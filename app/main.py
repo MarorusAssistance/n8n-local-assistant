@@ -10,7 +10,7 @@ from .config import settings
 
 logging.basicConfig(level=settings.LOG_LEVEL)
 
-app = FastAPI(title="n8n Workflow Assistant", version="0.1.0")
+app = FastAPI(title="n8n Workflow Assistant", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

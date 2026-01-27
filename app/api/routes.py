@@ -5,7 +5,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Query, Request, Response
 
 from ..memory import get_memory_store
-from ..schemas import ChatCompletionRequest
+from ..schemas import ChatCompletionRequest, DebugWorkflowRequest
 from ..services import ChatService
 
 
@@ -28,6 +28,11 @@ def create_chat_completions(
     request: ChatCompletionRequest, http_request: Request, response: Response
 ) -> Any:
     return chat_service.create_chat_completions(request, http_request, response)
+
+
+@router.post("/v1/debug/workflow")
+def debug_workflow(request: DebugWorkflowRequest) -> Dict[str, Any]:
+    return chat_service.debug_workflow(request)
 
 
 @router.get("/v1/chats")

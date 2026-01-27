@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import re
+
 from .config import settings
 from .db import query_similar
 from .llm import create_embedding
@@ -53,9 +55,9 @@ def extract_last_user_message(messages: List[Dict[str, str]]) -> Optional[str]:
     return None
 
 
-def retrieve_context(question: str) -> List[Dict[str, Any]]:
+def retrieve_context(question: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
     embedding = create_embedding(question)
-    rows = query_similar(embedding)
+    rows = query_similar(embedding, top_k=top_k)
 
     results: List[Dict[str, Any]] = []
     for row in rows:
@@ -84,11 +86,17 @@ def build_context_block(chunks: List[Dict[str, Any]]) -> str:
 
         header_parts: List[str] = []
         if chunk.get("title"):
-            header_parts.append(f"title: {chunk['title']}")
+            header_parts.append(
+                f"title: {_compact_header_value(str(chunk['title']), max_chars=120)}"
+            )
         if chunk.get("section"):
-            header_parts.append(f"section: {chunk['section']}")
+            header_parts.append(
+                f"section: {_compact_header_value(str(chunk['section']), max_chars=80)}"
+            )
         if chunk.get("url"):
-            header_parts.append(f"url: {chunk['url']}")
+            header_parts.append(
+                f"url: {_compact_header_value(str(chunk['url']), max_chars=120)}"
+            )
 
         header = " | ".join(header_parts) if header_parts else "chunk"
         entry = f"[{index}] {header}\n{text}\n"
@@ -111,11 +119,41 @@ def build_system_prompt(context_block: str) -> str:
     return f"{SYSTEM_PROMPT}\n\n{FORMAT_PROMPT}\n{context_block}"
 
 
+_MD_HEADER_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")
+_MD_BULLET_RE = re.compile(r"(?m)^\s*[-*+]\s+")
+_MD_QUOTE_RE = re.compile(r"(?m)^\s*>\s?")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+
+
+def _sanitize_markdown(text: str) -> str:
+    # Prevent markdown headers/bullets from rendering as huge titles in clients.
+    cleaned = _MD_HEADER_RE.sub("", text)
+    cleaned = _MD_BULLET_RE.sub("", cleaned)
+    cleaned = _MD_QUOTE_RE.sub("", cleaned)
+    cleaned = _MD_LINK_RE.sub(r"\1", cleaned)
+    return cleaned
+
+
 def _compact_snippet(text: str, max_chars: int) -> str:
-    snippet = " ".join(text.split())
+    snippet = _sanitize_markdown(text)
+    snippet = " ".join(snippet.split())
     if len(snippet) > max_chars:
         snippet = snippet[: max_chars - 3].rstrip() + "..."
     return snippet
+
+
+def _compact_header_value(value: Optional[str], max_chars: int = 120) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    compact = " ".join(text.split())
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 3].rstrip() + "..."
+    return compact
+
+
+def _references_enabled() -> bool:
+    return settings.references_enabled()
 
 
 def collect_references(
@@ -123,6 +161,8 @@ def collect_references(
     max_refs: int = 8,
     max_chars: int = 280,
 ) -> List[Dict[str, str]]:
+    if not _references_enabled():
+        return []
     refs: List[Dict[str, str]] = []
     seen = set()
     for chunk in chunks:
@@ -143,8 +183,8 @@ def collect_references(
             {
                 "snippet": snippet,
                 "url": url,
-                "title": title,
-                "section": section,
+                "title": _compact_header_value(title, max_chars=120),
+                "section": _compact_header_value(section, max_chars=80),
             }
         )
         if len(refs) >= max_refs:
@@ -153,17 +193,25 @@ def collect_references(
 
 
 def format_references(refs: List[Dict[str, str]]) -> str:
+    if not _references_enabled():
+        return ""
     if not refs:
         return ""
     lines: List[str] = ["Referencias:"]
     for ref in refs:
         header_parts: List[str] = []
         if ref.get("title"):
-            header_parts.append(f"title: {ref['title']}")
+            header_parts.append(
+                f"title: {_compact_header_value(ref.get('title'), max_chars=120)}"
+            )
         if ref.get("section"):
-            header_parts.append(f"section: {ref['section']}")
+            header_parts.append(
+                f"section: {_compact_header_value(ref.get('section'), max_chars=80)}"
+            )
         if ref.get("url"):
-            header_parts.append(f"url: {ref['url']}")
+            header_parts.append(
+                f"url: {_compact_header_value(ref.get('url'), max_chars=120)}"
+            )
         header = " | ".join(header_parts)
         if header:
             lines.append(f"- {header}")
@@ -174,6 +222,8 @@ def format_references(refs: List[Dict[str, str]]) -> str:
 
 
 def append_references(text: str, refs: List[Dict[str, str]]) -> str:
+    if not _references_enabled():
+        return text
     refs_block = format_references(refs)
     if not refs_block:
         return text

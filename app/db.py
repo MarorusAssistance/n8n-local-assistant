@@ -79,7 +79,10 @@ def _select_expr(
     return None
 
 
-def query_similar(embedding: List[float]) -> List[Dict[str, Any]]:
+def query_similar(embedding: List[float], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+    top_k = top_k or settings.TOP_K
+    if top_k <= 0:
+        top_k = settings.TOP_K
     select_items: List[sql.SQL] = []
 
     text_expr = _select_expr(settings.TEXT_COLUMN, None, settings.TEXT_COLUMN)
@@ -140,7 +143,7 @@ def query_similar(embedding: List[float]) -> List[Dict[str, Any]]:
         distance_op=sql.SQL(settings.DISTANCE_OP),
     )
 
-    params.extend([Vector(embedding), settings.TOP_K])
+    params.extend([Vector(embedding), top_k])
 
     with _connect() as conn:
         with conn.cursor(row_factory=dict_row) as cur:

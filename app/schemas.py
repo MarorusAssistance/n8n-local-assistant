@@ -24,3 +24,10 @@ class ChatCompletionRequest(BaseModel):
     conversation_id: Optional[str] = None
 
     model_config = ConfigDict(extra="allow")
+
+
+class DebugWorkflowRequest(BaseModel):
+    workflow_id: str
+    question: str
+    include_docs: bool = True
+    include_nodes: bool = True

@@ -24,6 +24,33 @@ class Settings(BaseSettings):
 
     LOG_LEVEL: str = "INFO"
 
+    @field_validator("LOG_LEVEL", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, value: str) -> str:
+        if value is None:
+            return "INFO"
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized:
+                return normalized
+        return "INFO"
+    APP_ENV: str = "dev"
+    APP_SHOW_REFERENCES: Optional[bool] = None
+
+    N8N_BASE_URL: str = "http://localhost:5678"
+    N8N_API_KEY: Optional[str] = None
+    N8N_TIMEOUT_SECONDS: float = 15.0
+    N8N_WORKFLOW_ENDPOINT_TEMPLATE: str = "/api/v1/workflows/{workflow_id}"
+
+    WORKFLOW_SUMMARY_MAX_NODES: int = 200
+    WORKFLOW_MICRO_MAX_CHARS: int = 1200
+    WORKFLOW_NEIGHBOR_DEPTH: int = 1
+    WORKFLOW_MAX_NODES_NODE_SPECIFIC: int = 6
+    WORKFLOW_MAX_NODES_SUBGRAPH: int = 12
+    WORKFLOW_MAX_NODES_GLOBAL: int = 15
+    WORKFLOW_DOCS_CANDIDATE_K: int = 16
+    WORKFLOW_DOCS_TOP_K: int = 8
+
     MEMORY_ENABLED: bool = True
     MEMORY_MAX_MESSAGES: int = 20
     MEMORY_TTL_SECONDS: int = 3600
@@ -31,6 +58,7 @@ class Settings(BaseSettings):
     MEMORY_AUTO_CREATE_CONVERSATION_ID: bool = False
     MEMORY_SKIP_PREFIXES: str = "### Task"
     MEMORY_SKIP_ASSISTANT_JSON_KEYS: str = "follow_ups,title,tags"
+    MEMORY_DEDUP_WINDOW_SECONDS: int = 8
     MEMORY_BACKEND: str = "postgres"
     MEMORY_CONVERSATIONS_TABLE: str = "chat_conversations"
     MEMORY_MESSAGES_TABLE: str = "chat_messages"
@@ -61,6 +89,8 @@ class Settings(BaseSettings):
         "SECTION_JSON_PATH",
         "SOURCE_JSON_PATH",
         "LLM_MODEL",
+        "N8N_API_KEY",
+        "APP_ENV",
         mode="before",
     )
     @classmethod
@@ -68,6 +98,15 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @field_validator("APP_ENV", mode="after")
+    @classmethod
+    def _validate_app_env(cls, value: Optional[str]) -> str:
+        env = (value or "dev").strip().lower()
+        allowed = {"dev", "qa", "prod"}
+        if env not in allowed:
+            raise ValueError(f"APP_ENV must be one of {sorted(allowed)}")
+        return env
 
     @field_validator("DISTANCE_OP")
     @classmethod
@@ -94,6 +133,11 @@ class Settings(BaseSettings):
         if self.SECTION_JSON_PATH and not self.SECTION_COLUMN:
             self.SECTION_COLUMN = "section"
         return self
+
+    def references_enabled(self) -> bool:
+        if self.APP_SHOW_REFERENCES is not None:
+            return bool(self.APP_SHOW_REFERENCES)
+        return self.APP_ENV in {"dev", "qa"}
 
 
 settings = Settings()
