@@ -36,6 +36,10 @@ class Settings(BaseSettings):
         return "INFO"
     APP_ENV: str = "dev"
     APP_SHOW_REFERENCES: Optional[bool] = None
+    DEFAULT_TEMPERATURE: float = 0.1
+    DEFAULT_TOP_P: float = 0.9
+    DEFAULT_FREQUENCY_PENALTY: float = 0.0
+    DEFAULT_PRESENCE_PENALTY: float = 0.0
 
     N8N_BASE_URL: str = "http://localhost:5678"
     N8N_API_KEY: Optional[str] = None

@@ -589,15 +589,23 @@ class ChatService:
     def _completion_params(request: ChatCompletionRequest, stream: bool) -> Dict[str, Any]:
         """Translate request fields into LM Studio completion params."""
         params: Dict[str, Any] = {}
-        params["temperature"] = request.temperature if request.temperature is not None else 0.2
+        params["temperature"] = (
+            request.temperature if request.temperature is not None else settings.DEFAULT_TEMPERATURE
+        )
         if request.max_tokens is not None:
             params["max_tokens"] = request.max_tokens
         if request.top_p is not None:
             params["top_p"] = request.top_p
+        else:
+            params["top_p"] = settings.DEFAULT_TOP_P
         if request.frequency_penalty is not None:
             params["frequency_penalty"] = request.frequency_penalty
+        else:
+            params["frequency_penalty"] = settings.DEFAULT_FREQUENCY_PENALTY
         if request.presence_penalty is not None:
             params["presence_penalty"] = request.presence_penalty
+        else:
+            params["presence_penalty"] = settings.DEFAULT_PRESENCE_PENALTY
         if request.stop is not None:
             params["stop"] = request.stop
         if stream:

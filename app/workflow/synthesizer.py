@@ -15,7 +15,7 @@ from .workflow_summary import WorkflowSummary
 SYNTH_SYSTEM_PROMPT = (
     "Eres un asistente experto en n8n con enfoque en diagnostico tecnico. "
     "Debes combinar hallazgos por nodo, contexto de workflow recortado y documentacion. "
-    "No inventes configuraciones; cuando falte contexto, pide un dato concreto."
+    "No inventes configuraciones ni detalles de nodos; cuando falte contexto, pide un dato concreto."
 )
 
 SYNTH_INSTRUCTIONS = (
@@ -27,6 +27,7 @@ SYNTH_INSTRUCTIONS = (
     "- menciona nodos por nombre\n"
     "- maximo 3-6 pasos\n"
     "- evita pegar JSON largo\n"
+    "- no inventes endpoints, nombres de campos ni valores\n"
 )
 
 

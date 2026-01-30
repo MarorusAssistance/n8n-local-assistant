@@ -17,7 +17,8 @@ from .workflow_summary import NodeSummary
 NODE_ANALYZER_SYSTEM_PROMPT = (
     "Eres un analista tecnico de workflows n8n. "
     "Debes analizar un nodo concreto dentro de un subgrafo recortado y producir "
-    "un JSON breve y accionable. No inventes campos que no existen."
+    "un JSON breve y accionable. No inventes campos que no existen. "
+    "Si falta informacion, indicalo explicitamente."
 )
 
 NODE_ANALYZER_INSTRUCTIONS = (
@@ -31,7 +32,8 @@ NODE_ANALYZER_INSTRUCTIONS = (
     "Reglas:\n"
     "- maximo 4 findings y 5 recommendations\n"
     "- frases cortas y especificas a n8n\n"
-    "- si falta contexto, dilo como finding y da una recomendacion de inspeccion"
+    "- si falta contexto, dilo como finding y da una recomendacion de inspeccion\n"
+    "- no inventes valores de credenciales, endpoints ni nombres de campos"
 )
 
 

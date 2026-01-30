@@ -55,6 +55,15 @@ El bloque final "Referencias" ahora depende del entorno:
 - `APP_ENV=dev` o `APP_ENV=qa`: se muestra "Referencias".
 - Puedes forzarlo con `APP_SHOW_REFERENCES=true|false`.
 
+## Antialucinaciones (parametros por defecto)
+Para reducir invenciones del modelo, el backend usa estos defaults si el cliente no los manda:
+- `DEFAULT_TEMPERATURE`
+- `DEFAULT_TOP_P`
+- `DEFAULT_FREQUENCY_PENALTY`
+- `DEFAULT_PRESENCE_PENALTY`
+
+Puedes ajustarlos en `.env`.
+
 ## Workflow-aware mode (`/wf`)
 Puedes activar el modo “workflow-aware” desde el chat:
 
