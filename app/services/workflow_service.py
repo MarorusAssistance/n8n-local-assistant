@@ -67,6 +67,7 @@ class WorkflowService:
                         "title": chunk.get("title"),
                         "section": chunk.get("section"),
                         "snippet": self._compact_snippet(text, 240),
+                        "rerank_score": chunk.get("rerank_score"),
                     }
                 )
 
@@ -98,6 +99,9 @@ class WorkflowService:
             "notes": {
                 "retriever": "retrieve_docs ignores node hints for now",
                 "docs_top_k": settings.WORKFLOW_DOCS_TOP_K,
+                "rerank_enabled": settings.ENABLE_RERANK,
+                "rerank_pool": settings.RERANK_POOL_SIZE,
+                "rerank_top_k": settings.RERANK_TOP_K,
             },
         }
 

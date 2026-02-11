@@ -9,6 +9,7 @@ import time
 from .config import settings
 from .db import query_similar
 from .llm import create_embedding
+from .reranker import reranker
 
 
 SYSTEM_PROMPT = (
@@ -37,7 +38,7 @@ def _trace_truncate(text: str, max_chars: int) -> str:
     return raw
 
 
-def _trace_chunks(chunks: List[Dict[str, Any]]) -> str:
+def _trace_chunks(chunks: List[Dict[str, Any]], include_scores: bool = False) -> str:
     if not chunks:
         return "  (sin resultados)"
     max_chunks = settings.TRACE_MAX_CHUNKS or len(chunks)
@@ -50,6 +51,8 @@ def _trace_chunks(chunks: List[Dict[str, Any]]) -> str:
             chunk.get("text") or "", max_chars=settings.TRACE_MAX_CHUNK_CHARS
         )
         header_parts = []
+        if include_scores and chunk.get("rerank_score") is not None:
+            header_parts.append(f"score={float(chunk['rerank_score']):.4f}")
         if title:
             header_parts.append(f"title={title}")
         if section:
@@ -100,9 +103,8 @@ def retrieve_context(
     top_k: Optional[int] = None,
     request_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    effective_top_k = top_k or settings.TOP_K
-    if effective_top_k <= 0:
-        effective_top_k = settings.TOP_K
+    effective_top_k = _resolve_top_k(top_k)
+    pool_size = _resolve_pool_size(effective_top_k)
 
     if trace_logger.isEnabledFor(logging.DEBUG):
         trace_logger.debug(
@@ -116,7 +118,7 @@ def retrieve_context(
     embed_ms = (time.perf_counter() - embed_start) * 1000
 
     query_start = time.perf_counter()
-    rows = query_similar(embedding, top_k=top_k, request_id=request_id)
+    rows = query_similar(embedding, top_k=pool_size, request_id=request_id)
     query_ms = (time.perf_counter() - query_start) * 1000
 
     results: List[Dict[str, Any]] = []
@@ -132,29 +134,70 @@ def retrieve_context(
             }
         )
 
+    pre_rerank = list(results)
+    if settings.ENABLE_RERANK:
+        results = reranker.rerank(
+            question, results, top_k=effective_top_k, request_id=request_id
+        )
+
     if trace_logger.isEnabledFor(logging.INFO):
         meta = (
-            "meta: q_len={q_len} top_k={top_k} rows={rows} embed_dim={embed_dim} "
-            "embed_ms={embed_ms:.1f} query_ms={query_ms:.1f} model={model}"
+            "meta: q_len={q_len} top_k={top_k} pool={pool} rows={rows} embed_dim={embed_dim} "
+            "embed_ms={embed_ms:.1f} query_ms={query_ms:.1f} model={model} "
+            "rerank={rerank} rerank_model={rerank_model}"
         ).format(
             q_len=len(question),
             top_k=effective_top_k,
+            pool=pool_size,
             rows=len(results),
             embed_dim=len(embedding),
             embed_ms=embed_ms,
             query_ms=query_ms,
             model=settings.EMBEDDING_MODEL,
+            rerank=settings.ENABLE_RERANK,
+            rerank_model=settings.RERANK_MODEL if settings.ENABLE_RERANK else "-",
         )
         query_text = _trace_truncate(question, settings.TRACE_MAX_TEXT_CHARS)
-        chunks_block = _trace_chunks(results)
-        trace_logger.info(
-            "TRACE RAG id=%s\n%s\nquery_text:\n  %s\nchunks:\n%s",
-            request_id or "-",
-            meta,
-            "\n  ".join(query_text.splitlines()) if query_text else "(vacio)",
-            chunks_block,
-        )
+        query_block = "\n  ".join(query_text.splitlines()) if query_text else "(vacio)"
+        if settings.ENABLE_RERANK:
+            pool_block = _trace_chunks(pre_rerank)
+            final_block = _trace_chunks(results, include_scores=True)
+            trace_logger.info(
+                "TRACE RAG id=%s\n%s\nquery_text:\n  %s\nchunks_pool:\n%s\nchunks_final:\n%s",
+                request_id or "-",
+                meta,
+                query_block,
+                pool_block,
+                final_block,
+            )
+        else:
+            chunks_block = _trace_chunks(results)
+            trace_logger.info(
+                "TRACE RAG id=%s\n%s\nquery_text:\n  %s\nchunks:\n%s",
+                request_id or "-",
+                meta,
+                query_block,
+                chunks_block,
+            )
     return results
+
+
+def _resolve_top_k(top_k: Optional[int]) -> int:
+    resolved = top_k or settings.TOP_K
+    if resolved <= 0:
+        resolved = settings.TOP_K
+    if settings.ENABLE_RERANK and settings.RERANK_TOP_K and settings.RERANK_TOP_K > 0:
+        return settings.RERANK_TOP_K
+    return resolved
+
+
+def _resolve_pool_size(final_top_k: int) -> int:
+    if not settings.ENABLE_RERANK:
+        return final_top_k
+    pool_size = settings.RERANK_POOL_SIZE or final_top_k
+    if pool_size <= 0:
+        pool_size = final_top_k
+    return max(pool_size, final_top_k)
 
 
 def build_context_block(chunks: List[Dict[str, Any]]) -> str:

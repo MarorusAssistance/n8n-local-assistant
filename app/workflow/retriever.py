@@ -13,8 +13,8 @@ def retrieve_docs(
     request_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve docs for a question; node hints are reserved for future boosting."""
-    # RAG is intentionally kept simple for now: no hints and no reranking.
-    # We keep the signature so we can add boosting/reranking later.
+    # RAG is intentionally kept simple for now: no hints and optional reranking.
+    # We keep the signature so we can add boosting later.
     _ = node_types, node_names
     return retrieve_context(
         question,

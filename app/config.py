@@ -21,6 +21,19 @@ class Settings(BaseSettings):
     DOCS_SOURCE_FILTER: Optional[str] = None
     TOP_K: int = 10
     MAX_CONTEXT_CHARS: int = 8000
+    ENABLE_RERANK: bool = False
+    RERANK_MODEL: str = "BAAI/bge-reranker-v2.5-gemma2-lightweight"
+    RERANK_FALLBACK_MODEL: Optional[str] = "BAAI/bge-reranker-v2-m3"
+    RERANK_POOL_SIZE: int = 30
+    RERANK_TOP_K: int = 8
+    RERANK_MAX_CHARS: int = 2000
+    RERANK_USE_FP16: bool = True
+    RERANK_BATCH_SIZE: Optional[int] = None
+    RERANK_DEVICE: Optional[str] = None
+    RERANK_CUTOFF_LAYERS: Optional[str] = None
+    RERANK_COMPRESS_LAYERS: Optional[str] = None
+    RERANK_COMPRESS_RATIO: Optional[int] = None
+    RETRIEVAL_DEBUG: bool = False
 
     LOG_LEVEL: str = "INFO"
     TRACE_LOG_ENABLED: bool = False
@@ -103,6 +116,12 @@ class Settings(BaseSettings):
         "LLM_MODEL",
         "N8N_API_KEY",
         "APP_ENV",
+        "RERANK_FALLBACK_MODEL",
+        "RERANK_DEVICE",
+        "RERANK_CUTOFF_LAYERS",
+        "RERANK_COMPRESS_LAYERS",
+        "RERANK_BATCH_SIZE",
+        "RERANK_COMPRESS_RATIO",
         mode="before",
     )
     @classmethod

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from fastapi import FastAPI
@@ -9,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api import router as api_router
 from .config import settings
+from .reranker import reranker
 
 logging.basicConfig(level=settings.LOG_LEVEL)
 trace_logger = logging.getLogger("n8n-assistant.trace")
@@ -36,6 +38,12 @@ if settings.TRACE_LOG_ENABLED:
             )
             file_handler._trace_handler = True  # type: ignore[attr-defined]
             trace_logger.addHandler(file_handler)
+    trace_logger.info(
+        "TRACE SESSION START %s pid=%s env=%s",
+        datetime.now().isoformat(timespec="seconds"),
+        os.getpid(),
+        settings.APP_ENV,
+    )
 else:
     trace_logger.setLevel(logging.CRITICAL + 10)
 
@@ -48,3 +56,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router)
+
+
+@app.on_event("startup")
+def _warm_reranker() -> None:
+    if settings.ENABLE_RERANK:
+        reranker.load()
