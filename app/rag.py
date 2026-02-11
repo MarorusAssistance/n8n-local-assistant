@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import logging
 import re
+import time
 
 from .config import settings
 from .db import query_similar
@@ -24,6 +26,42 @@ FORMAT_PROMPT = (
     "Pasos:\n"
     "Alternativas:\n"
 )
+
+trace_logger = logging.getLogger("n8n-assistant.trace")
+
+
+def _trace_truncate(text: str, max_chars: int) -> str:
+    raw = str(text or "")
+    if max_chars and len(raw) > max_chars:
+        return raw[:max_chars].rstrip() + f"... [truncado {len(raw) - max_chars} chars]"
+    return raw
+
+
+def _trace_chunks(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return "  (sin resultados)"
+    max_chunks = settings.TRACE_MAX_CHUNKS or len(chunks)
+    lines: List[str] = []
+    for idx, chunk in enumerate(chunks[:max_chunks], start=1):
+        title = _compact_header_value(chunk.get("title"), max_chars=120)
+        section = _compact_header_value(chunk.get("section"), max_chars=80)
+        url = _compact_header_value(chunk.get("url"), max_chars=140)
+        snippet = _compact_snippet(
+            chunk.get("text") or "", max_chars=settings.TRACE_MAX_CHUNK_CHARS
+        )
+        header_parts = []
+        if title:
+            header_parts.append(f"title={title}")
+        if section:
+            header_parts.append(f"section={section}")
+        if url:
+            header_parts.append(f"url={url}")
+        header = " | ".join(header_parts) if header_parts else "chunk"
+        lines.append(f"[{idx}] {header}")
+        lines.append(f"  {snippet}")
+    if len(chunks) > max_chunks:
+        lines.append(f"... {len(chunks) - max_chunks} mas")
+    return "\n".join(lines)
 
 
 def _normalize_content(content: Any) -> str:
@@ -57,9 +95,29 @@ def extract_last_user_message(messages: List[Dict[str, str]]) -> Optional[str]:
     return None
 
 
-def retrieve_context(question: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+def retrieve_context(
+    question: str,
+    top_k: Optional[int] = None,
+    request_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    effective_top_k = top_k or settings.TOP_K
+    if effective_top_k <= 0:
+        effective_top_k = settings.TOP_K
+
+    if trace_logger.isEnabledFor(logging.DEBUG):
+        trace_logger.debug(
+            "rag query text: id=%s text=%s",
+            request_id or "-",
+            _compact_snippet(question, max_chars=220),
+        )
+
+    embed_start = time.perf_counter()
     embedding = create_embedding(question)
-    rows = query_similar(embedding, top_k=top_k)
+    embed_ms = (time.perf_counter() - embed_start) * 1000
+
+    query_start = time.perf_counter()
+    rows = query_similar(embedding, top_k=top_k, request_id=request_id)
+    query_ms = (time.perf_counter() - query_start) * 1000
 
     results: List[Dict[str, Any]] = []
     for row in rows:
@@ -72,6 +130,29 @@ def retrieve_context(question: str, top_k: Optional[int] = None) -> List[Dict[st
                 "title": row.get(settings.TITLE_COLUMN) if settings.TITLE_COLUMN else None,
                 "section": row.get(settings.SECTION_COLUMN) if settings.SECTION_COLUMN else None,
             }
+        )
+
+    if trace_logger.isEnabledFor(logging.INFO):
+        meta = (
+            "meta: q_len={q_len} top_k={top_k} rows={rows} embed_dim={embed_dim} "
+            "embed_ms={embed_ms:.1f} query_ms={query_ms:.1f} model={model}"
+        ).format(
+            q_len=len(question),
+            top_k=effective_top_k,
+            rows=len(results),
+            embed_dim=len(embedding),
+            embed_ms=embed_ms,
+            query_ms=query_ms,
+            model=settings.EMBEDDING_MODEL,
+        )
+        query_text = _trace_truncate(question, settings.TRACE_MAX_TEXT_CHARS)
+        chunks_block = _trace_chunks(results)
+        trace_logger.info(
+            "TRACE RAG id=%s\n%s\nquery_text:\n  %s\nchunks:\n%s",
+            request_id or "-",
+            meta,
+            "\n  ".join(query_text.splitlines()) if query_text else "(vacio)",
+            chunks_block,
         )
     return results
 

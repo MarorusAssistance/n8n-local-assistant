@@ -25,7 +25,6 @@ SYNTH_INSTRUCTIONS = (
     "Alternativas:\n"
     "Reglas:\n"
     "- menciona nodos por nombre\n"
-    "- maximo 3-6 pasos\n"
     "- evita pegar JSON largo\n"
     "- no inventes endpoints, nombres de campos ni valores\n"
 )

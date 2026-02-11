@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, Iterable, List, Optional
 
+import logging
 import json
 import re
 
@@ -38,6 +39,7 @@ NODE_ANALYZER_INSTRUCTIONS = (
 
 
 JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
+trace_logger = logging.getLogger("n8n-assistant.trace")
 
 
 class NodeFinding(BaseModel):
@@ -114,6 +116,13 @@ def _fallback_finding(node: NodeSummary, scope: PlanScope) -> NodeFinding:
     )
 
 
+def _compact_snippet(text: str, max_chars: int) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 3].rstrip() + "..."
+    return compact
+
+
 def analyze_node(
     question: str,
     node: NodeSummary,
@@ -121,9 +130,20 @@ def analyze_node(
     docs_chunks: Iterable[Dict[str, Any]],
     scope: PlanScope,
     model: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> NodeFinding:
     """Call the LLM to analyze one node and normalize its JSON output."""
     docs_block = _docs_block(docs_chunks)
+    if trace_logger.isEnabledFor(logging.DEBUG):
+        trace_logger.debug(
+            "node analyzer prompt: id=%s node=%s type=%s scope=%s docs_chars=%d micro_chars=%d",
+            request_id or "-",
+            node.node_id,
+            node.short_type,
+            scope.value,
+            len(docs_block),
+            len(micro_context_text),
+        )
 
     prompt = (
         f"Pregunta del usuario:\n{question.strip()}\n\n"
@@ -151,11 +171,25 @@ def analyze_node(
             .get("message", {})
             .get("content", "")
         )
-    except Exception:
+    except Exception as exc:
+        trace_logger.warning(
+            "node analyzer failed: id=%s node=%s type=%s error=%s",
+            request_id or "-",
+            node.node_id,
+            node.short_type,
+            str(exc),
+        )
         return _fallback_finding(node, scope)
 
     data = _extract_json(content)
     if not data:
+        trace_logger.warning(
+            "node analyzer invalid json: id=%s node=%s type=%s content=%s",
+            request_id or "-",
+            node.node_id,
+            node.short_type,
+            _compact_snippet(content, max_chars=220),
+        )
         return _fallback_finding(node, scope)
 
     risk_level = str(data.get("risk_level") or "unknown")

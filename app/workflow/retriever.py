@@ -10,9 +10,14 @@ def retrieve_docs(
     question: str,
     node_types: Optional[Iterable[str]] = None,
     node_names: Optional[Iterable[str]] = None,
+    request_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve docs for a question; node hints are reserved for future boosting."""
     # RAG is intentionally kept simple for now: no hints and no reranking.
     # We keep the signature so we can add boosting/reranking later.
     _ = node_types, node_names
-    return retrieve_context(question, top_k=settings.WORKFLOW_DOCS_TOP_K)
+    return retrieve_context(
+        question,
+        top_k=settings.WORKFLOW_DOCS_TOP_K,
+        request_id=request_id,
+    )

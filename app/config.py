@@ -23,8 +23,16 @@ class Settings(BaseSettings):
     MAX_CONTEXT_CHARS: int = 8000
 
     LOG_LEVEL: str = "INFO"
+    TRACE_LOG_ENABLED: bool = False
+    TRACE_LOG_LEVEL: str = "INFO"
+    TRACE_MAX_TEXT_CHARS: int = 4000
+    TRACE_MAX_CHUNK_CHARS: int = 320
+    TRACE_MAX_CHUNKS: int = 12
+    TRACE_LOG_FILE: str = "logs/trace.log"
+    TRACE_LOG_MAX_BYTES: int = 5_000_000
+    TRACE_LOG_BACKUPS: int = 3
 
-    @field_validator("LOG_LEVEL", mode="before")
+    @field_validator("LOG_LEVEL", "TRACE_LOG_LEVEL", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: str) -> str:
         if value is None:

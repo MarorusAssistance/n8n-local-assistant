@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import logging
 import re
 
 import psycopg
@@ -14,6 +15,7 @@ from .config import settings
 
 
 _JSON_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+trace_logger = logging.getLogger("n8n-assistant.trace")
 
 
 def _connect() -> psycopg.Connection:
@@ -62,6 +64,26 @@ def _json_path_expr(path: str) -> sql.SQL:
     )
 
 
+def _display_json_path(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    try:
+        parts = _parse_json_path(path)
+        return "{" + ",".join(parts) + "}"
+    except ValueError:
+        return path
+
+
+def _select_preview(column_name: Optional[str], json_path: Optional[str], alias: Optional[str]) -> Optional[str]:
+    if json_path:
+        metadata_col = settings.METADATA_COLUMN or "metadata"
+        display_path = _display_json_path(json_path) or json_path
+        return f"{metadata_col}#>>'{display_path}' AS {alias}"
+    if column_name:
+        return column_name
+    return None
+
+
 def _select_expr(
     column_name: Optional[str],
     json_path: Optional[str],
@@ -79,7 +101,11 @@ def _select_expr(
     return None
 
 
-def query_similar(embedding: List[float], top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+def query_similar(
+    embedding: List[float],
+    top_k: Optional[int] = None,
+    request_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     top_k = top_k or settings.TOP_K
     if top_k <= 0:
         top_k = settings.TOP_K
@@ -106,6 +132,48 @@ def query_similar(embedding: List[float], top_k: Optional[int] = None) -> List[D
     )
     if section_expr is not None:
         select_items.append(section_expr)
+
+    if trace_logger.isEnabledFor(logging.INFO):
+        select_preview = list(
+            filter(
+                None,
+                [
+                    _select_preview(settings.TEXT_COLUMN, None, settings.TEXT_COLUMN),
+                    _select_preview(settings.URL_COLUMN, settings.URL_JSON_PATH, settings.URL_COLUMN),
+                    _select_preview(settings.TITLE_COLUMN, settings.TITLE_JSON_PATH, settings.TITLE_COLUMN),
+                    _select_preview(
+                        settings.SECTION_COLUMN, settings.SECTION_JSON_PATH, settings.SECTION_COLUMN
+                    ),
+                ],
+            )
+        )
+        where_preview = ""
+        filter_value = "-"
+        if settings.DOCS_SOURCE_FILTER:
+            filter_value = str(settings.DOCS_SOURCE_FILTER)
+            if settings.SOURCE_JSON_PATH:
+                display_path = _display_json_path(settings.SOURCE_JSON_PATH) or settings.SOURCE_JSON_PATH
+                metadata_col = settings.METADATA_COLUMN or "metadata"
+                where_preview = f"WHERE {metadata_col}#>>'{display_path}' = :source"
+            elif settings.SOURCE_COLUMN:
+                where_preview = f"WHERE {settings.SOURCE_COLUMN} = :source"
+        sql_preview = (
+            "SELECT {cols} FROM {table} {where} ORDER BY {emb_col} {dist} :vector LIMIT :limit"
+        ).format(
+            cols=", ".join(select_preview) if select_preview else "*",
+            table=settings.TABLE_NAME,
+            where=where_preview,
+            emb_col=settings.EMBEDDING_COLUMN,
+            dist=settings.DISTANCE_OP,
+        )
+        trace_logger.info(
+            "TRACE DB QUERY id=%s\nsql: %s\nparams: top_k=%d embed_dim=%d filter=%s",
+            request_id or "-",
+            sql_preview.strip(),
+            top_k,
+            len(embedding),
+            filter_value,
+        )
 
     select_cols = sql.SQL(", ").join(select_items)
     table = sql.Identifier(settings.TABLE_NAME)
