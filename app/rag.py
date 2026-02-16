@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import logging
 import re
 import time
 
 from .config import settings
-from .db import query_similar
+from .db import FTS_SCORE_KEY, ROW_ID_KEY, query_fts, query_similar
+from .hybrid import rrf_fuse
 from .llm import create_embedding
 from .reranker import reranker
 
@@ -38,7 +39,11 @@ def _trace_truncate(text: str, max_chars: int) -> str:
     return raw
 
 
-def _trace_chunks(chunks: List[Dict[str, Any]], include_scores: bool = False) -> str:
+def _trace_chunks(
+    chunks: List[Dict[str, Any]],
+    include_rerank_scores: bool = False,
+    include_rrf_scores: bool = False,
+) -> str:
     if not chunks:
         return "  (sin resultados)"
     max_chunks = settings.TRACE_MAX_CHUNKS or len(chunks)
@@ -51,8 +56,12 @@ def _trace_chunks(chunks: List[Dict[str, Any]], include_scores: bool = False) ->
             chunk.get("text") or "", max_chars=settings.TRACE_MAX_CHUNK_CHARS
         )
         header_parts = []
-        if include_scores and chunk.get("rerank_score") is not None:
-            header_parts.append(f"score={float(chunk['rerank_score']):.4f}")
+        if include_rerank_scores and chunk.get("rerank_score") is not None:
+            header_parts.append(f"rerank={float(chunk['rerank_score']):.4f}")
+        if include_rrf_scores and chunk.get("rrf_score") is not None:
+            header_parts.append(f"rrf={float(chunk['rrf_score']):.4f}")
+        if chunk.get("doc_id"):
+            header_parts.append(f"id={chunk['doc_id']}")
         if title:
             header_parts.append(f"title={title}")
         if section:
@@ -65,6 +74,36 @@ def _trace_chunks(chunks: List[Dict[str, Any]], include_scores: bool = False) ->
     if len(chunks) > max_chunks:
         lines.append(f"... {len(chunks) - max_chunks} mas")
     return "\n".join(lines)
+
+
+def _trace_retrieval_stage(stage: str, chunks: List[Dict[str, Any]], max_items: int = 10) -> str:
+    if not chunks:
+        return f"{stage}: (sin resultados)"
+
+    lines = [f"{stage}: count={len(chunks)}"]
+    for idx, chunk in enumerate(chunks[:max_items], start=1):
+        ref = _candidate_reference(chunk)
+        parts = [f"rank={idx}", f"id={chunk.get('doc_id') or '-'}", f"ref={ref}"]
+        if chunk.get("vector_rank") is not None:
+            parts.append(f"vec_rank={chunk['vector_rank']}")
+        if chunk.get("fts_rank") is not None:
+            parts.append(f"fts_rank={chunk['fts_rank']}")
+        if chunk.get("rrf_score") is not None:
+            parts.append(f"rrf={float(chunk['rrf_score']):.4f}")
+        if chunk.get("retrieval_sources"):
+            parts.append(f"sources={','.join(chunk['retrieval_sources'])}")
+        if chunk.get("fts_score") is not None:
+            parts.append(f"fts_score={float(chunk['fts_score']):.4f}")
+        lines.append("  - " + " | ".join(parts))
+    return "\n".join(lines)
+
+
+def _candidate_reference(chunk: Dict[str, Any]) -> str:
+    for key in ("url", "title", "section"):
+        value = (chunk.get(key) or "").strip() if isinstance(chunk.get(key), str) else chunk.get(key)
+        if value:
+            return str(value)
+    return str(chunk.get("doc_id") or "-")
 
 
 def _normalize_content(content: Any) -> str:
@@ -103,8 +142,11 @@ def retrieve_context(
     top_k: Optional[int] = None,
     request_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    effective_top_k = _resolve_top_k(top_k)
-    pool_size = _resolve_pool_size(effective_top_k)
+    final_top_k = _resolve_top_k(top_k)
+    rerank_pool_size = _resolve_pool_size(final_top_k)
+    vector_limit = _resolve_vector_limit(rerank_pool_size)
+    fts_limit = _resolve_fts_limit(rerank_pool_size)
+    rrf_top_m = _resolve_rrf_top_m(rerank_pool_size)
 
     if trace_logger.isEnabledFor(logging.DEBUG):
         trace_logger.debug(
@@ -117,51 +159,112 @@ def retrieve_context(
     embedding = create_embedding(question)
     embed_ms = (time.perf_counter() - embed_start) * 1000
 
-    query_start = time.perf_counter()
-    rows = query_similar(embedding, top_k=pool_size, request_id=request_id)
-    query_ms = (time.perf_counter() - query_start) * 1000
+    vector_start = time.perf_counter()
+    vector_rows = query_similar(embedding, top_k=vector_limit, request_id=request_id)
+    vector_ms = (time.perf_counter() - vector_start) * 1000
+    vector_list = [_row_to_candidate(row) for row in vector_rows]
 
-    results: List[Dict[str, Any]] = []
-    for row in rows:
-        results.append(
-            {
-                ##ToDo: Review columns names
-            
-                "text": row.get(settings.TEXT_COLUMN),
-                "url": row.get(settings.URL_COLUMN),
-                "title": row.get(settings.TITLE_COLUMN) if settings.TITLE_COLUMN else None,
-                "section": row.get(settings.SECTION_COLUMN) if settings.SECTION_COLUMN else None,
-            }
+    fts_list: List[Dict[str, Any]] = []
+    hybrid_warning = ""
+    retrieval_pool = list(vector_list)
+
+    if settings.ENABLE_HYBRID:
+        try:
+            fts_start = time.perf_counter()
+            fts_rows = query_fts(question, top_k=fts_limit, request_id=request_id)
+            fts_ms = (time.perf_counter() - fts_start) * 1000
+            fts_list = [_row_to_candidate(row) for row in fts_rows]
+            if trace_logger.isEnabledFor(logging.DEBUG):
+                trace_logger.debug(
+                    "hybrid fts done: id=%s rows=%d fts_ms=%.1f",
+                    request_id or "-",
+                    len(fts_list),
+                    fts_ms,
+                )
+        except Exception as exc:
+            if settings.HYBRID_STRICT_MODE:
+                raise
+            hybrid_warning = str(exc)
+            trace_logger.warning(
+                "hybrid fts failed, fallback vector-only: id=%s error=%s",
+                request_id or "-",
+                exc,
+            )
+
+        retrieval_pool = rrf_fuse(
+            vector_list,
+            fts_list,
+            rrf_k=settings.RRF_K,
+            vector_weight=settings.RRF_VECTOR_WEIGHT,
+            fts_weight=settings.RRF_FTS_WEIGHT,
+            top_m=rrf_top_m,
         )
+        if not retrieval_pool:
+            retrieval_pool = list(vector_list)[:rrf_top_m]
 
-    pre_rerank = list(results)
+    if settings.RETRIEVAL_DEBUG and trace_logger.isEnabledFor(logging.INFO):
+        trace_logger.info(
+            "TRACE RETRIEVAL id=%s\n%s",
+            request_id or "-",
+            _trace_retrieval_stage("vector_list", vector_list),
+        )
+        if settings.ENABLE_HYBRID:
+            trace_logger.info(
+                "TRACE RETRIEVAL id=%s\n%s",
+                request_id or "-",
+                _trace_retrieval_stage("fts_list", fts_list),
+            )
+            trace_logger.info(
+                "TRACE RETRIEVAL id=%s\n%s",
+                request_id or "-",
+                _trace_retrieval_stage("merged_pool", retrieval_pool),
+            )
+
+    pre_rerank = list(retrieval_pool)
     if settings.ENABLE_RERANK:
         results = reranker.rerank(
-            question, results, top_k=effective_top_k, request_id=request_id
+            question, retrieval_pool, top_k=final_top_k, request_id=request_id
         )
+    else:
+        results = retrieval_pool[:final_top_k]
 
     if trace_logger.isEnabledFor(logging.INFO):
         meta = (
             "meta: q_len={q_len} top_k={top_k} pool={pool} rows={rows} embed_dim={embed_dim} "
-            "embed_ms={embed_ms:.1f} query_ms={query_ms:.1f} model={model} "
-            "rerank={rerank} rerank_model={rerank_model}"
+            "embed_ms={embed_ms:.1f} vector_ms={vector_ms:.1f} model={model} "
+            "rerank={rerank} rerank_model={rerank_model} "
+            "hybrid={hybrid} n_vec={n_vec} n_fts={n_fts} rrf_top_m={rrf_top_m} "
+            "rows_vec={rows_vec} rows_fts={rows_fts}"
         ).format(
             q_len=len(question),
-            top_k=effective_top_k,
-            pool=pool_size,
+            top_k=final_top_k,
+            pool=len(pre_rerank),
             rows=len(results),
             embed_dim=len(embedding),
             embed_ms=embed_ms,
-            query_ms=query_ms,
+            vector_ms=vector_ms,
             model=settings.EMBEDDING_MODEL,
             rerank=settings.ENABLE_RERANK,
             rerank_model=settings.RERANK_MODEL if settings.ENABLE_RERANK else "-",
+            hybrid=settings.ENABLE_HYBRID,
+            n_vec=vector_limit,
+            n_fts=fts_limit if settings.ENABLE_HYBRID else 0,
+            rrf_top_m=rrf_top_m if settings.ENABLE_HYBRID else 0,
+            rows_vec=len(vector_list),
+            rows_fts=len(fts_list),
         )
         query_text = _trace_truncate(question, settings.TRACE_MAX_TEXT_CHARS)
         query_block = "\n  ".join(query_text.splitlines()) if query_text else "(vacio)"
         if settings.ENABLE_RERANK:
-            pool_block = _trace_chunks(pre_rerank)
-            final_block = _trace_chunks(results, include_scores=True)
+            pool_block = _trace_chunks(
+                pre_rerank,
+                include_rrf_scores=settings.ENABLE_HYBRID,
+            )
+            final_block = _trace_chunks(
+                results,
+                include_rerank_scores=True,
+                include_rrf_scores=settings.ENABLE_HYBRID,
+            )
             trace_logger.info(
                 "TRACE RAG id=%s\n%s\nquery_text:\n  %s\nchunks_pool:\n%s\nchunks_final:\n%s",
                 request_id or "-",
@@ -171,7 +274,10 @@ def retrieve_context(
                 final_block,
             )
         else:
-            chunks_block = _trace_chunks(results)
+            chunks_block = _trace_chunks(
+                results,
+                include_rrf_scores=settings.ENABLE_HYBRID,
+            )
             trace_logger.info(
                 "TRACE RAG id=%s\n%s\nquery_text:\n  %s\nchunks:\n%s",
                 request_id or "-",
@@ -179,7 +285,30 @@ def retrieve_context(
                 query_block,
                 chunks_block,
             )
+
+    if hybrid_warning and settings.RETRIEVAL_DEBUG and trace_logger.isEnabledFor(logging.INFO):
+        trace_logger.info(
+            "TRACE RETRIEVAL id=%s\nhybrid_warning: %s",
+            request_id or "-",
+            hybrid_warning,
+        )
+
     return results
+
+
+def _row_to_candidate(row: Dict[str, Any]) -> Dict[str, Any]:
+    candidate: Dict[str, Any] = {
+        "doc_id": str(row.get(ROW_ID_KEY) or "").strip(),
+        "text": row.get(settings.TEXT_COLUMN),
+        "url": row.get(settings.URL_COLUMN),
+        "title": row.get(settings.TITLE_COLUMN) if settings.TITLE_COLUMN else None,
+        "section": row.get(settings.SECTION_COLUMN) if settings.SECTION_COLUMN else None,
+    }
+    if row.get(FTS_SCORE_KEY) is not None:
+        candidate["fts_score"] = float(row[FTS_SCORE_KEY])
+    if not candidate["doc_id"]:
+        candidate["doc_id"] = _candidate_reference(candidate)
+    return candidate
 
 
 def _resolve_top_k(top_k: Optional[int]) -> int:
@@ -198,6 +327,33 @@ def _resolve_pool_size(final_top_k: int) -> int:
     if pool_size <= 0:
         pool_size = final_top_k
     return max(pool_size, final_top_k)
+
+
+def _resolve_vector_limit(pool_size: int) -> int:
+    if not settings.ENABLE_HYBRID:
+        return pool_size
+    n_vec = settings.N_VEC or pool_size
+    if n_vec <= 0:
+        n_vec = pool_size
+    return max(n_vec, pool_size)
+
+
+def _resolve_fts_limit(pool_size: int) -> int:
+    if not settings.ENABLE_HYBRID:
+        return 0
+    n_fts = settings.N_FTS or pool_size
+    if n_fts <= 0:
+        n_fts = pool_size
+    return max(n_fts, pool_size)
+
+
+def _resolve_rrf_top_m(pool_size: int) -> int:
+    if not settings.ENABLE_HYBRID:
+        return pool_size
+    top_m = settings.RRF_TOP_M or pool_size
+    if top_m <= 0:
+        top_m = pool_size
+    return max(top_m, pool_size)
 
 
 def build_context_block(chunks: List[Dict[str, Any]]) -> str:

@@ -35,6 +35,21 @@ class Settings(BaseSettings):
     RERANK_COMPRESS_RATIO: Optional[int] = None
     RETRIEVAL_DEBUG: bool = False
 
+    ENABLE_HYBRID: bool = False
+    HYBRID_STRICT_MODE: bool = False
+    N_VEC: int = 50
+    N_FTS: int = 50
+    FTS_LANGUAGE: str = "simple"
+    FTS_TSVECTOR_COLUMN: str = "content_tsv"
+    FTS_QUERY_MAX_CHARS: int = 320
+    FTS_KEYWORDS_MAX_TERMS: int = 14
+    FTS_KEYWORDS_MIN_TERM_LEN: int = 3
+    FTS_ENABLE_RELAXED_FALLBACK: bool = True
+    RRF_K: int = 60
+    RRF_TOP_M: int = 30
+    RRF_VECTOR_WEIGHT: float = 1.0
+    RRF_FTS_WEIGHT: float = 0.6
+
     LOG_LEVEL: str = "INFO"
     TRACE_LOG_ENABLED: bool = False
     TRACE_LOG_LEVEL: str = "INFO"
@@ -55,6 +70,7 @@ class Settings(BaseSettings):
             if normalized:
                 return normalized
         return "INFO"
+
     APP_ENV: str = "dev"
     APP_SHOW_REFERENCES: Optional[bool] = None
     DEFAULT_TEMPERATURE: float = 0.1
@@ -139,6 +155,27 @@ class Settings(BaseSettings):
         if env not in allowed:
             raise ValueError(f"APP_ENV must be one of {sorted(allowed)}")
         return env
+
+    @field_validator("FTS_LANGUAGE", "FTS_TSVECTOR_COLUMN", mode="before")
+    @classmethod
+    def _normalize_fts_strings(cls, value: Optional[str]) -> str:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+        raise ValueError("FTS settings cannot be empty")
+
+    @field_validator(
+        "FTS_QUERY_MAX_CHARS",
+        "FTS_KEYWORDS_MAX_TERMS",
+        "FTS_KEYWORDS_MIN_TERM_LEN",
+        mode="after",
+    )
+    @classmethod
+    def _validate_fts_positive_ints(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("FTS numeric settings must be > 0")
+        return value
 
     @field_validator("DISTANCE_OP")
     @classmethod

@@ -37,6 +37,37 @@ Notes:
 - For reranking to have impact, `RERANK_POOL_SIZE` must be > `RERANK_TOP_K`.
 - If the lightweight model is incompatible with your `transformers` build, the code falls back to `RERANK_FALLBACK_MODEL` and logs a warning.
 
+## Hybrid Retrieval
+The backend can run hybrid retrieval (vector + Postgres FTS) before reranking.
+
+Pipeline when `ENABLE_HYBRID=true`:
+- Vector retrieval: top `N_VEC`
+- FTS retrieval (strict): compact keyword query via `websearch_to_tsquery`
+- FTS retrieval (relaxed fallback): OR query via `to_tsquery` if strict returns 0
+- RRF fusion: `RRF_K`, `RRF_VECTOR_WEIGHT`, `RRF_FTS_WEIGHT`, output top `RRF_TOP_M`
+- Existing reranker receives the merged pool and returns final top K
+
+Relevant `.env` knobs:
+- `ENABLE_HYBRID`
+- `HYBRID_STRICT_MODE`
+- `N_VEC`
+- `N_FTS`
+- `FTS_LANGUAGE`
+- `FTS_TSVECTOR_COLUMN`
+- `FTS_QUERY_MAX_CHARS`
+- `FTS_KEYWORDS_MAX_TERMS`
+- `FTS_KEYWORDS_MIN_TERM_LEN`
+- `FTS_ENABLE_RELAXED_FALLBACK`
+- `RRF_K`
+- `RRF_TOP_M`
+- `RRF_VECTOR_WEIGHT`
+- `RRF_FTS_WEIGHT`
+- `RETRIEVAL_DEBUG`
+
+Failure behavior:
+- If hybrid is enabled and FTS fails, default behavior is warning + fallback to vector-only.
+- Set `HYBRID_STRICT_MODE=true` to fail fast instead of fallback.
+
 ## Requirements
 - Python 3.11+
 - Postgres with pgvector and your docs already indexed
