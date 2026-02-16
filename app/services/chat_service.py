@@ -22,6 +22,7 @@ from ..rag import (
     retrieve_context,
 )
 from ..schemas import ChatCompletionRequest, DebugWorkflowRequest
+from ..token_budget import PromptBudgetResult, trim_messages_to_budget
 from ..workflow.control_parser import parse_control_state
 from ..workflow.n8n_client import N8NClient
 from ..workflow.planner import PlanScope, plan_scope
@@ -221,6 +222,8 @@ class ChatService:
         system_prompt = build_system_prompt(context_block)
         llm_messages = [{"role": "system", "content": system_prompt}]
         llm_messages.extend(messages_for_prompt)
+        prompt_budget = self._apply_prompt_budget(llm_messages, request_id=request_id, mode="docs")
+        llm_messages = prompt_budget.messages
 
         model = resolve_model(request.model)
         params = self._completion_params(request, stream=request.stream)
@@ -234,10 +237,11 @@ class ChatService:
             len(refs),
         )
         self._trace_logger.debug(
-            "docs-only prompt stats: id=%s messages=%d chars=%d",
+            "docs-only prompt stats: id=%s messages=%d chars=%d est_tokens=%d",
             request_id,
             len(llm_messages),
             self._messages_char_count(llm_messages),
+            prompt_budget.estimated_tokens_after,
         )
         self._trace_logger.debug(
             "llm request: id=%s model=%s temp=%s max_tokens=%s top_p=%s freq_pen=%s pres_pen=%s stream=%s",
@@ -410,14 +414,17 @@ class ChatService:
             docs_chunks=docs_chunks,
             chat_context=chat_context,
         )
+        prompt_budget = self._apply_prompt_budget(llm_messages, request_id=request_id, mode="workflow")
+        llm_messages = prompt_budget.messages
 
         model = resolve_model(request.model)
         params = self._completion_params(request, stream=request.stream)
         self._trace_logger.debug(
-            "workflow synthesis prompt stats: id=%s messages=%d chars=%d",
+            "workflow synthesis prompt stats: id=%s messages=%d chars=%d est_tokens=%d",
             request_id,
             len(llm_messages),
             self._messages_char_count(llm_messages),
+            prompt_budget.estimated_tokens_after,
         )
         self._trace_logger.debug(
             "llm request: id=%s model=%s temp=%s max_tokens=%s top_p=%s freq_pen=%s pres_pen=%s stream=%s",
@@ -607,6 +614,27 @@ class ChatService:
             meta,
             body,
         )
+
+    def _apply_prompt_budget(
+        self,
+        messages: List[Dict[str, str]],
+        request_id: str,
+        mode: str,
+    ) -> PromptBudgetResult:
+        limit = max(settings.CONVERSATION_MAX_TOKENS, 256)
+        result = trim_messages_to_budget(messages, max_tokens=limit)
+        if result.changed:
+            self._trace_logger.info(
+                "prompt budget applied: id=%s mode=%s limit=%d before=%d after=%d dropped=%d truncated=%d",
+                request_id,
+                mode,
+                limit,
+                result.estimated_tokens_before,
+                result.estimated_tokens_after,
+                result.dropped_messages,
+                result.truncated_messages,
+            )
+        return result
 
     @staticmethod
     def _trace_text_block(label: str, text: str) -> str:

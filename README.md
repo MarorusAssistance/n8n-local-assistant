@@ -11,6 +11,32 @@ Local FastAPI backend that exposes an OpenAI-compatible API with RAG over your n
 - References appended at the end of each answer (solo en `dev`/`qa`)
 - No secrets logged
 
+
+## Reranking
+Optional cross-encoder reranking to improve precision after retrieval.
+
+How it works:
+- Retrieval builds a larger pool (`RERANK_POOL_SIZE`).
+- Reranker sorts candidates by relevance.
+- Only the top K (`RERANK_TOP_K`) are sent to the LLM.
+
+Relevant .env knobs:
+- `ENABLE_RERANK=true|false`
+- `RERANK_MODEL` (default: `BAAI/bge-reranker-v2.5-gemma2-lightweight`)
+- `RERANK_FALLBACK_MODEL` (default: `BAAI/bge-reranker-v2-m3`)
+- `RERANK_POOL_SIZE` (recommend 20-50)
+- `RERANK_TOP_K` (recommend 6-10)
+- `RERANK_MAX_CHARS` (truncate chunks before scoring)
+- `RERANK_USE_FP16`
+- `RERANK_BATCH_SIZE`
+- `RERANK_DEVICE` (e.g. `cuda:0` or `cpu`)
+- `RERANK_CUTOFF_LAYERS`, `RERANK_COMPRESS_LAYERS`, `RERANK_COMPRESS_RATIO`
+- `RETRIEVAL_DEBUG=true` to log before/after rerank lists
+
+Notes:
+- For reranking to have impact, `RERANK_POOL_SIZE` must be > `RERANK_TOP_K`.
+- If the lightweight model is incompatible with your `transformers` build, the code falls back to `RERANK_FALLBACK_MODEL` and logs a warning.
+
 ## Requirements
 - Python 3.11+
 - Postgres with pgvector and your docs already indexed
@@ -114,6 +140,7 @@ Parámetros ajustables en `.env`:
 The API keeps a short history per conversation for context and can persist chats in Postgres.
 - Enable/disable with `MEMORY_ENABLED`
 - Limit context window with `MEMORY_MAX_MESSAGES`
+- Hard prompt budget by estimated tokens with `CONVERSATION_MAX_TOKENS` (default: `16000`)
 - `MEMORY_TTL_SECONDS` only applies to the in-memory backend (eviction)
 - Provide a conversation key via `X-Conversation-Id` header, `conversation_id` in the request body, or `user`
 - If your client doesn't send an ID, you can set `MEMORY_AUTO_CREATE_CONVERSATION_ID=true` to auto-generate one (creates a new chat per request unless the client reuses it)
@@ -187,6 +214,33 @@ METADATA_COLUMN=metadata
 URL_JSON_PATH=metadata_docs.url
 SOURCE_JSON_PATH=metadata_docs.source
 ```
+
+If you use the bundled indexer (`scripts/index_docs.py`), it stores metadata at the top level:
+```
+metadata: { source, url, title, section, ... }
+```
+In that case, set:
+```
+METADATA_COLUMN=metadata
+URL_JSON_PATH=url
+TITLE_JSON_PATH=title
+SECTION_JSON_PATH=section
+SOURCE_JSON_PATH=source
+```
+
+## Indexing markdown docs
+This repo includes a local indexer that chunks Markdown by blocks (headings, lists, tables, code fences) and writes embeddings to Postgres.
+
+Basic usage:
+```bash
+python scripts/index_docs.py --input-dir "C:\path\to\docs" --source n8n-docs
+```
+
+Options:
+- `--base-url` for canonical links (default `https://docs.n8n.io`)
+- `--docs-root` to trim a leading folder from URLs (default `docs`)
+- `--purge-source` to delete existing rows for the source before indexing
+- `--dry-run` to inspect block counts without embeddings/DB writes
 
 ## Notes
 - `EMBEDDING_MODEL` must match the model used to index your docs.

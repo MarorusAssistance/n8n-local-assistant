@@ -78,6 +78,7 @@ class Settings(BaseSettings):
 
     MEMORY_ENABLED: bool = True
     MEMORY_MAX_MESSAGES: int = 20
+    CONVERSATION_MAX_TOKENS: int = 16000
     MEMORY_TTL_SECONDS: int = 3600
     MEMORY_HEADER: str = "x-conversation-id"
     MEMORY_AUTO_CREATE_CONVERSATION_ID: bool = False
