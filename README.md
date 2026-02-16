@@ -242,6 +242,46 @@ Options:
 - `--purge-source` to delete existing rows for the source before indexing
 - `--dry-run` to inspect block counts without embeddings/DB writes
 
+## Indexing n8n definitions (nodes + credentials)
+This repo includes a deterministic indexer for `nodes.json` and `credentials.json` that generates structured chunks with metadata and embeddings.
+
+Dry run (no embeddings, no DB writes):
+```bash
+python scripts/index_n8n_definitions.py --dry-run
+```
+
+Full indexing (embeddings + upsert incremental in Postgres):
+```bash
+python scripts/index_n8n_definitions.py
+```
+
+Useful options:
+- `--nodes-file` and `--credentials-file` to override input paths
+- `--skip-nodes` or `--skip-credentials` to index only one source
+- `--source-nodes` and `--source-credentials` to control source tags
+- `--include-raw-json` to store per-chunk JSON payload in metadata
+- `--nodes-limit` and `--credentials-limit` for quick test runs
+
+## Linking docs -> defs
+After docs + definitions are indexed in the same chunks table, run the linker to create page-level relations:
+- `doc_page_node_link`
+- `doc_page_credential_link`
+
+Dry run:
+```bash
+python scripts/link_docs_defs.py --dry-run --docs-source n8n-docs --nodes-source n8n-nodes --credentials-source n8n-credentials
+```
+
+Apply changes (upsert + prune stale links for processed pages):
+```bash
+python scripts/link_docs_defs.py --docs-source n8n-docs --nodes-source n8n-nodes --credentials-source n8n-credentials
+```
+
+Useful options:
+- `--doc-page-key` (repeatable) to process specific pages only
+- `--mention-limit-per-page` to cap weak links (`mention`)
+- `--similarity-limit-per-page` and `--similarity-threshold` for `similarity` fallback tuning
+
 ## Notes
 - `EMBEDDING_MODEL` must match the model used to index your docs.
 - If LM Studio does not support embeddings for that model, the API will return a clear error.
