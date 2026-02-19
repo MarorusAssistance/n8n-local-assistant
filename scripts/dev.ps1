@@ -6,8 +6,8 @@ param(
   [string]$LmStudioCli = "lms",
   [string]$LmStudioBind = "0.0.0.0",
   [int]$LmStudioPort = 1234,
-  [string]$LmStudioLlmModel = "mistralai/ministral-3-14b-reasoning",
-  [string]$LmStudioEmbeddingModel = "text-embedding-bge-m3",
+  [string]$LmStudioLlmModel = "",
+  [string]$LmStudioEmbeddingModel = "",
   [int]$LmStudioLlmContextLength = 10000,
   [int]$LmStudioEmbeddingContextLength = 4096,
   [string]$LmStudioGpuOffload = "max",
@@ -29,6 +29,61 @@ if ([string]::IsNullOrWhiteSpace($OpenWebUiDir)) {
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $openWebUiExe = Join-Path $OpenWebUiDir ".venv\Scripts\open-webui.exe"
 $uvicornExe = Join-Path $repoRoot ".venv\Scripts\uvicorn.exe"
+
+$envFile = Join-Path $repoRoot ".env"
+
+function Get-DotEnvMap {
+  param([string]$Path)
+
+  $map = @{}
+  if (!(Test-Path $Path)) {
+    return $map
+  }
+
+  foreach ($line in Get-Content $Path) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed -or $trimmed.StartsWith("#")) {
+      continue
+    }
+
+    $parts = $trimmed.Split("=", 2)
+    if ($parts.Count -ne 2) {
+      continue
+    }
+
+    $key = $parts[0].Trim()
+    $value = $parts[1].Trim()
+    if ([string]::IsNullOrWhiteSpace($key)) {
+      continue
+    }
+
+    if ((($value.StartsWith(""")) -and ($value.EndsWith("""))) -or (($value.StartsWith("'")) -and ($value.EndsWith("'")))) {
+      if ($value.Length -ge 2) {
+        $value = $value.Substring(1, $value.Length - 2)
+      }
+    }
+
+    $map[$key] = $value
+  }
+
+  return $map
+}
+
+$dotEnv = Get-DotEnvMap -Path $envFile
+
+if ([string]::IsNullOrWhiteSpace($LmStudioLlmModel)) {
+  $LmStudioLlmModel = $dotEnv["LLM_MODEL"]
+}
+if ([string]::IsNullOrWhiteSpace($LmStudioEmbeddingModel)) {
+  $LmStudioEmbeddingModel = $dotEnv["EMBEDDING_MODEL"]
+}
+
+if ([string]::IsNullOrWhiteSpace($LmStudioLlmModel)) {
+  $LmStudioLlmModel = "mistralai/ministral-3-14b-reasoning"
+}
+if ([string]::IsNullOrWhiteSpace($LmStudioEmbeddingModel)) {
+  $LmStudioEmbeddingModel = "text-embedding-bge-m3"
+}
 
 if ([string]::IsNullOrWhiteSpace($LmStudioLlmIdentifier)) {
   $LmStudioLlmIdentifier = $LmStudioLlmModel
