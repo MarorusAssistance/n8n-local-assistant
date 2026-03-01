@@ -313,6 +313,21 @@ Useful options:
 - `--mention-limit-per-page` to cap weak links (`mention`)
 - `--similarity-limit-per-page` and `--similarity-threshold` for `similarity` fallback tuning
 
+## Injecting linked defs in RAG
+After reranking, the backend can enrich the prompt with linked node/credential definition chunks for the top docs.
+
+Relevant `.env` knobs:
+- `LINKED_DEFS_ENABLED=true|false`
+- `LINKED_DEFS_TOP_DOCS` (default: `6`)
+- `LINKED_DEFS_NODES_SOURCE` (default: `n8n-nodes`)
+- `LINKED_DEFS_CREDENTIALS_SOURCE` (default: `n8n-credentials`)
+- `LINKED_DEFS_MAX_NODE_DEFS` (default: `12`)
+- `LINKED_DEFS_MAX_CREDENTIAL_DEFS` (default: `12`)
+
+Notes:
+- This does not reindex anything. It only reads `doc_page_node_link` / `doc_page_credential_link`.
+- If relation tables are missing, retrieval continues with docs-only context.
+
 ## Notes
 - `EMBEDDING_MODEL` must match the model used to index your docs.
 - If LM Studio does not support embeddings for that model, the API will return a clear error.

@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     DOCS_SOURCE_FILTER: Optional[str] = None
     TOP_K: int = 10
     MAX_CONTEXT_CHARS: int = 8000
+    REASONING_PIPELINE_ENABLED: bool = False
+    ROUTER_USE_LLM: bool = False
+    MAX_NODE_CARDS: int = 10
+    MAX_DOC_CHUNKS: int = 6
+    MAX_CONTEXT_TOKENS: int = 2500
     ENABLE_RERANK: bool = False
     RERANK_MODEL: str = "BAAI/bge-reranker-v2.5-gemma2-lightweight"
     RERANK_FALLBACK_MODEL: Optional[str] = "BAAI/bge-reranker-v2-m3"
@@ -34,6 +39,12 @@ class Settings(BaseSettings):
     RERANK_COMPRESS_LAYERS: Optional[str] = None
     RERANK_COMPRESS_RATIO: Optional[int] = None
     RETRIEVAL_DEBUG: bool = False
+    LINKED_DEFS_ENABLED: bool = True
+    LINKED_DEFS_TOP_DOCS: int = 6
+    LINKED_DEFS_NODES_SOURCE: str = "n8n-nodes"
+    LINKED_DEFS_CREDENTIALS_SOURCE: str = "n8n-credentials"
+    LINKED_DEFS_MAX_NODE_DEFS: int = 12
+    LINKED_DEFS_MAX_CREDENTIAL_DEFS: int = 12
 
     ENABLE_HYBRID: bool = False
     HYBRID_STRICT_MODE: bool = False
@@ -175,6 +186,30 @@ class Settings(BaseSettings):
     def _validate_fts_positive_ints(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("FTS numeric settings must be > 0")
+        return value
+
+    @field_validator(
+        "LINKED_DEFS_TOP_DOCS",
+        "LINKED_DEFS_MAX_NODE_DEFS",
+        "LINKED_DEFS_MAX_CREDENTIAL_DEFS",
+        mode="after",
+    )
+    @classmethod
+    def _validate_linked_defs_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("Linked definitions limits must be >= 0")
+        return value
+
+    @field_validator(
+        "MAX_NODE_CARDS",
+        "MAX_DOC_CHUNKS",
+        "MAX_CONTEXT_TOKENS",
+        mode="after",
+    )
+    @classmethod
+    def _validate_reasoning_limits(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("Reasoning limits must be > 0")
         return value
 
     @field_validator("DISTANCE_OP")

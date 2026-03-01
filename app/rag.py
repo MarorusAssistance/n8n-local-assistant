@@ -7,7 +7,15 @@ import re
 import time
 
 from .config import settings
-from .db import FTS_SCORE_KEY, ROW_ID_KEY, query_fts, query_similar
+from .db import (
+    FTS_SCORE_KEY,
+    METADATA_KEY,
+    ROW_ID_KEY,
+    query_fts,
+    query_related_definition_chunks,
+    query_similar,
+)
+from .doc_links import derive_doc_page_key
 from .hybrid import rrf_fuse
 from .llm import create_embedding
 from .reranker import reranker
@@ -228,13 +236,34 @@ def retrieve_context(
     else:
         results = retrieval_pool[:final_top_k]
 
+    docs_results = list(results)
+    linked_defs: List[Dict[str, Any]] = []
+    page_keys = _extract_doc_page_keys(
+        docs_results,
+        max_docs=settings.LINKED_DEFS_TOP_DOCS,
+    )
+    if settings.LINKED_DEFS_ENABLED and page_keys:
+        try:
+            linked_defs = query_related_definition_chunks(page_keys, request_id=request_id)
+        except Exception as exc:
+            trace_logger.warning(
+                "linked defs retrieval failed: id=%s error=%s",
+                request_id or "-",
+                exc,
+            )
+            linked_defs = []
+    if linked_defs:
+        results = _merge_unique_chunks(docs_results, linked_defs)
+
+    linked_defs_count = max(0, len(results) - len(docs_results))
+
     if trace_logger.isEnabledFor(logging.INFO):
         meta = (
             "meta: q_len={q_len} top_k={top_k} pool={pool} rows={rows} embed_dim={embed_dim} "
             "embed_ms={embed_ms:.1f} vector_ms={vector_ms:.1f} model={model} "
             "rerank={rerank} rerank_model={rerank_model} "
             "hybrid={hybrid} n_vec={n_vec} n_fts={n_fts} rrf_top_m={rrf_top_m} "
-            "rows_vec={rows_vec} rows_fts={rows_fts}"
+            "rows_vec={rows_vec} rows_fts={rows_fts} rows_docs={rows_docs} rows_linked_defs={rows_linked_defs}"
         ).format(
             q_len=len(question),
             top_k=final_top_k,
@@ -252,6 +281,8 @@ def retrieve_context(
             rrf_top_m=rrf_top_m if settings.ENABLE_HYBRID else 0,
             rows_vec=len(vector_list),
             rows_fts=len(fts_list),
+            rows_docs=len(docs_results),
+            rows_linked_defs=linked_defs_count,
         )
         query_text = _trace_truncate(question, settings.TRACE_MAX_TEXT_CHARS)
         query_block = "\n  ".join(query_text.splitlines()) if query_text else "(vacio)"
@@ -304,6 +335,9 @@ def _row_to_candidate(row: Dict[str, Any]) -> Dict[str, Any]:
         "title": row.get(settings.TITLE_COLUMN) if settings.TITLE_COLUMN else None,
         "section": row.get(settings.SECTION_COLUMN) if settings.SECTION_COLUMN else None,
     }
+    metadata = row.get(METADATA_KEY)
+    if isinstance(metadata, dict):
+        candidate["metadata"] = metadata
     if row.get(FTS_SCORE_KEY) is not None:
         candidate["fts_score"] = float(row[FTS_SCORE_KEY])
     if not candidate["doc_id"]:
@@ -356,10 +390,51 @@ def _resolve_rrf_top_m(pool_size: int) -> int:
     return max(top_m, pool_size)
 
 
+def _extract_doc_page_keys(chunks: List[Dict[str, Any]], max_docs: int) -> List[str]:
+    if max_docs <= 0:
+        return []
+    page_keys: List[str] = []
+    seen = set()
+    for chunk in chunks[:max_docs]:
+        metadata = chunk.get("metadata")
+        metadata_map = metadata if isinstance(metadata, dict) else {}
+        row_url = str(chunk.get("url") or "")
+        page_key, _, _ = derive_doc_page_key(metadata_map, row_url=row_url)
+        if not page_key or page_key in seen:
+            continue
+        seen.add(page_key)
+        page_keys.append(page_key)
+    return page_keys
+
+
+def _chunk_identity(chunk: Dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(chunk.get("doc_id") or "").strip(),
+        str(chunk.get("url") or "").strip(),
+        str(chunk.get("title") or "").strip(),
+        str(chunk.get("section") or "").strip(),
+    )
+
+
+def _merge_unique_chunks(
+    docs_chunks: List[Dict[str, Any]],
+    linked_chunks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged = list(docs_chunks)
+    seen = {_chunk_identity(chunk) for chunk in merged}
+    for chunk in linked_chunks:
+        identity = _chunk_identity(chunk)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        merged.append(chunk)
+    return merged
+
+
 def build_context_block(chunks: List[Dict[str, Any]]) -> str:
     max_chars = settings.MAX_CONTEXT_CHARS
     used = 0
-    lines: List[str] = ["Contexto de documentacion (citado):"]
+    lines: List[str] = ["Contexto de documentacion y definiciones relacionadas (citado):"]
 
     for index, chunk in enumerate(chunks, start=1):
         text = (chunk.get("text") or "").strip()
@@ -448,6 +523,8 @@ def collect_references(
     refs: List[Dict[str, str]] = []
     seen = set()
     for chunk in chunks:
+        if chunk.get("context_kind") == "linked_def":
+            continue
         text = (chunk.get("text") or "").strip()
         if not text:
             continue

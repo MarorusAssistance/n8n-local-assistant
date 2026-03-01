@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import logging
 import re
 
 import psycopg
+from psycopg import Error as PsycopgError
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 from psycopg import sql
 from psycopg.rows import dict_row
 
 from .config import settings
+from .doc_links import METHOD_PRIORITY
 
 
 _JSON_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -112,6 +114,9 @@ _FTS_STOPWORDS_ES: Set[str] = {
 }
 ROW_ID_KEY = "__row_id"
 FTS_SCORE_KEY = "__fts_score"
+METADATA_KEY = "__metadata"
+LINK_META_KIND_KEY = "__meta_kind"
+LINK_ENTITY_KEY = "__entity_id"
 trace_logger = logging.getLogger("n8n-assistant.trace")
 
 
@@ -251,6 +256,15 @@ def _build_select_items() -> Tuple[List[sql.SQL], List[str]]:
     )
     select_preview.append(f"ctid::text AS {ROW_ID_KEY}")
 
+    if settings.METADATA_COLUMN:
+        select_items.append(
+            sql.SQL("{meta_col} AS {alias}").format(
+                meta_col=sql.Identifier(settings.METADATA_COLUMN),
+                alias=sql.Identifier(METADATA_KEY),
+            )
+        )
+        select_preview.append(f"{settings.METADATA_COLUMN} AS {METADATA_KEY}")
+
     return select_items, select_preview
 
 
@@ -276,6 +290,42 @@ def _source_filter_condition() -> Tuple[Optional[sql.SQL], List[Any], str, str]:
         return condition, [settings.DOCS_SOURCE_FILTER], preview, source_value
 
     raise ValueError("DOCS_SOURCE_FILTER set but no SOURCE_COLUMN or SOURCE_JSON_PATH")
+
+
+def _source_match_condition(source_value: Optional[str]) -> Tuple[Optional[sql.SQL], List[Any]]:
+    if not source_value:
+        return None, []
+
+    if settings.SOURCE_JSON_PATH:
+        condition = sql.SQL("{source_expr} = %s").format(
+            source_expr=_json_path_expr(settings.SOURCE_JSON_PATH)
+        )
+        return condition, [source_value]
+
+    if settings.SOURCE_COLUMN:
+        condition = sql.SQL("{source_col} = %s").format(
+            source_col=sql.Identifier(settings.SOURCE_COLUMN)
+        )
+        return condition, [source_value]
+
+    return None, []
+
+
+def _select_output_expr(
+    column_name: Optional[str],
+    json_path: Optional[str],
+    alias: str,
+) -> sql.SQL:
+    if json_path:
+        expr = _json_path_expr(json_path)
+    elif column_name:
+        expr = sql.Identifier(column_name)
+    else:
+        expr = sql.SQL("NULL::text")
+    return sql.SQL("{expr} AS {alias}").format(
+        expr=expr,
+        alias=sql.Identifier(alias),
+    )
 
 
 def _combine_where(conditions: List[sql.SQL]) -> sql.SQL:
@@ -547,3 +597,354 @@ def query_fts(
         filter_value=filter_value,
         request_id=request_id,
     )
+
+
+def _relation_table_exists(conn: psycopg.Connection, table_name: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (table_name,))
+        row = cur.fetchone()
+    if not row:
+        return False
+    return bool(row[0])
+
+
+def _fetch_link_rows(
+    conn: psycopg.Connection,
+    *,
+    table_name: str,
+    entity_column: str,
+    doc_page_keys: Sequence[str],
+) -> List[Dict[str, Any]]:
+    if not doc_page_keys:
+        return []
+
+    query = sql.SQL(
+        "SELECT doc_page_key, {entity_col} AS entity_id, confidence, method::text AS method, evidence "
+        "FROM {table} "
+        "WHERE doc_page_key = ANY(%s)"
+    ).format(
+        entity_col=sql.Identifier(entity_column),
+        table=sql.Identifier(table_name),
+    )
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, (list(doc_page_keys),))
+        rows = cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+def _best_links_by_entity(
+    links: Sequence[Dict[str, Any]],
+    *,
+    max_items: int,
+) -> List[Dict[str, Any]]:
+    if max_items <= 0:
+        return []
+
+    best: Dict[str, Dict[str, Any]] = {}
+    for row in links:
+        entity_id = str(row.get("entity_id") or "").strip()
+        if not entity_id:
+            continue
+
+        method = str(row.get("method") or "").strip()
+        confidence = float(row.get("confidence") or 0.0)
+        payload = {
+            "entity_id": entity_id,
+            "doc_page_key": str(row.get("doc_page_key") or "").strip(),
+            "method": method,
+            "confidence": confidence,
+            "evidence": str(row.get("evidence") or "").strip(),
+        }
+
+        existing = best.get(entity_id)
+        if existing is None:
+            best[entity_id] = payload
+            continue
+
+        new_rank = METHOD_PRIORITY.get(method, 0)
+        old_rank = METHOD_PRIORITY.get(existing.get("method", ""), 0)
+        if new_rank > old_rank:
+            best[entity_id] = payload
+            continue
+        if new_rank == old_rank and confidence > float(existing.get("confidence") or 0.0):
+            best[entity_id] = payload
+
+    ordered = sorted(
+        best.values(),
+        key=lambda item: (
+            METHOD_PRIORITY.get(str(item.get("method") or ""), 0),
+            float(item.get("confidence") or 0.0),
+            str(item.get("entity_id") or ""),
+        ),
+        reverse=True,
+    )
+    return ordered[:max_items]
+
+
+def _fetch_definition_rows(
+    conn: psycopg.Connection,
+    *,
+    entity_key: str,
+    entity_ids: Sequence[str],
+    source_value: Optional[str],
+    preferred_kind: str,
+) -> Dict[str, Dict[str, Any]]:
+    if not entity_ids:
+        return {}
+    if not settings.METADATA_COLUMN:
+        return {}
+
+    metadata_col = sql.Identifier(settings.METADATA_COLUMN)
+    entity_expr = sql.SQL("{meta_col} ->> {field}").format(
+        meta_col=metadata_col,
+        field=sql.Literal(entity_key),
+    )
+    kind_expr = sql.SQL("{meta_col} ->> 'kind'").format(meta_col=metadata_col)
+
+    select_cols = [
+        sql.SQL("{text_col} AS text").format(text_col=sql.Identifier(settings.TEXT_COLUMN)),
+        _select_output_expr(settings.URL_COLUMN, settings.URL_JSON_PATH, "url"),
+        _select_output_expr(settings.TITLE_COLUMN, settings.TITLE_JSON_PATH, "title"),
+        _select_output_expr(settings.SECTION_COLUMN, settings.SECTION_JSON_PATH, "section"),
+        sql.SQL("{meta_col} AS metadata").format(meta_col=metadata_col),
+        sql.SQL("{entity_expr} AS {alias}").format(
+            entity_expr=entity_expr,
+            alias=sql.Identifier(LINK_ENTITY_KEY),
+        ),
+        sql.SQL("{kind_expr} AS {alias}").format(
+            kind_expr=kind_expr,
+            alias=sql.Identifier(LINK_META_KIND_KEY),
+        ),
+    ]
+
+    conditions: List[sql.SQL] = [
+        sql.SQL("{entity_expr} = ANY(%s)").format(entity_expr=entity_expr),
+    ]
+    params: List[Any] = [list(entity_ids)]
+
+    source_condition, source_params = _source_match_condition(source_value)
+    if source_condition is not None:
+        conditions.append(source_condition)
+        params.extend(source_params)
+
+    where_clause = _combine_where(conditions)
+    query = sql.SQL(
+        "SELECT {select_cols} "
+        "FROM {table} "
+        "{where_clause}"
+    ).format(
+        select_cols=sql.SQL(", ").join(select_cols),
+        table=sql.Identifier(settings.TABLE_NAME),
+        where_clause=where_clause,
+    )
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    def row_score(item: Dict[str, Any]) -> Tuple[int, int]:
+        kind = str(item.get(LINK_META_KIND_KEY) or "")
+        text_len = len(str(item.get("text") or ""))
+        return (1 if kind == preferred_kind else 0, text_len)
+
+    selected: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        payload = dict(row)
+        entity_id = str(payload.get(LINK_ENTITY_KEY) or "").strip()
+        if not entity_id:
+            continue
+
+        existing = selected.get(entity_id)
+        if existing is None:
+            selected[entity_id] = payload
+            continue
+        if row_score(payload) > row_score(existing):
+            selected[entity_id] = payload
+
+    return selected
+
+
+def _build_related_chunk(
+    row: Dict[str, Any],
+    *,
+    link: Dict[str, Any],
+    label: str,
+) -> Optional[Dict[str, Any]]:
+    text = str(row.get("text") or "").strip()
+    if not text:
+        return None
+
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    entity_id = str(link.get("entity_id") or row.get(LINK_ENTITY_KEY) or "").strip()
+    if not entity_id:
+        return None
+
+    display_name = str(metadata.get("displayName") or "").strip()
+    title = str(row.get("title") or "").strip()
+    if not title:
+        title = f"{label}: {display_name or entity_id}"
+
+    section = str(row.get("section") or "").strip()
+    if not section:
+        method = str(link.get("method") or "").strip()
+        confidence = float(link.get("confidence") or 0.0)
+        section = f"linked_by={method} ({confidence:.2f})"
+
+    url = str(row.get("url") or "").strip()
+    kind = str(row.get(LINK_META_KIND_KEY) or metadata.get("kind") or "").strip()
+
+    return {
+        "doc_id": f"linked:{label.lower()}:{entity_id}",
+        "text": text,
+        "url": url,
+        "title": title,
+        "section": section,
+        "metadata": metadata,
+        "context_kind": "linked_def",
+        "linked_def_type": label.lower(),
+        "linked_entity_id": entity_id,
+        "linked_kind": kind,
+        "link_method": str(link.get("method") or "").strip(),
+        "link_confidence": float(link.get("confidence") or 0.0),
+        "link_evidence": str(link.get("evidence") or "").strip(),
+        "link_doc_page_key": str(link.get("doc_page_key") or "").strip(),
+    }
+
+
+def query_related_definition_chunks(
+    doc_page_keys: Sequence[str],
+    *,
+    request_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not settings.LINKED_DEFS_ENABLED:
+        return []
+    if not doc_page_keys:
+        return []
+    if not settings.METADATA_COLUMN:
+        trace_logger.warning(
+            "linked defs disabled at runtime: id=%s METADATA_COLUMN not set",
+            request_id or "-",
+        )
+        return []
+
+    normalized_keys: List[str] = []
+    seen_keys = set()
+    for value in doc_page_keys:
+        key = str(value or "").strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        normalized_keys.append(key)
+    if not normalized_keys:
+        return []
+
+    with _connect() as conn:
+        try:
+            node_table_ok = _relation_table_exists(conn, "doc_page_node_link")
+            credential_table_ok = _relation_table_exists(conn, "doc_page_credential_link")
+        except PsycopgError as exc:
+            trace_logger.warning(
+                "linked defs relation check failed: id=%s error=%s",
+                request_id or "-",
+                exc,
+            )
+            return []
+
+        if not node_table_ok and not credential_table_ok:
+            return []
+
+        node_links_raw: List[Dict[str, Any]] = []
+        credential_links_raw: List[Dict[str, Any]] = []
+        try:
+            if node_table_ok:
+                node_links_raw = _fetch_link_rows(
+                    conn,
+                    table_name="doc_page_node_link",
+                    entity_column="node_type",
+                    doc_page_keys=normalized_keys,
+                )
+            if credential_table_ok:
+                credential_links_raw = _fetch_link_rows(
+                    conn,
+                    table_name="doc_page_credential_link",
+                    entity_column="credential_type",
+                    doc_page_keys=normalized_keys,
+                )
+        except PsycopgError as exc:
+            trace_logger.warning(
+                "linked defs relation fetch failed: id=%s error=%s",
+                request_id or "-",
+                exc,
+            )
+            return []
+
+        node_links = _best_links_by_entity(
+            node_links_raw,
+            max_items=max(0, settings.LINKED_DEFS_MAX_NODE_DEFS),
+        )
+        credential_links = _best_links_by_entity(
+            credential_links_raw,
+            max_items=max(0, settings.LINKED_DEFS_MAX_CREDENTIAL_DEFS),
+        )
+
+        node_rows = _fetch_definition_rows(
+            conn,
+            entity_key="nodeType",
+            entity_ids=[item["entity_id"] for item in node_links],
+            source_value=settings.LINKED_DEFS_NODES_SOURCE,
+            preferred_kind="NODE_OVERVIEW",
+        )
+        if node_links and not node_rows:
+            node_rows = _fetch_definition_rows(
+                conn,
+                entity_key="nodeType",
+                entity_ids=[item["entity_id"] for item in node_links],
+                source_value=None,
+                preferred_kind="NODE_OVERVIEW",
+            )
+        credential_rows = _fetch_definition_rows(
+            conn,
+            entity_key="credentialType",
+            entity_ids=[item["entity_id"] for item in credential_links],
+            source_value=settings.LINKED_DEFS_CREDENTIALS_SOURCE,
+            preferred_kind="CRED_OVERVIEW",
+        )
+        if credential_links and not credential_rows:
+            credential_rows = _fetch_definition_rows(
+                conn,
+                entity_key="credentialType",
+                entity_ids=[item["entity_id"] for item in credential_links],
+                source_value=None,
+                preferred_kind="CRED_OVERVIEW",
+            )
+
+    output: List[Dict[str, Any]] = []
+    for link in node_links:
+        row = node_rows.get(link["entity_id"])
+        if not row:
+            continue
+        chunk = _build_related_chunk(row, link=link, label="Node")
+        if chunk:
+            output.append(chunk)
+
+    for link in credential_links:
+        row = credential_rows.get(link["entity_id"])
+        if not row:
+            continue
+        chunk = _build_related_chunk(row, link=link, label="Credential")
+        if chunk:
+            output.append(chunk)
+
+    if trace_logger.isEnabledFor(logging.INFO):
+        trace_logger.info(
+            "linked defs query: id=%s pages=%d node_links=%d cred_links=%d chunks=%d",
+            request_id or "-",
+            len(normalized_keys),
+            len(node_links),
+            len(credential_links),
+            len(output),
+        )
+    return output

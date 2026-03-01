@@ -66,7 +66,6 @@ def trim_messages_to_budget(
             truncated_messages=0,
         )
 
-    token_by_index = [estimate_messages_tokens([msg]) - _TOKENS_REPLY_PRIMING for msg in normalized]
     system_indices = [idx for idx, msg in enumerate(normalized) if msg["role"] == "system"]
     last_user_idx = next(
         (idx for idx in range(len(normalized) - 1, -1, -1) if normalized[idx]["role"] == "user"),
@@ -77,76 +76,29 @@ def trim_messages_to_budget(
     if last_user_idx is not None:
         required.add(last_user_idx)
 
-    used = sum(token_by_index[idx] for idx in required) + _TOKENS_REPLY_PRIMING
-    kept_indices = set(required)
+    kept_indices = list(range(len(normalized)))
 
-    for idx in range(len(normalized) - 1, -1, -1):
-        if idx in kept_indices:
-            continue
-        msg_tokens = token_by_index[idx]
-        if used + msg_tokens <= max_tokens:
-            kept_indices.add(idx)
-            used += msg_tokens
+    # Strict FIFO trimming: drop oldest non-required conversation message first.
+    while True:
+        trimmed = [normalized[idx].copy() for idx in kept_indices]
+        after = estimate_messages_tokens(trimmed)
+        if after <= max_tokens:
+            break
 
-    trimmed = [normalized[idx].copy() for idx in sorted(kept_indices)]
+        drop_pos = next((pos for pos, idx in enumerate(kept_indices) if idx not in required), None)
+        if drop_pos is None:
+            break
+
+        kept_indices.pop(drop_pos)
+
+    trimmed = [normalized[idx].copy() for idx in kept_indices]
     dropped = len(normalized) - len(trimmed)
     after = estimate_messages_tokens(trimmed)
-    truncated = 0
-
-    if after > max_tokens and trimmed:
-        after, truncated = _truncate_to_fit(trimmed, max_tokens)
 
     return PromptBudgetResult(
         messages=trimmed,
         estimated_tokens_before=before,
         estimated_tokens_after=after,
         dropped_messages=dropped,
-        truncated_messages=truncated,
+        truncated_messages=0,
     )
-
-
-def _truncate_to_fit(messages: List[Dict[str, str]], max_tokens: int) -> tuple[int, int]:
-    truncated = 0
-    total = estimate_messages_tokens(messages)
-    if total <= max_tokens:
-        return total, truncated
-
-    for idx, msg in enumerate(messages):
-        if total <= max_tokens:
-            break
-
-        content = msg.get("content") or ""
-        content_tokens = estimate_text_tokens(content)
-        if content_tokens <= 1:
-            continue
-
-        overflow = total - max_tokens
-        target_tokens = max(1, content_tokens - overflow - 4)
-        truncated_content = _truncate_text_to_tokens(content, target_tokens)
-        if truncated_content == content:
-            continue
-
-        messages[idx]["content"] = truncated_content
-        truncated += 1
-        total = estimate_messages_tokens(messages)
-
-    return total, truncated
-
-
-def _truncate_text_to_tokens(text: str, max_tokens: int) -> str:
-    raw = str(text or "")
-    if max_tokens <= 0:
-        return ""
-
-    max_bytes = max_tokens * _BYTES_PER_TOKEN
-    encoded = raw.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return raw
-
-    # Keep valid UTF-8 while trimming to approximate token budget.
-    compact = encoded[:max(0, max_bytes - 3)].decode("utf-8", errors="ignore").rstrip()
-    if not compact:
-        return ""
-    if compact == raw:
-        return compact
-    return compact + "..."

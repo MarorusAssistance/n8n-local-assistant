@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 from fastapi import HTTPException, Request, Response
@@ -12,6 +13,7 @@ from ..config import settings
 from ..db import check_db
 from ..llm import chat_completion, list_models, resolve_model
 from ..memory import MemoryStore
+from ..reasoning.pipeline import run_reasoning_pipeline
 from ..rag import (
     append_references,
     build_context_block,
@@ -206,6 +208,16 @@ class ChatService:
     ) -> Any:
         """RAG-only path when no active workflow is selected."""
         self._trace_logger.debug("docs-only start: id=%s conv=%s", request_id, conversation_id)
+        if settings.REASONING_PIPELINE_ENABLED:
+            return self._handle_reasoning_plan_only(
+                request=request,
+                user_message=user_message,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
         try:
             chunks = retrieve_context(user_message, request_id=request_id)
         except Exception as exc:
@@ -218,12 +230,20 @@ class ChatService:
                 ),
             ) from exc
 
+        def _build_docs_prompt(current_chunks: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+            context_block = build_context_block(current_chunks)
+            system_prompt = build_system_prompt(context_block)
+            llm_messages = [{"role": "system", "content": system_prompt}]
+            llm_messages.extend(messages_for_prompt)
+            return llm_messages
+
+        llm_messages, chunks, prompt_budget = self._apply_prompt_budget_with_docs_fallback(
+            docs_chunks=chunks,
+            request_id=request_id,
+            mode="docs",
+            message_builder=_build_docs_prompt,
+        )
         context_block = build_context_block(chunks)
-        system_prompt = build_system_prompt(context_block)
-        llm_messages = [{"role": "system", "content": system_prompt}]
-        llm_messages.extend(messages_for_prompt)
-        prompt_budget = self._apply_prompt_budget(llm_messages, request_id=request_id, mode="docs")
-        llm_messages = prompt_budget.messages
 
         model = resolve_model(request.model)
         params = self._completion_params(request, stream=request.stream)
@@ -291,6 +311,77 @@ class ChatService:
 
         response_dict["choices"][0]["message"]["content"] = assistant_text
         response_dict["model"] = model
+        if http_response is not None:
+            self._memory.apply_conversation_headers(
+                http_response, conversation_id, generated_conversation_id
+            )
+        return response_dict
+
+    def _handle_reasoning_plan_only(
+        self,
+        request: ChatCompletionRequest,
+        user_message: str,
+        conversation_id: Optional[str],
+        generated_conversation_id: bool,
+        http_response: Optional[Response],
+        raw_user_message: Optional[str],
+        request_id: str,
+    ) -> Any:
+        self._trace_logger.debug("reasoning pipeline start: id=%s conv=%s", request_id, conversation_id)
+
+        try:
+            result = run_reasoning_pipeline(
+                user_prompt=user_message,
+                model=request.model,
+                request_id=request_id,
+                existing_workflow=None,
+            )
+        except Exception as exc:
+            self._logger.exception("reasoning pipeline failed")
+            raise HTTPException(
+                status_code=502,
+                detail="Reasoning pipeline failed. Check local model and retrieval configuration.",
+            ) from exc
+
+        issue_count = len(result.checker.issues)
+        self._trace_logger.info(
+            (
+                "reasoning plan-only result: id=%s intent=%s node_cards=%d doc_chunks=%d "
+                "max_tokens=%d estimated_tokens=%d second_iteration=%s issues=%d"
+            ),
+            request_id,
+            result.router.intent,
+            len(result.context_pack.nodeCards),
+            len(result.context_pack.docChunks),
+            result.context_pack.budget.maxContextTokens,
+            result.context_pack.budget.estimatedTokens,
+            result.second_iteration_used,
+            issue_count,
+        )
+
+        if result.checker.ok:
+            payload: Dict[str, Any] = result.plan.model_dump(exclude_none=True)
+        else:
+            payload = {
+                "plan": result.plan.model_dump(exclude_none=True),
+                "checker": result.checker.model_dump(exclude_none=True),
+            }
+
+        assistant_text_raw = json.dumps(payload, ensure_ascii=False)
+        model = resolve_model(request.model)
+
+        self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
+
+        if request.stream:
+            return StreamingResponse(
+                self._responses.stream_simple_text(assistant_text_raw, model=model),
+                headers=self._memory.conversation_headers(
+                    conversation_id, generated_conversation_id
+                ),
+                media_type="text/event-stream",
+            )
+
+        response_dict = self._responses.simple_chat_response(assistant_text_raw, model=model)
         if http_response is not None:
             self._memory.apply_conversation_headers(
                 http_response, conversation_id, generated_conversation_id
@@ -387,7 +478,6 @@ class ChatService:
         docs_chunks = self._workflow.retrieve_docs_for_subgraph(
             user_message, summary, subgraph, request_id=request_id
         )
-        refs = collect_references(docs_chunks)
 
         findings = self._workflow.analyze_nodes(
             user_message,
@@ -405,17 +495,25 @@ class ChatService:
             len(findings),
         )
         chat_context = self._chat_context_block(messages_for_prompt, user_message)
-        llm_messages = build_synthesis_messages(
-            question=user_message,
-            plan=plan,
-            summary=summary,
-            subgraph=subgraph,
-            findings=findings,
+
+        def _build_workflow_prompt(current_chunks: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+            return build_synthesis_messages(
+                question=user_message,
+                plan=plan,
+                summary=summary,
+                subgraph=subgraph,
+                findings=findings,
+                docs_chunks=current_chunks,
+                chat_context=chat_context,
+            )
+
+        llm_messages, docs_chunks, prompt_budget = self._apply_prompt_budget_with_docs_fallback(
             docs_chunks=docs_chunks,
-            chat_context=chat_context,
+            request_id=request_id,
+            mode="workflow",
+            message_builder=_build_workflow_prompt,
         )
-        prompt_budget = self._apply_prompt_budget(llm_messages, request_id=request_id, mode="workflow")
-        llm_messages = prompt_budget.messages
+        refs = collect_references(docs_chunks)
 
         model = resolve_model(request.model)
         params = self._completion_params(request, stream=request.stream)
@@ -620,6 +718,7 @@ class ChatService:
         messages: List[Dict[str, str]],
         request_id: str,
         mode: str,
+        warn_on_overflow: bool = True,
     ) -> PromptBudgetResult:
         limit = max(settings.CONVERSATION_MAX_TOKENS, 256)
         result = trim_messages_to_budget(messages, max_tokens=limit)
@@ -634,7 +733,60 @@ class ChatService:
                 result.dropped_messages,
                 result.truncated_messages,
             )
+        if warn_on_overflow and result.estimated_tokens_after > limit:
+            self._trace_logger.warning(
+                "prompt budget overflow: id=%s mode=%s limit=%d after=%d",
+                request_id,
+                mode,
+                limit,
+                result.estimated_tokens_after,
+            )
         return result
+
+    def _apply_prompt_budget_with_docs_fallback(
+        self,
+        docs_chunks: List[Dict[str, Any]],
+        request_id: str,
+        mode: str,
+        message_builder: Callable[[List[Dict[str, Any]]], List[Dict[str, str]]],
+    ) -> tuple[List[Dict[str, str]], List[Dict[str, Any]], PromptBudgetResult]:
+        """Trim prompt to token budget and shrink docs chunks if still overflowing."""
+        limit = max(settings.CONVERSATION_MAX_TOKENS, 256)
+        docs_before = len(docs_chunks)
+        current_chunks = list(docs_chunks)
+
+        while True:
+            llm_messages = message_builder(current_chunks)
+            result = self._apply_prompt_budget(
+                llm_messages,
+                request_id=request_id,
+                mode=mode,
+                warn_on_overflow=False,
+            )
+            if result.estimated_tokens_after <= limit or not current_chunks:
+                break
+            current_chunks = current_chunks[:-1]
+
+        if len(current_chunks) < docs_before:
+            self._trace_logger.info(
+                "docs fallback applied: id=%s mode=%s docs_before=%d docs_after=%d",
+                request_id,
+                mode,
+                docs_before,
+                len(current_chunks),
+            )
+
+        if result.estimated_tokens_after > limit:
+            self._trace_logger.warning(
+                "prompt budget overflow after docs fallback: id=%s mode=%s limit=%d after=%d docs=%d",
+                request_id,
+                mode,
+                limit,
+                result.estimated_tokens_after,
+                len(current_chunks),
+            )
+
+        return result.messages, current_chunks, result
 
     @staticmethod
     def _trace_text_block(label: str, text: str) -> str:
