@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from ..llm import chat_completion, resolve_model
+from ..llm import chat_completion, get_langchain_chat_model, resolve_model
 from .types import CheckerIssue, ContextPack, PlanSpec, PlanStep, RouterOutput
+
+logger = logging.getLogger("n8n-assistant")
 
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
 
@@ -175,7 +178,24 @@ def _planner_revision_prompt(
     )
 
 
-def _run_planner_call(prompt: str, model: Optional[str]) -> PlanSpec:
+def _run_planner_structured_call(prompt: str, model: Optional[str]) -> PlanSpec:
+    chat_model = get_langchain_chat_model(model=model, temperature=0.1)
+    if chat_model is None:
+        raise RuntimeError("langchain chat model is unavailable")
+
+    structured_llm = chat_model.with_structured_output(PlanSpec)
+    output = structured_llm.invoke(
+        [
+            ("system", _PLANNER_SYSTEM_PROMPT),
+            ("human", prompt),
+        ]
+    )
+    if isinstance(output, PlanSpec):
+        return output
+    return PlanSpec.model_validate(output)
+
+
+def _run_planner_legacy_call(prompt: str, model: Optional[str]) -> PlanSpec:
     resolved_model = resolve_model(model)
     response = chat_completion(
         [
@@ -185,13 +205,20 @@ def _run_planner_call(prompt: str, model: Optional[str]) -> PlanSpec:
         model=resolved_model,
         temperature=0.1,
     )
-    content = (
-        response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
-    )
+    content = response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
     payload = _extract_json_payload(str(content))
     if payload is None:
         raise ValueError("planner returned invalid json")
     return PlanSpec.model_validate(payload)
+
+
+def _run_planner_call(prompt: str, model: Optional[str]) -> PlanSpec:
+    try:
+        return _run_planner_structured_call(prompt, model)
+    except Exception as exc:
+        logger.warning("planner structured output failed: %s", str(exc))
+
+    return _run_planner_legacy_call(prompt, model)
 
 
 def plan_workflow(

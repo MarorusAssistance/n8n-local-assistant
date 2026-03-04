@@ -6,7 +6,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..config import settings
-from ..llm import chat_completion, resolve_model
+from ..llm import chat_completion, get_langchain_chat_model, resolve_model
 from .types import RouterConstraints, RouterOutput
 
 
@@ -33,7 +33,6 @@ _INTENT_EXTEND_HINTS = (
     "extend",
     "agrega",
     "anade",
-    "añade",
     "add",
     "suma",
     "append",
@@ -82,7 +81,7 @@ _NON_FUNCTIONAL_HINTS: Dict[str, Sequence[str]] = {
     "observability": ("logging", "tracing", "monitoring", "observability"),
 }
 
-_BRANCHING_HINTS = ("if", "condicion", "condición", "switch", "branch", "route", "rama")
+_BRANCHING_HINTS = ("if", "condicion", "switch", "branch", "route", "rama")
 
 
 def _tokenize(text: str) -> List[str]:
@@ -204,6 +203,7 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     raw = (text or "").strip()
     if not raw:
         return None
+
     if raw.startswith("```"):
         lines = raw.splitlines()
         if lines and lines[0].startswith("```"):
@@ -211,15 +211,18 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         raw = "\n".join(lines).strip()
+
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
             return data
     except Exception:
         pass
+
     match = _JSON_BLOCK_RE.search(raw)
     if not match:
         return None
+
     try:
         data = json.loads(match.group(0))
     except Exception:
@@ -227,14 +230,10 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def _route_with_llm(
-    user_prompt: str,
-    model: Optional[str],
-) -> RouterOutput:
+def _router_prompts(user_prompt: str) -> tuple[str, str]:
     system_prompt = (
         "You are a strict router for n8n assistant requests. "
-        "Classify the intent and extract a compact JSON object. "
-        "Return ONLY valid JSON, no prose."
+        "Classify the intent and extract a compact object matching the schema."
     )
     user_payload = (
         "Output schema:\n"
@@ -256,6 +255,35 @@ def _route_with_llm(
         "- Keep goal concise.\n\n"
         f"User request:\n{(user_prompt or '').strip()}"
     )
+    return system_prompt, user_payload
+
+
+def _route_with_structured_output(
+    user_prompt: str,
+    model: Optional[str],
+) -> RouterOutput:
+    chat_model = get_langchain_chat_model(model=model, temperature=0.0)
+    if chat_model is None:
+        raise RuntimeError("langchain chat model is unavailable")
+
+    system_prompt, user_payload = _router_prompts(user_prompt)
+    structured_llm = chat_model.with_structured_output(RouterOutput)
+    output = structured_llm.invoke(
+        [
+            ("system", system_prompt),
+            ("human", user_payload),
+        ]
+    )
+    if isinstance(output, RouterOutput):
+        return output
+    return RouterOutput.model_validate(output)
+
+
+def _route_with_legacy_json(
+    user_prompt: str,
+    model: Optional[str],
+) -> RouterOutput:
+    system_prompt, user_payload = _router_prompts(user_prompt)
     resolved_model = resolve_model(model)
     response = chat_completion(
         [
@@ -265,9 +293,7 @@ def _route_with_llm(
         model=resolved_model,
         temperature=0.0,
     )
-    content = (
-        response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
-    )
+    content = response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
     payload = _extract_json(str(content))
     if payload is None:
         raise ValueError("router llm returned invalid json")
@@ -281,9 +307,16 @@ def route_prompt(
 ) -> RouterOutput:
     if not settings.ROUTER_USE_LLM:
         return _heuristic_router_output(user_prompt, existing_workflow)
+
     fallback = _heuristic_router_output(user_prompt, existing_workflow)
+
     try:
-        return _route_with_llm(user_prompt, model=model)
-    except Exception as exc:  # pragma: no cover - defensive fallback
+        return _route_with_structured_output(user_prompt, model=model)
+    except Exception as exc:
+        logger.warning("router structured output failed: %s", str(exc))
+
+    try:
+        return _route_with_legacy_json(user_prompt, model=model)
+    except Exception as exc:
         logger.warning("router llm fallback to heuristics: %s", str(exc))
         return fallback

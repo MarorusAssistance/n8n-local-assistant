@@ -11,7 +11,9 @@ from fastapi.responses import StreamingResponse
 
 from ..config import settings
 from ..db import check_db
+from ..graphs import MasterGraphRuntime
 from ..llm import chat_completion, list_models, resolve_model
+from ..observability import build_graph_run_config
 from ..memory import MemoryStore
 from ..reasoning.pipeline import run_reasoning_pipeline
 from ..rag import (
@@ -45,6 +47,7 @@ class ChatService:
         self._memory = ConversationManager(memory_store, self._logger)
         self._responses = ChatResponseBuilder()
         self._workflow = WorkflowService(self._n8n_client, self._logger)
+        self._graph_runtime = MasterGraphRuntime(self._workflow)
 
     def health(self) -> Dict[str, Any]:
         """Return DB and LM Studio health status."""
@@ -183,6 +186,19 @@ class ChatService:
                 request_id=request_id,
             )
 
+        if self._use_langgraph_workflow_runtime():
+            return self._handle_workflow_aware_langgraph(
+                request=request,
+                user_message=user_message,
+                messages_for_prompt=messages_for_prompt,
+                active_workflow_id=active_workflow_id,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
+
         return self._handle_workflow_aware(
             request=request,
             user_message=user_message,
@@ -194,6 +210,18 @@ class ChatService:
             raw_user_message=raw_user_message,
             request_id=request_id,
         )
+
+    @staticmethod
+    def _use_langgraph_runtime() -> bool:
+        return settings.AGENT_RUNTIME == "langgraph"
+
+    @classmethod
+    def _use_langgraph_reasoning_runtime(cls) -> bool:
+        return cls._use_langgraph_runtime() and settings.LANGGRAPH_REASONING_ENABLED
+
+    @classmethod
+    def _use_langgraph_workflow_runtime(cls) -> bool:
+        return cls._use_langgraph_runtime() and settings.LANGGRAPH_WORKFLOW_ENABLED
 
     def _handle_docs_only(
         self,
@@ -208,6 +236,17 @@ class ChatService:
     ) -> Any:
         """RAG-only path when no active workflow is selected."""
         self._trace_logger.debug("docs-only start: id=%s conv=%s", request_id, conversation_id)
+        if self._use_langgraph_reasoning_runtime():
+            return self._handle_reasoning_plan_only_langgraph(
+                request=request,
+                user_message=user_message,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
+
         if settings.REASONING_PIPELINE_ENABLED:
             return self._handle_reasoning_plan_only(
                 request=request,
@@ -382,6 +421,261 @@ class ChatService:
             )
 
         response_dict = self._responses.simple_chat_response(assistant_text_raw, model=model)
+        if http_response is not None:
+            self._memory.apply_conversation_headers(
+                http_response, conversation_id, generated_conversation_id
+            )
+        return response_dict
+
+    def _handle_reasoning_plan_only_langgraph(
+        self,
+        request: ChatCompletionRequest,
+        user_message: str,
+        conversation_id: Optional[str],
+        generated_conversation_id: bool,
+        http_response: Optional[Response],
+        raw_user_message: Optional[str],
+        request_id: str,
+    ) -> Any:
+        self._trace_logger.debug("reasoning graph start: id=%s conv=%s", request_id, conversation_id)
+
+        run_config = build_graph_run_config(
+            request_id=request_id,
+            mode="reasoning",
+            conversation_id=conversation_id,
+            workflow_id=None,
+            model=request.model,
+        )
+
+        try:
+            result = self._graph_runtime.run_reasoning(
+                user_prompt=user_message,
+                model=request.model,
+                request_id=request_id,
+                existing_workflow=None,
+                run_config=run_config,
+            )
+        except Exception as exc:
+            self._logger.exception("reasoning graph failed")
+            self._trace_logger.warning("reasoning graph fallback to legacy pipeline: id=%s err=%s", request_id, str(exc))
+            return self._handle_reasoning_plan_only(
+                request=request,
+                user_message=user_message,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
+
+        issue_count = len(result.checker.issues)
+        self._trace_logger.info(
+            (
+                "reasoning graph result: id=%s intent=%s node_cards=%d doc_chunks=%d "
+                "max_tokens=%d estimated_tokens=%d second_iteration=%s issues=%d"
+            ),
+            request_id,
+            result.router.intent,
+            len(result.context_pack.nodeCards),
+            len(result.context_pack.docChunks),
+            result.context_pack.budget.maxContextTokens,
+            result.context_pack.budget.estimatedTokens,
+            result.second_iteration_used,
+            issue_count,
+        )
+
+        if result.checker.ok:
+            payload: Dict[str, Any] = result.plan.model_dump(exclude_none=True)
+        else:
+            payload = {
+                "plan": result.plan.model_dump(exclude_none=True),
+                "checker": result.checker.model_dump(exclude_none=True),
+            }
+
+        assistant_text_raw = json.dumps(payload, ensure_ascii=False)
+        model = resolve_model(request.model)
+
+        self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
+
+        if request.stream:
+            return StreamingResponse(
+                self._responses.stream_simple_text(assistant_text_raw, model=model),
+                headers=self._memory.conversation_headers(
+                    conversation_id, generated_conversation_id
+                ),
+                media_type="text/event-stream",
+            )
+
+        response_dict = self._responses.simple_chat_response(assistant_text_raw, model=model)
+        if http_response is not None:
+            self._memory.apply_conversation_headers(
+                http_response, conversation_id, generated_conversation_id
+            )
+        return response_dict
+
+    def _handle_workflow_aware_langgraph(
+        self,
+        request: ChatCompletionRequest,
+        user_message: str,
+        messages_for_prompt: List[Dict[str, str]],
+        active_workflow_id: str,
+        conversation_id: Optional[str],
+        generated_conversation_id: bool,
+        http_response: Optional[Response],
+        raw_user_message: Optional[str],
+        request_id: str,
+    ) -> Any:
+        self._trace_logger.debug(
+            "workflow graph start: id=%s conv=%s wf=%s",
+            request_id,
+            conversation_id,
+            active_workflow_id,
+        )
+
+        chat_context = self._chat_context_block(messages_for_prompt, user_message)
+        run_config = build_graph_run_config(
+            request_id=request_id,
+            mode="workflow",
+            conversation_id=conversation_id,
+            workflow_id=active_workflow_id,
+            model=request.model,
+        )
+
+        try:
+            graph_state = self._graph_runtime.run_workflow(
+                question=user_message,
+                workflow_id=active_workflow_id,
+                request_model=request.model,
+                request_id=request_id,
+                chat_context=chat_context,
+                run_config=run_config,
+            )
+        except Exception as exc:
+            self._logger.exception("workflow graph failed")
+            self._trace_logger.warning("workflow graph fallback to legacy runtime: id=%s err=%s", request_id, str(exc))
+            return self._handle_workflow_aware(
+                request=request,
+                user_message=user_message,
+                messages_for_prompt=messages_for_prompt,
+                active_workflow_id=active_workflow_id,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
+
+        if graph_state.get("fallback_to_docs_only"):
+            return self._handle_docs_only(
+                request=request,
+                messages_for_prompt=messages_for_prompt,
+                user_message=user_message,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
+
+        clarification_text = str(graph_state.get("clarification_text") or "").strip()
+        if clarification_text:
+            model = resolve_model(request.model)
+            self._memory.append_memory(conversation_id, raw_user_message, clarification_text)
+            if request.stream:
+                return StreamingResponse(
+                    self._responses.stream_simple_text(clarification_text, model=model),
+                    headers=self._memory.conversation_headers(
+                        conversation_id, generated_conversation_id
+                    ),
+                    media_type="text/event-stream",
+                )
+            response_dict = self._responses.simple_chat_response(clarification_text, model=model)
+            if http_response is not None:
+                self._memory.apply_conversation_headers(
+                    http_response, conversation_id, generated_conversation_id
+                )
+            return response_dict
+
+        llm_messages = graph_state.get("llm_messages") or []
+        docs_chunks = graph_state.get("docs_chunks") or []
+        refs = graph_state.get("refs") or collect_references(docs_chunks)
+        prompt_budget = graph_state.get("prompt_budget")
+
+        if not llm_messages:
+            self._trace_logger.warning(
+                "workflow graph produced empty prompt, fallback to legacy: id=%s wf=%s",
+                request_id,
+                active_workflow_id,
+            )
+            return self._handle_workflow_aware(
+                request=request,
+                user_message=user_message,
+                messages_for_prompt=messages_for_prompt,
+                active_workflow_id=active_workflow_id,
+                conversation_id=conversation_id,
+                generated_conversation_id=generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=raw_user_message,
+                request_id=request_id,
+            )
+
+        model = resolve_model(request.model)
+        params = self._completion_params(request, stream=request.stream)
+        estimated_tokens = int(getattr(prompt_budget, "estimated_tokens_after", 0) or 0)
+        self._trace_logger.debug(
+            "workflow graph synthesis prompt stats: id=%s messages=%d chars=%d est_tokens=%d",
+            request_id,
+            len(llm_messages),
+            self._messages_char_count(llm_messages),
+            estimated_tokens,
+        )
+        self._trace_logger.debug(
+            "llm request: id=%s model=%s temp=%s max_tokens=%s top_p=%s freq_pen=%s pres_pen=%s stream=%s",
+            request_id,
+            model,
+            params.get("temperature"),
+            params.get("max_tokens"),
+            params.get("top_p"),
+            params.get("frequency_penalty"),
+            params.get("presence_penalty"),
+            request.stream,
+        )
+
+        if request.stream:
+            params["stream"] = True
+            try:
+                stream = chat_completion(llm_messages, model=model, **params)
+            except Exception as exc:
+                self._logger.exception("lm studio request failed")
+                raise HTTPException(status_code=502, detail="LM Studio request failed") from exc
+
+            def _on_stream_complete(assistant_text: str) -> None:
+                self._memory.append_memory(conversation_id, raw_user_message, assistant_text)
+                self._log_response_summary(request_id, model, assistant_text, refs)
+
+            return StreamingResponse(
+                self._responses.stream_with_references(stream, refs, model, _on_stream_complete),
+                headers=self._memory.conversation_headers(
+                    conversation_id, generated_conversation_id
+                ),
+                media_type="text/event-stream",
+            )
+
+        try:
+            llm_response = chat_completion(llm_messages, model=model, **params)
+        except Exception as exc:
+            self._logger.exception("lm studio request failed")
+            raise HTTPException(status_code=502, detail="LM Studio request failed") from exc
+
+        response_dict = llm_response.model_dump()
+        assistant_text_raw = response_dict["choices"][0]["message"].get("content") or ""
+        assistant_text = append_references(assistant_text_raw, refs)
+        self._log_response_summary(request_id, model, assistant_text_raw, refs)
+
+        self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
+
+        response_dict["choices"][0]["message"]["content"] = assistant_text
+        response_dict["model"] = model
         if http_response is not None:
             self._memory.apply_conversation_headers(
                 http_response, conversation_id, generated_conversation_id

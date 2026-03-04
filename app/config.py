@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     TOP_K: int = 10
     MAX_CONTEXT_CHARS: int = 8000
     REASONING_PIPELINE_ENABLED: bool = False
+    AGENT_RUNTIME: str = "legacy"
+    LANGGRAPH_REASONING_ENABLED: bool = False
+    LANGGRAPH_WORKFLOW_ENABLED: bool = False
+    LANGGRAPH_RECURSION_LIMIT: int = 60
     ROUTER_USE_LLM: bool = False
     MAX_NODE_CARDS: int = 10
     MAX_DOC_CHUNKS: int = 6
@@ -70,6 +74,10 @@ class Settings(BaseSettings):
     TRACE_LOG_FILE: str = "logs/trace.log"
     TRACE_LOG_MAX_BYTES: int = 5_000_000
     TRACE_LOG_BACKUPS: int = 3
+
+    LANGSMITH_TRACING: bool = True
+    LANGSMITH_PROJECT: str = "n8n-assistant"
+    LANGSMITH_ENDPOINT: Optional[str] = None
 
     @field_validator("LOG_LEVEL", "TRACE_LOG_LEVEL", mode="before")
     @classmethod
@@ -144,6 +152,7 @@ class Settings(BaseSettings):
         "LLM_MODEL",
         "N8N_API_KEY",
         "APP_ENV",
+        "LANGSMITH_ENDPOINT",
         "RERANK_FALLBACK_MODEL",
         "RERANK_DEVICE",
         "RERANK_CUTOFF_LAYERS",
@@ -166,6 +175,15 @@ class Settings(BaseSettings):
         if env not in allowed:
             raise ValueError(f"APP_ENV must be one of {sorted(allowed)}")
         return env
+
+    @field_validator("AGENT_RUNTIME", mode="before")
+    @classmethod
+    def _validate_agent_runtime(cls, value: Optional[str]) -> str:
+        runtime = (value or "legacy").strip().lower()
+        allowed = {"legacy", "langgraph"}
+        if runtime not in allowed:
+            raise ValueError(f"AGENT_RUNTIME must be one of {sorted(allowed)}")
+        return runtime
 
     @field_validator("FTS_LANGUAGE", "FTS_TSVECTOR_COLUMN", mode="before")
     @classmethod
@@ -204,6 +222,7 @@ class Settings(BaseSettings):
         "MAX_NODE_CARDS",
         "MAX_DOC_CHUNKS",
         "MAX_CONTEXT_TOKENS",
+        "LANGGRAPH_RECURSION_LIMIT",
         mode="after",
     )
     @classmethod

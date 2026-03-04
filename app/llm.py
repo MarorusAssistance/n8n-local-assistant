@@ -1,14 +1,22 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from openai import OpenAI
 
 from .config import settings
 
+try:  # Optional at runtime until deps are installed.
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+except Exception:  # pragma: no cover - optional dependency fallback
+    ChatOpenAI = None  # type: ignore[assignment]
+    OpenAIEmbeddings = None  # type: ignore[assignment]
+
 _client: Optional[OpenAI] = None
 _http_client: Optional[httpx.Client] = None
+_lc_chat_models: Dict[Tuple[str, float], Any] = {}
+_lc_embeddings: Optional[Any] = None
 
 
 def _get_openai_client() -> OpenAI:
@@ -61,7 +69,52 @@ def resolve_model(requested: Optional[str]) -> str:
     return requested or settings.LLM_MODEL or "local-model"
 
 
+def get_langchain_chat_model(model: Optional[str] = None, temperature: float = 0.0) -> Optional[Any]:
+    """Return a cached ChatOpenAI model configured for LM Studio compatibility."""
+    if ChatOpenAI is None:
+        return None
+
+    resolved_model = resolve_model(model)
+    key = (resolved_model, float(temperature))
+    cached = _lc_chat_models.get(key)
+    if cached is not None:
+        return cached
+
+    chat_model = ChatOpenAI(
+        model=resolved_model,
+        api_key=settings.LMSTUDIO_API_KEY,
+        base_url=settings.LMSTUDIO_BASE_URL,
+        timeout=settings.LMSTUDIO_TIMEOUT_SECONDS,
+        temperature=temperature,
+    )
+    _lc_chat_models[key] = chat_model
+    return chat_model
+
+
+def get_langchain_embeddings() -> Optional[Any]:
+    """Return a cached OpenAIEmbeddings model configured for LM Studio compatibility."""
+    global _lc_embeddings
+    if OpenAIEmbeddings is None:
+        return None
+    if _lc_embeddings is None:
+        _lc_embeddings = OpenAIEmbeddings(
+            model=settings.EMBEDDING_MODEL,
+            api_key=settings.LMSTUDIO_API_KEY,
+            base_url=settings.LMSTUDIO_BASE_URL,
+            request_timeout=settings.LMSTUDIO_TIMEOUT_SECONDS,
+        )
+    return _lc_embeddings
+
+
 def create_embedding(text: str) -> List[float]:
+    embeddings = get_langchain_embeddings()
+    if embeddings is not None:
+        try:
+            return embeddings.embed_query(text)
+        except Exception:
+            # Fallback to OpenAI client for compatibility with local providers.
+            pass
+
     client = _get_openai_client()
     response = client.embeddings.create(
         model=settings.EMBEDDING_MODEL,
@@ -75,6 +128,7 @@ def chat_completion(
     model: str,
     **kwargs: Any,
 ) -> Any:
+    """OpenAI-compatible completion used by legacy response formatting/streaming paths."""
     client = _get_openai_client()
     return client.chat.completions.create(
         model=model,

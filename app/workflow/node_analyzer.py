@@ -1,15 +1,14 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional
-
-import logging
 import json
+import logging
 import re
+from typing import Any, Dict, Iterable, List, Optional
 
 from pydantic import BaseModel, Field
 
 from ..config import settings
-from ..llm import chat_completion, resolve_model
+from ..llm import chat_completion, get_langchain_chat_model, resolve_model
 from ..rag import build_context_block
 from .planner import PlanScope
 from .workflow_summary import NodeSummary
@@ -25,10 +24,10 @@ NODE_ANALYZER_SYSTEM_PROMPT = (
 NODE_ANALYZER_INSTRUCTIONS = (
     "Responde SOLO con JSON valido con esta forma:\n"
     "{\n"
-    "  \"risk_level\": \"low|medium|high|unknown\",\n"
-    "  \"findings\": [\"...\"],\n"
-    "  \"recommendations\": [\"...\"],\n"
-    "  \"confidence\": 0.0\n"
+    '  "risk_level": "low|medium|high|unknown",\n'
+    '  "findings": ["..."],\n'
+    '  "recommendations": ["..."],\n'
+    '  "confidence": 0.0\n'
     "}\n"
     "Reglas:\n"
     "- maximo 4 findings y 5 recommendations\n"
@@ -40,6 +39,13 @@ NODE_ANALYZER_INSTRUCTIONS = (
 
 JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
 trace_logger = logging.getLogger("n8n-assistant.trace")
+
+
+class NodeAnalyzerOutput(BaseModel):
+    risk_level: str = "unknown"
+    findings: List[str] = Field(default_factory=list)
+    recommendations: List[str] = Field(default_factory=list)
+    confidence: float = 0.0
 
 
 class NodeFinding(BaseModel):
@@ -123,6 +129,71 @@ def _compact_snippet(text: str, max_chars: int) -> str:
     return compact
 
 
+def _build_prompt(
+    question: str,
+    node: NodeSummary,
+    micro_context_text: str,
+    docs_block: str,
+    scope: PlanScope,
+) -> str:
+    return (
+        f"Pregunta del usuario:\n{question.strip()}\n\n"
+        f"Nodo objetivo:\n- id: {node.node_id}\n- name: {node.name}\n- type: {node.node_type}\n\n"
+        f"Micro-contexto del workflow (recortado):\n{micro_context_text}\n\n"
+        f"Documentacion relevante:\n{docs_block}\n\n"
+        f"Scope: {scope.value}\n\n"
+        f"{NODE_ANALYZER_INSTRUCTIONS}"
+    )
+
+
+def _run_structured_output(prompt: str, model: Optional[str]) -> NodeAnalyzerOutput:
+    chat_model = get_langchain_chat_model(model=model, temperature=0.1)
+    if chat_model is None:
+        raise RuntimeError("langchain chat model is unavailable")
+
+    structured_llm = chat_model.with_structured_output(NodeAnalyzerOutput)
+    output = structured_llm.invoke(
+        [
+            ("system", NODE_ANALYZER_SYSTEM_PROMPT),
+            ("human", prompt),
+        ]
+    )
+    if isinstance(output, NodeAnalyzerOutput):
+        return output
+    return NodeAnalyzerOutput.model_validate(output)
+
+
+def _run_legacy_json(prompt: str, model: Optional[str]) -> NodeAnalyzerOutput:
+    resolved_model = resolve_model(model)
+    response = chat_completion(
+        [
+            {"role": "system", "content": NODE_ANALYZER_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        model=resolved_model,
+        temperature=0.1,
+    )
+    content = response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
+
+    data = _extract_json(content)
+    if not data:
+        raise ValueError("node analyzer returned invalid json")
+    return NodeAnalyzerOutput.model_validate(data)
+
+
+def _normalize_output(output: NodeAnalyzerOutput) -> NodeAnalyzerOutput:
+    findings = [str(item).strip() for item in output.findings[:4] if str(item).strip()]
+    recommendations = [
+        str(item).strip() for item in output.recommendations[:5] if str(item).strip()
+    ]
+    return NodeAnalyzerOutput(
+        risk_level=str(output.risk_level or "unknown"),
+        findings=findings,
+        recommendations=recommendations,
+        confidence=max(0.0, min(float(output.confidence or 0.0), 1.0)),
+    )
+
+
 def analyze_node(
     question: str,
     node: NodeSummary,
@@ -145,72 +216,42 @@ def analyze_node(
             len(micro_context_text),
         )
 
-    prompt = (
-        f"Pregunta del usuario:\n{question.strip()}\n\n"
-        f"Nodo objetivo:\n- id: {node.node_id}\n- name: {node.name}\n- type: {node.node_type}\n\n"
-        f"Micro-contexto del workflow (recortado):\n{micro_context_text}\n\n"
-        f"Documentacion relevante:\n{docs_block}\n\n"
-        f"Scope: {scope.value}\n\n"
-        f"{NODE_ANALYZER_INSTRUCTIONS}"
-    )
+    prompt = _build_prompt(question, node, micro_context_text, docs_block, scope)
 
-    resolved_model = resolve_model(model)
-
+    output: Optional[NodeAnalyzerOutput] = None
     try:
-        response = chat_completion(
-            [
-                {"role": "system", "content": NODE_ANALYZER_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            model=resolved_model,
-            temperature=0.1,
-        )
-        content = (
-            response.model_dump()
-            .get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        output = _run_structured_output(prompt, model)
     except Exception as exc:
         trace_logger.warning(
-            "node analyzer failed: id=%s node=%s type=%s error=%s",
+            "node analyzer structured output failed: id=%s node=%s type=%s error=%s",
             request_id or "-",
             node.node_id,
             node.short_type,
             str(exc),
         )
-        return _fallback_finding(node, scope)
 
-    data = _extract_json(content)
-    if not data:
-        trace_logger.warning(
-            "node analyzer invalid json: id=%s node=%s type=%s content=%s",
-            request_id or "-",
-            node.node_id,
-            node.short_type,
-            _compact_snippet(content, max_chars=220),
-        )
-        return _fallback_finding(node, scope)
+    if output is None:
+        try:
+            output = _run_legacy_json(prompt, model)
+        except Exception as exc:
+            trace_logger.warning(
+                "node analyzer legacy fallback failed: id=%s node=%s type=%s error=%s prompt=%s",
+                request_id or "-",
+                node.node_id,
+                node.short_type,
+                str(exc),
+                _compact_snippet(prompt, max_chars=220),
+            )
+            return _fallback_finding(node, scope)
 
-    risk_level = str(data.get("risk_level") or "unknown")
-    findings_raw = data.get("findings") if isinstance(data.get("findings"), list) else []
-    recommendations_raw = (
-        data.get("recommendations") if isinstance(data.get("recommendations"), list) else []
-    )
-    confidence = float(data.get("confidence") or 0.0)
-
-    findings = [str(item).strip() for item in findings_raw[:4] if str(item).strip()]
-    recommendations = [
-        str(item).strip() for item in recommendations_raw[:5] if str(item).strip()
-    ]
-
+    normalized = _normalize_output(output)
     return NodeFinding(
         node_id=node.node_id,
         node_name=node.name,
         node_type=node.short_type,
         scope=scope,
-        risk_level=risk_level,
-        findings=findings,
-        recommendations=recommendations,
-        confidence=max(0.0, min(confidence, 1.0)),
+        risk_level=normalized.risk_level,
+        findings=normalized.findings,
+        recommendations=normalized.recommendations,
+        confidence=normalized.confidence,
     )

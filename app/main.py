@@ -10,9 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .api import router as api_router
 from .config import settings
+from .observability import configure_langsmith_environment
 from .reranker import reranker
 
 logging.basicConfig(level=settings.LOG_LEVEL)
+configure_langsmith_environment()
 trace_logger = logging.getLogger("n8n-assistant.trace")
 if settings.TRACE_LOG_ENABLED:
     trace_logger.setLevel(settings.TRACE_LOG_LEVEL)
