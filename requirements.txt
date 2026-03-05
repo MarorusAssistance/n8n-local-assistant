@@ -10,6 +10,7 @@ langsmith>=0.3,<1.0
 pydantic>=2.6
 pydantic-settings>=2.2
 httpx>=0.26
+PyYAML>=6.0
 pytest>=7.4
 FlagEmbedding>=1.2.0
 transformers>=4.41,<5

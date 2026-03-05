@@ -1,0 +1,27 @@
+- name: baseline
+  env_overrides: {}
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: false
+
+- name: legacy_json_only
+  env_overrides:
+    AGENT_RUNTIME: legacy
+    REASONING_PIPELINE_ENABLED: "false"
+    LANGGRAPH_REASONING_ENABLED: "false"
+    LANGGRAPH_WORKFLOW_ENABLED: "false"
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: true
+
+- name: cfg_more_context
+  env_overrides:
+    MAX_DOC_CHUNKS: "10"
+    MAX_CONTEXT_TOKENS: "3200"
+    WORKFLOW_DOCS_TOP_K: "10"
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: true

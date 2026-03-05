@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from ..llm import chat_completion, get_langchain_chat_model, resolve_model
+from ..observability import emit_llm_output_event, emit_llm_prompt_event
 from .types import CheckerIssue, ContextPack, PlanSpec, PlanStep, RouterOutput
 
 logger = logging.getLogger("n8n-assistant")
+trace_logger = logging.getLogger("n8n-assistant.trace")
 
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
 
@@ -178,47 +181,123 @@ def _planner_revision_prompt(
     )
 
 
-def _run_planner_structured_call(prompt: str, model: Optional[str]) -> PlanSpec:
+def _run_planner_structured_call(
+    prompt: str,
+    model: Optional[str],
+    *,
+    stage: str,
+    request_id: Optional[str] = None,
+) -> PlanSpec:
     chat_model = get_langchain_chat_model(model=model, temperature=0.1)
     if chat_model is None:
         raise RuntimeError("langchain chat model is unavailable")
 
+    resolved_model = resolve_model(model)
+    prompt_messages = [
+        {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    emit_llm_prompt_event(
+        trace_logger,
+        request_id=request_id,
+        stage=f"{stage}.structured",
+        model=resolved_model,
+        messages=prompt_messages,
+        params={"temperature": 0.1},
+    )
     structured_llm = chat_model.with_structured_output(PlanSpec)
+    started = time.perf_counter()
     output = structured_llm.invoke(
         [
             ("system", _PLANNER_SYSTEM_PROMPT),
             ("human", prompt),
         ]
     )
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    serialized = output.model_dump(exclude_none=True) if isinstance(output, PlanSpec) else output
+    emit_llm_output_event(
+        trace_logger,
+        request_id=request_id,
+        stage=f"{stage}.structured",
+        model=resolved_model,
+        latency_ms=latency_ms,
+        content=json.dumps(serialized, ensure_ascii=False),
+        usage=None,
+        extra={"temperature": 0.1},
+    )
     if isinstance(output, PlanSpec):
         return output
     return PlanSpec.model_validate(output)
 
 
-def _run_planner_legacy_call(prompt: str, model: Optional[str]) -> PlanSpec:
+def _run_planner_legacy_call(
+    prompt: str,
+    model: Optional[str],
+    *,
+    stage: str,
+    request_id: Optional[str] = None,
+) -> PlanSpec:
     resolved_model = resolve_model(model)
+    prompt_messages = [
+        {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    emit_llm_prompt_event(
+        trace_logger,
+        request_id=request_id,
+        stage=f"{stage}.legacy",
+        model=resolved_model,
+        messages=prompt_messages,
+        params={"temperature": 0.1},
+    )
+    started = time.perf_counter()
     response = chat_completion(
-        [
-            {"role": "system", "content": _PLANNER_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
+        prompt_messages,
         model=resolved_model,
         temperature=0.1,
     )
-    content = response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    response_payload = response.model_dump()
+    content = response_payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    emit_llm_output_event(
+        trace_logger,
+        request_id=request_id,
+        stage=f"{stage}.legacy",
+        model=resolved_model,
+        latency_ms=latency_ms,
+        content=str(content),
+        usage=response_payload.get("usage"),
+        extra={"temperature": 0.1},
+    )
     payload = _extract_json_payload(str(content))
     if payload is None:
         raise ValueError("planner returned invalid json")
     return PlanSpec.model_validate(payload)
 
 
-def _run_planner_call(prompt: str, model: Optional[str]) -> PlanSpec:
+def _run_planner_call(
+    prompt: str,
+    model: Optional[str],
+    *,
+    stage: str,
+    request_id: Optional[str] = None,
+) -> PlanSpec:
     try:
-        return _run_planner_structured_call(prompt, model)
+        return _run_planner_structured_call(
+            prompt,
+            model,
+            stage=stage,
+            request_id=request_id,
+        )
     except Exception as exc:
         logger.warning("planner structured output failed: %s", str(exc))
 
-    return _run_planner_legacy_call(prompt, model)
+    return _run_planner_legacy_call(
+        prompt,
+        model,
+        stage=stage,
+        request_id=request_id,
+    )
 
 
 def plan_workflow(
@@ -226,6 +305,7 @@ def plan_workflow(
     router_output: RouterOutput,
     context_pack: ContextPack,
     model: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> PlanSpec:
     allowed_node_types = [card.type for card in context_pack.nodeCards if card.type]
     try:
@@ -237,6 +317,8 @@ def plan_workflow(
                 allowed_node_types=allowed_node_types,
             ),
             model=model,
+            stage="reasoning.planner.plan",
+            request_id=request_id,
         )
     except Exception:
         return _fallback_plan(
@@ -252,6 +334,7 @@ def revise_plan(
     current_plan: PlanSpec,
     checker_issues: Sequence[CheckerIssue],
     model: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> PlanSpec:
     allowed_node_types = [card.type for card in context_pack.nodeCards if card.type]
     try:
@@ -265,6 +348,8 @@ def revise_plan(
                 allowed_node_types=allowed_node_types,
             ),
             model=model,
+            stage="reasoning.planner.revise",
+            request_id=request_id,
         )
     except Exception:
         return _normalize_plan(current_plan, set(allowed_node_types))

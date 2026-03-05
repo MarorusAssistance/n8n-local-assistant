@@ -8,7 +8,7 @@ param(
   [int]$LmStudioPort = 1234,
   [string]$LmStudioLlmModel = "",
   [string]$LmStudioEmbeddingModel = "",
-  [int]$LmStudioLlmContextLength = 10000,
+  [int]$LmStudioLlmContextLength = 16000,
   [int]$LmStudioEmbeddingContextLength = 4096,
   [string]$LmStudioGpuOffload = "max",
   [string]$LmStudioLlmIdentifier = "",

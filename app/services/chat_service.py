@@ -13,7 +13,11 @@ from ..config import settings
 from ..db import check_db
 from ..graphs import MasterGraphRuntime
 from ..llm import chat_completion, list_models, resolve_model
-from ..observability import build_graph_run_config
+from ..observability import (
+    build_graph_run_config,
+    emit_llm_output_event,
+    emit_llm_prompt_event,
+)
 from ..memory import MemoryStore
 from ..reasoning.pipeline import run_reasoning_pipeline
 from ..rag import (
@@ -313,6 +317,15 @@ class ChatService:
             params.get("presence_penalty"),
             request.stream,
         )
+        emit_llm_prompt_event(
+            self._trace_logger,
+            request_id=request_id,
+            stage="docs_only.synthesis",
+            model=model,
+            messages=llm_messages,
+            estimated_tokens=int(getattr(prompt_budget, "estimated_tokens_after", 0) or 0),
+            params=params,
+        )
         if request.stream:
             params["stream"] = True
             try:
@@ -336,15 +349,27 @@ class ChatService:
             )
 
         try:
+            llm_start = time.perf_counter()
             llm_response = chat_completion(llm_messages, model=model, **params)
         except Exception as exc:
             self._logger.exception("lm studio request failed")
             raise HTTPException(status_code=502, detail="LM Studio request failed") from exc
+        llm_latency_ms = (time.perf_counter() - llm_start) * 1000.0
 
         response_dict = llm_response.model_dump()
         assistant_text_raw = response_dict["choices"][0]["message"].get("content") or ""
         assistant_text = append_references(assistant_text_raw, refs)
         self._log_response_summary(request_id, model, assistant_text_raw, refs)
+        emit_llm_output_event(
+            self._trace_logger,
+            request_id=request_id,
+            stage="docs_only.synthesis",
+            model=model,
+            latency_ms=llm_latency_ms,
+            content=assistant_text_raw,
+            usage=response_dict.get("usage"),
+            extra={"stream": False},
+        )
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
 
@@ -640,6 +665,15 @@ class ChatService:
             params.get("presence_penalty"),
             request.stream,
         )
+        emit_llm_prompt_event(
+            self._trace_logger,
+            request_id=request_id,
+            stage="workflow.graph.synthesis",
+            model=model,
+            messages=llm_messages,
+            estimated_tokens=estimated_tokens,
+            params=params,
+        )
 
         if request.stream:
             params["stream"] = True
@@ -662,15 +696,27 @@ class ChatService:
             )
 
         try:
+            llm_start = time.perf_counter()
             llm_response = chat_completion(llm_messages, model=model, **params)
         except Exception as exc:
             self._logger.exception("lm studio request failed")
             raise HTTPException(status_code=502, detail="LM Studio request failed") from exc
+        llm_latency_ms = (time.perf_counter() - llm_start) * 1000.0
 
         response_dict = llm_response.model_dump()
         assistant_text_raw = response_dict["choices"][0]["message"].get("content") or ""
         assistant_text = append_references(assistant_text_raw, refs)
         self._log_response_summary(request_id, model, assistant_text_raw, refs)
+        emit_llm_output_event(
+            self._trace_logger,
+            request_id=request_id,
+            stage="workflow.graph.synthesis",
+            model=model,
+            latency_ms=llm_latency_ms,
+            content=assistant_text_raw,
+            usage=response_dict.get("usage"),
+            extra={"stream": False},
+        )
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
 
@@ -829,6 +875,15 @@ class ChatService:
             params.get("presence_penalty"),
             request.stream,
         )
+        emit_llm_prompt_event(
+            self._trace_logger,
+            request_id=request_id,
+            stage="workflow.synthesis",
+            model=model,
+            messages=llm_messages,
+            estimated_tokens=int(getattr(prompt_budget, "estimated_tokens_after", 0) or 0),
+            params=params,
+        )
 
         if request.stream:
             params["stream"] = True
@@ -851,15 +906,27 @@ class ChatService:
             )
 
         try:
+            llm_start = time.perf_counter()
             llm_response = chat_completion(llm_messages, model=model, **params)
         except Exception as exc:
             self._logger.exception("lm studio request failed")
             raise HTTPException(status_code=502, detail="LM Studio request failed") from exc
+        llm_latency_ms = (time.perf_counter() - llm_start) * 1000.0
 
         response_dict = llm_response.model_dump()
         assistant_text_raw = response_dict["choices"][0]["message"].get("content") or ""
         assistant_text = append_references(assistant_text_raw, refs)
         self._log_response_summary(request_id, model, assistant_text_raw, refs)
+        emit_llm_output_event(
+            self._trace_logger,
+            request_id=request_id,
+            stage="workflow.synthesis",
+            model=model,
+            latency_ms=llm_latency_ms,
+            content=assistant_text_raw,
+            usage=response_dict.get("usage"),
+            extra={"stream": False},
+        )
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
 

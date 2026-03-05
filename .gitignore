@@ -208,3 +208,5 @@ __marimo__/
 
 #JSON files
 *.json
+bench/results/
+bench_io_*/

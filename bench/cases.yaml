@@ -1,0 +1,65 @@
+- id: emails_daily_summary
+  user_message: |
+    Necesito un workflow n8n importable que lea los correos recientes y me genere un resumen diario.
+    Debe ejecutarse todos los dias a las 08:00 y limitar el procesamiento a 10 items.
+  json_only: true
+  requirements:
+    - type: must_have_schedule_daily_at
+      value: "08:00"
+    - type: must_include_node_type
+      value: n8n-nodes-base.scheduleTrigger
+    - type: must_include_keyword_in_node_params
+      value:
+        key: limit
+        equals: 10
+  limits:
+    max_nodes: 30
+
+- id: webhook_to_sheets
+  user_message: |
+    Genera un workflow n8n importable que reciba leads por Webhook y los escriba en Google Sheets.
+    Quiero un flujo sencillo y listo para importar.
+  json_only: true
+  requirements:
+    - type: must_include_node_type
+      value: n8n-nodes-base.webhook
+    - type: must_include_node_type
+      value: n8n-nodes-base.googleSheets
+    - type: must_have_connection
+      value:
+        from_type: n8n-nodes-base.webhook
+        to_type: n8n-nodes-base.googleSheets
+  limits:
+    max_nodes: 20
+
+- id: http_alert_slack
+  user_message: |
+    Crea un workflow n8n importable que llame una API con HTTP Request y envie alerta a Slack
+    cuando el status sea error.
+  json_only: true
+  requirements:
+    - type: must_include_node_type
+      value: n8n-nodes-base.httpRequest
+    - type: must_include_node_type
+      value: n8n-nodes-base.slack
+    - type: must_include_keyword_in_node_params
+      value:
+        key: channel
+        contains: "#"
+  limits:
+    max_nodes: 25
+
+- id: schedule_postgres_sync
+  user_message: |
+    Quiero un workflow n8n importable que ejecute una sincronizacion diaria a las 02:30
+    y haga escritura en PostgreSQL.
+  json_only: true
+  requirements:
+    - type: must_have_schedule_daily_at
+      value: "02:30"
+    - type: must_include_node_type
+      value: n8n-nodes-base.scheduleTrigger
+    - type: must_include_node_type
+      value: n8n-nodes-base.postgres
+  limits:
+    max_nodes: 25

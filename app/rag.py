@@ -18,6 +18,7 @@ from .db import (
 from .doc_links import derive_doc_page_key
 from .hybrid import rrf_fuse
 from .llm import create_embedding
+from .observability import emit_trace_event
 from .reranker import reranker
 
 
@@ -104,6 +105,30 @@ def _trace_retrieval_stage(stage: str, chunks: List[Dict[str, Any]], max_items: 
             parts.append(f"fts_score={float(chunk['fts_score']):.4f}")
         lines.append("  - " + " | ".join(parts))
     return "\n".join(lines)
+
+
+def _trace_chunk_payload(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    max_chunks = settings.TRACE_MAX_CHUNKS or len(chunks)
+    for chunk in chunks[:max_chunks]:
+        snippet = _compact_snippet(chunk.get("text") or "", max_chars=220)
+        payload.append(
+            {
+                "doc_id": str(chunk.get("doc_id") or ""),
+                "title": _compact_header_value(str(chunk.get("title") or ""), max_chars=120),
+                "section": _compact_header_value(str(chunk.get("section") or ""), max_chars=80),
+                "url": _compact_header_value(str(chunk.get("url") or ""), max_chars=180),
+                "source": str(chunk.get("source") or ""),
+                "context_kind": str(chunk.get("context_kind") or ""),
+                "linked_def_type": str(chunk.get("linked_def_type") or ""),
+                "linked_entity_id": str(chunk.get("linked_entity_id") or ""),
+                "rerank_score": chunk.get("rerank_score"),
+                "rrf_score": chunk.get("rrf_score"),
+                "content": snippet,
+                "snippet": snippet,
+            }
+        )
+    return payload
 
 
 def _candidate_reference(chunk: Dict[str, Any]) -> str:
@@ -316,6 +341,27 @@ def retrieve_context(
                 query_block,
                 chunks_block,
             )
+
+    emit_trace_event(
+        trace_logger,
+        event="retrieval_final",
+        request_id=request_id,
+        stage="rag.retrieve_context",
+        payload={
+            "query_chars": len(question or ""),
+            "top_k": final_top_k,
+            "pool_size": len(pre_rerank),
+            "results_count": len(results),
+            "docs_results_count": len(docs_results),
+            "linked_defs_count": linked_defs_count,
+            "rerank_enabled": settings.ENABLE_RERANK,
+            "hybrid_enabled": settings.ENABLE_HYBRID,
+            "pre_rerank_chunks": _trace_chunk_payload(list(pre_rerank)),
+            "post_rerank_chunks": _trace_chunk_payload(list(docs_results)),
+            "final_chunks": _trace_chunk_payload(list(results)),
+            "chunks": _trace_chunk_payload(list(results)),
+        },
+    )
 
     if hybrid_warning and settings.RETRIEVAL_DEBUG and trace_logger.isEnabledFor(logging.INFO):
         trace_logger.info(

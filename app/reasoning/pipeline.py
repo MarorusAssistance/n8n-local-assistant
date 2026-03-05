@@ -23,6 +23,7 @@ def run_reasoning_pipeline(
         user_prompt=user_prompt,
         existing_workflow=existing_workflow,
         model=model,
+        request_id=request_id,
     )
     context_pack = build_context_pack(
         router_output=router_output,
@@ -35,6 +36,7 @@ def run_reasoning_pipeline(
         router_output=router_output,
         context_pack=context_pack,
         model=model,
+        request_id=request_id,
     )
     checker_result = check_plan(
         plan=initial_plan,
@@ -57,6 +59,7 @@ def run_reasoning_pipeline(
             current_plan=initial_plan,
             checker_issues=checker_result.issues,
             model=model,
+            request_id=request_id,
         )
         final_plan = revised_plan
         final_checker = check_plan(

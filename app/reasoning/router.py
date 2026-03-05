@@ -3,14 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..config import settings
 from ..llm import chat_completion, get_langchain_chat_model, resolve_model
+from ..observability import emit_llm_output_event, emit_llm_prompt_event
 from .types import RouterConstraints, RouterOutput
 
 
 logger = logging.getLogger("n8n-assistant")
+trace_logger = logging.getLogger("n8n-assistant.trace")
 
 _TOKEN_RE = re.compile(r"[a-z0-9_\-]+", re.IGNORECASE)
 _JSON_BLOCK_RE = re.compile(r"\{[\s\S]*\}")
@@ -261,18 +264,45 @@ def _router_prompts(user_prompt: str) -> tuple[str, str]:
 def _route_with_structured_output(
     user_prompt: str,
     model: Optional[str],
+    request_id: Optional[str] = None,
 ) -> RouterOutput:
     chat_model = get_langchain_chat_model(model=model, temperature=0.0)
     if chat_model is None:
         raise RuntimeError("langchain chat model is unavailable")
 
     system_prompt, user_payload = _router_prompts(user_prompt)
+    resolved_model = resolve_model(model)
+    prompt_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_payload},
+    ]
+    emit_llm_prompt_event(
+        trace_logger,
+        request_id=request_id,
+        stage="reasoning.router.structured",
+        model=resolved_model,
+        messages=prompt_messages,
+        params={"temperature": 0.0},
+    )
     structured_llm = chat_model.with_structured_output(RouterOutput)
+    started = time.perf_counter()
     output = structured_llm.invoke(
         [
             ("system", system_prompt),
             ("human", user_payload),
         ]
+    )
+    latency_ms = (time.perf_counter() - started) * 1000.0
+    serialized = output.model_dump(exclude_none=True) if isinstance(output, RouterOutput) else output
+    emit_llm_output_event(
+        trace_logger,
+        request_id=request_id,
+        stage="reasoning.router.structured",
+        model=resolved_model,
+        latency_ms=latency_ms,
+        content=json.dumps(serialized, ensure_ascii=False),
+        usage=None,
+        extra={"temperature": 0.0},
     )
     if isinstance(output, RouterOutput):
         return output
@@ -282,18 +312,41 @@ def _route_with_structured_output(
 def _route_with_legacy_json(
     user_prompt: str,
     model: Optional[str],
+    request_id: Optional[str] = None,
 ) -> RouterOutput:
     system_prompt, user_payload = _router_prompts(user_prompt)
     resolved_model = resolve_model(model)
+    prompt_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_payload},
+    ]
+    emit_llm_prompt_event(
+        trace_logger,
+        request_id=request_id,
+        stage="reasoning.router.legacy",
+        model=resolved_model,
+        messages=prompt_messages,
+        params={"temperature": 0.0},
+    )
+    started = time.perf_counter()
     response = chat_completion(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_payload},
-        ],
+        prompt_messages,
         model=resolved_model,
         temperature=0.0,
     )
+    latency_ms = (time.perf_counter() - started) * 1000.0
     content = response.model_dump().get("choices", [{}])[0].get("message", {}).get("content", "")
+    response_payload = response.model_dump()
+    emit_llm_output_event(
+        trace_logger,
+        request_id=request_id,
+        stage="reasoning.router.legacy",
+        model=resolved_model,
+        latency_ms=latency_ms,
+        content=str(content),
+        usage=response_payload.get("usage"),
+        extra={"temperature": 0.0},
+    )
     payload = _extract_json(str(content))
     if payload is None:
         raise ValueError("router llm returned invalid json")
@@ -304,6 +357,7 @@ def route_prompt(
     user_prompt: str,
     existing_workflow: Any = None,
     model: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> RouterOutput:
     if not settings.ROUTER_USE_LLM:
         return _heuristic_router_output(user_prompt, existing_workflow)
@@ -311,12 +365,12 @@ def route_prompt(
     fallback = _heuristic_router_output(user_prompt, existing_workflow)
 
     try:
-        return _route_with_structured_output(user_prompt, model=model)
+        return _route_with_structured_output(user_prompt, model=model, request_id=request_id)
     except Exception as exc:
         logger.warning("router structured output failed: %s", str(exc))
 
     try:
-        return _route_with_legacy_json(user_prompt, model=model)
+        return _route_with_legacy_json(user_prompt, model=model, request_id=request_id)
     except Exception as exc:
         logger.warning("router llm fallback to heuristics: %s", str(exc))
         return fallback

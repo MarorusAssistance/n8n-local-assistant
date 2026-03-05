@@ -14,6 +14,7 @@ def route_node(state: ReasoningGraphState) -> Dict[str, Any]:
         user_prompt=state["user_prompt"],
         existing_workflow=state.get("existing_workflow"),
         model=state.get("model"),
+        request_id=state.get("request_id"),
     )
     return {"router_output": output, "debug_events": ["route"]}
 
@@ -33,6 +34,7 @@ def plan_node(state: ReasoningGraphState) -> Dict[str, Any]:
         router_output=state["router_output"],
         context_pack=state["context_pack"],
         model=state.get("model"),
+        request_id=state.get("request_id"),
     )
     return {"plan": plan, "attempts": 1, "debug_events": ["plan"]}
 
@@ -54,6 +56,7 @@ def revise_node(state: ReasoningGraphState) -> Dict[str, Any]:
         current_plan=state["plan"],
         checker_issues=state["checker"].issues,
         model=state.get("model"),
+        request_id=state.get("request_id"),
     )
     return {
         "plan": revised_plan,
