@@ -47,6 +47,8 @@ def _client_with_store() -> tuple[TestClient, InMemoryStore]:
 def test_docs_only_legacy_path_when_reasoning_flag_disabled(monkeypatch) -> None:
     client, _store = _client_with_store()
     monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", False, raising=False)
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "legacy", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", False, raising=False)
 
     monkeypatch.setattr(
         "app.services.chat_service.retrieve_context",
@@ -76,6 +78,8 @@ def test_docs_only_legacy_path_when_reasoning_flag_disabled(monkeypatch) -> None
 def test_docs_only_reasoning_path_when_flag_enabled(monkeypatch) -> None:
     client, _store = _client_with_store()
     monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "legacy", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", False, raising=False)
     monkeypatch.setattr("app.services.chat_service.resolve_model", lambda *_: "test-model")
 
     fake_result = ReasoningPipelineResult(

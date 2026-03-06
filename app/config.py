@@ -22,9 +22,10 @@ class Settings(BaseSettings):
     TOP_K: int = 10
     MAX_CONTEXT_CHARS: int = 8000
     REASONING_PIPELINE_ENABLED: bool = False
-    AGENT_RUNTIME: str = "legacy"
-    LANGGRAPH_REASONING_ENABLED: bool = False
-    LANGGRAPH_WORKFLOW_ENABLED: bool = False
+    AGENT_RUNTIME: str = "langgraph"
+    LANGGRAPH_REASONING_ENABLED: bool = True
+    LANGGRAPH_WORKFLOW_ENABLED: bool = True
+    LANGGRAPH_EMERGENCY_LEGACY_FALLBACK: bool = False
     LANGGRAPH_RECURSION_LIMIT: int = 60
     ROUTER_USE_LLM: bool = False
     MAX_NODE_CARDS: int = 10

@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from ..config import settings
 from ..db import check_db
+from ..features.chat import ChatModePolicy, ChatUseCaseInput, HandleChatUseCase
 from ..graphs import MasterGraphRuntime
 from ..llm import chat_completion, list_models, resolve_model
 from ..observability import (
@@ -52,6 +53,7 @@ class ChatService:
         self._responses = ChatResponseBuilder()
         self._workflow = WorkflowService(self._n8n_client, self._logger)
         self._graph_runtime = MasterGraphRuntime(self._workflow)
+        self._chat_use_case = HandleChatUseCase(ChatModePolicy())
 
     def health(self) -> Dict[str, Any]:
         """Return DB and LM Studio health status."""
@@ -141,78 +143,103 @@ class ChatService:
         user_message = extract_last_user_message(control_combined.cleaned_messages)
         active_workflow_id = control_combined.active_workflow_id
 
-        if not user_message:
-            model = resolve_model(request.model)
-            if active_workflow_id:
-                text = (
-                    f"Workflow activo: {active_workflow_id}. "
-                    "Listo. Ahora dime que parte quieres revisar (nodo, rama o global)."
-                )
-            else:
-                raise HTTPException(status_code=400, detail="No user message found")
-
-            self._memory.append_memory(conversation_id, raw_user_message, text)
-            if request.stream:
-                return StreamingResponse(
-                    self._responses.stream_simple_text(text, model=model),
-                    headers=self._memory.conversation_headers(
-                        conversation_id, generated_conversation_id
-                    ),
-                    media_type="text/event-stream",
-                )
-
-            response_dict = self._responses.simple_chat_response(text, model=model)
-            if http_response is not None:
-                self._memory.apply_conversation_headers(
-                    http_response, conversation_id, generated_conversation_id
-                )
-            return response_dict
-
-        self._trace_request(
-            request_id=request_id,
-            conversation_id=conversation_id,
-            workflow_id=active_workflow_id,
-            stream=request.stream,
-            messages_count=len(messages),
-            history_count=len(history),
-            user_message=user_message,
-        )
-
-        if not active_workflow_id:
-            return self._handle_docs_only(
-                request=request,
-                messages_for_prompt=messages_for_prompt,
-                user_message=user_message,
-                conversation_id=conversation_id,
-                generated_conversation_id=generated_conversation_id,
-                http_response=http_response,
-                raw_user_message=raw_user_message,
+        if user_message:
+            self._trace_request(
                 request_id=request_id,
+                conversation_id=conversation_id,
+                workflow_id=active_workflow_id,
+                stream=request.stream,
+                messages_count=len(messages),
+                history_count=len(history),
+                user_message=user_message,
             )
 
-        if self._use_langgraph_workflow_runtime():
-            return self._handle_workflow_aware_langgraph(
-                request=request,
-                user_message=user_message,
-                messages_for_prompt=messages_for_prompt,
-                active_workflow_id=active_workflow_id,
-                conversation_id=conversation_id,
-                generated_conversation_id=generated_conversation_id,
-                http_response=http_response,
-                raw_user_message=raw_user_message,
-                request_id=request_id,
-            )
-
-        return self._handle_workflow_aware(
+        chat_input = ChatUseCaseInput(
             request=request,
+            request_id=request_id,
             user_message=user_message,
-            messages_for_prompt=messages_for_prompt,
             active_workflow_id=active_workflow_id,
+            messages_for_prompt=messages_for_prompt,
+            raw_user_message=raw_user_message,
             conversation_id=conversation_id,
             generated_conversation_id=generated_conversation_id,
-            http_response=http_response,
-            raw_user_message=raw_user_message,
-            request_id=request_id,
+            history_count=len(history),
+            messages_count=len(messages),
+        )
+        use_case_result = self._chat_use_case.execute(
+            chat_input,
+            handlers=self._chat_use_case_handlers(http_response=http_response),
+        )
+        return use_case_result.payload
+
+    def _chat_use_case_handlers(self, http_response: Optional[Response]):
+        from ..features.chat.use_case import ChatUseCaseHandlers
+
+        return ChatUseCaseHandlers(
+            on_missing_user_message=lambda chat_input: self._handle_missing_user_message(
+                request=chat_input.request,
+                active_workflow_id=chat_input.active_workflow_id,
+                conversation_id=chat_input.conversation_id,
+                generated_conversation_id=chat_input.generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=chat_input.raw_user_message,
+            ),
+            on_docs_mode=lambda chat_input: self._handle_docs_only(
+                request=chat_input.request,
+                messages_for_prompt=chat_input.messages_for_prompt,
+                user_message=str(chat_input.user_message or ""),
+                conversation_id=chat_input.conversation_id,
+                generated_conversation_id=chat_input.generated_conversation_id,
+                http_response=http_response,
+                raw_user_message=chat_input.raw_user_message,
+                request_id=chat_input.request_id,
+            ),
+            on_reasoning_mode=lambda chat_input: (
+                self._handle_reasoning_plan_only_langgraph(
+                    request=chat_input.request,
+                    user_message=str(chat_input.user_message or ""),
+                    conversation_id=chat_input.conversation_id,
+                    generated_conversation_id=chat_input.generated_conversation_id,
+                    http_response=http_response,
+                    raw_user_message=chat_input.raw_user_message,
+                    request_id=chat_input.request_id,
+                )
+                if self._use_langgraph_reasoning_runtime()
+                else self._handle_reasoning_plan_only(
+                    request=chat_input.request,
+                    user_message=str(chat_input.user_message or ""),
+                    conversation_id=chat_input.conversation_id,
+                    generated_conversation_id=chat_input.generated_conversation_id,
+                    http_response=http_response,
+                    raw_user_message=chat_input.raw_user_message,
+                    request_id=chat_input.request_id,
+                )
+            ),
+            on_workflow_mode=lambda chat_input: (
+                self._handle_workflow_aware_langgraph(
+                    request=chat_input.request,
+                    user_message=str(chat_input.user_message or ""),
+                    messages_for_prompt=chat_input.messages_for_prompt,
+                    active_workflow_id=str(chat_input.active_workflow_id or ""),
+                    conversation_id=chat_input.conversation_id,
+                    generated_conversation_id=chat_input.generated_conversation_id,
+                    http_response=http_response,
+                    raw_user_message=chat_input.raw_user_message,
+                    request_id=chat_input.request_id,
+                )
+                if self._use_langgraph_workflow_runtime()
+                else self._handle_workflow_aware(
+                    request=chat_input.request,
+                    user_message=str(chat_input.user_message or ""),
+                    messages_for_prompt=chat_input.messages_for_prompt,
+                    active_workflow_id=str(chat_input.active_workflow_id or ""),
+                    conversation_id=chat_input.conversation_id,
+                    generated_conversation_id=chat_input.generated_conversation_id,
+                    http_response=http_response,
+                    raw_user_message=chat_input.raw_user_message,
+                    request_id=chat_input.request_id,
+                )
+            ),
         )
 
     @staticmethod
@@ -227,6 +254,41 @@ class ChatService:
     def _use_langgraph_workflow_runtime(cls) -> bool:
         return cls._use_langgraph_runtime() and settings.LANGGRAPH_WORKFLOW_ENABLED
 
+    def _handle_missing_user_message(
+        self,
+        request: ChatCompletionRequest,
+        active_workflow_id: Optional[str],
+        conversation_id: Optional[str],
+        generated_conversation_id: bool,
+        http_response: Optional[Response],
+        raw_user_message: Optional[str],
+    ) -> Any:
+        model = resolve_model(request.model)
+        if active_workflow_id:
+            text = (
+                f"Workflow activo: {active_workflow_id}. "
+                "Listo. Ahora dime que parte quieres revisar (nodo, rama o global)."
+            )
+        else:
+            raise HTTPException(status_code=400, detail="No user message found")
+
+        self._memory.append_memory(conversation_id, raw_user_message, text)
+        if request.stream:
+            return StreamingResponse(
+                self._responses.stream_simple_text(text, model=model),
+                headers=self._memory.conversation_headers(
+                    conversation_id, generated_conversation_id
+                ),
+                media_type="text/event-stream",
+            )
+
+        response_dict = self._responses.simple_chat_response(text, model=model)
+        if http_response is not None:
+            self._memory.apply_conversation_headers(
+                http_response, conversation_id, generated_conversation_id
+            )
+        return response_dict
+
     def _handle_docs_only(
         self,
         request: ChatCompletionRequest,
@@ -240,18 +302,17 @@ class ChatService:
     ) -> Any:
         """RAG-only path when no active workflow is selected."""
         self._trace_logger.debug("docs-only start: id=%s conv=%s", request_id, conversation_id)
-        if self._use_langgraph_reasoning_runtime():
-            return self._handle_reasoning_plan_only_langgraph(
-                request=request,
-                user_message=user_message,
-                conversation_id=conversation_id,
-                generated_conversation_id=generated_conversation_id,
-                http_response=http_response,
-                raw_user_message=raw_user_message,
-                request_id=request_id,
-            )
-
         if settings.REASONING_PIPELINE_ENABLED:
+            if self._use_langgraph_reasoning_runtime():
+                return self._handle_reasoning_plan_only_langgraph(
+                    request=request,
+                    user_message=user_message,
+                    conversation_id=conversation_id,
+                    generated_conversation_id=generated_conversation_id,
+                    http_response=http_response,
+                    raw_user_message=raw_user_message,
+                    request_id=request_id,
+                )
             return self._handle_reasoning_plan_only(
                 request=request,
                 user_message=user_message,
@@ -482,6 +543,11 @@ class ChatService:
             )
         except Exception as exc:
             self._logger.exception("reasoning graph failed")
+            if not settings.LANGGRAPH_EMERGENCY_LEGACY_FALLBACK:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Reasoning runtime failed in graph mode.",
+                ) from exc
             self._trace_logger.warning("reasoning graph fallback to legacy pipeline: id=%s err=%s", request_id, str(exc))
             return self._handle_reasoning_plan_only(
                 request=request,
@@ -577,6 +643,11 @@ class ChatService:
             )
         except Exception as exc:
             self._logger.exception("workflow graph failed")
+            if not settings.LANGGRAPH_EMERGENCY_LEGACY_FALLBACK:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Workflow runtime failed in graph mode.",
+                ) from exc
             self._trace_logger.warning("workflow graph fallback to legacy runtime: id=%s err=%s", request_id, str(exc))
             return self._handle_workflow_aware(
                 request=request,
@@ -632,6 +703,11 @@ class ChatService:
                 request_id,
                 active_workflow_id,
             )
+            if not settings.LANGGRAPH_EMERGENCY_LEGACY_FALLBACK:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Workflow graph produced empty prompt.",
+                )
             return self._handle_workflow_aware(
                 request=request,
                 user_message=user_message,

@@ -1,4 +1,4 @@
-- name: legacy_json_only_no_reasoning
+- name: baseline
   env_overrides:
     AGENT_RUNTIME: legacy
     REASONING_PIPELINE_ENABLED: "false"
@@ -15,6 +15,17 @@
     REASONING_PIPELINE_ENABLED: "true"
     LANGGRAPH_REASONING_ENABLED: "false"
     LANGGRAPH_WORKFLOW_ENABLED: "false"
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: true
+
+- name: langgraph_json_only_reasoning
+  env_overrides:
+    AGENT_RUNTIME: langgraph
+    REASONING_PIPELINE_ENABLED: "true"
+    LANGGRAPH_REASONING_ENABLED: "true"
+    LANGGRAPH_WORKFLOW_ENABLED: "true"
   warmup: 1
   repetitions: 3
   adapter: direct
