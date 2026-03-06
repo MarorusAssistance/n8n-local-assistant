@@ -559,29 +559,55 @@ class ChatService:
                 request_id=request_id,
             )
 
-        issue_count = len(result.checker.issues)
-        self._trace_logger.info(
-            (
-                "reasoning graph result: id=%s intent=%s node_cards=%d doc_chunks=%d "
-                "max_tokens=%d estimated_tokens=%d second_iteration=%s issues=%d"
-            ),
-            request_id,
-            result.router.intent,
-            len(result.context_pack.nodeCards),
-            len(result.context_pack.docChunks),
-            result.context_pack.budget.maxContextTokens,
-            result.context_pack.budget.estimatedTokens,
-            result.second_iteration_used,
-            issue_count,
-        )
-
-        if result.checker.ok:
-            payload: Dict[str, Any] = result.plan.model_dump(exclude_none=True)
-        else:
+        payload: Dict[str, Any]
+        if hasattr(result, "entry_intent"):
+            entry_intent = getattr(result, "entry_intent", "unknown")
+            target_stage = getattr(result, "target_stage", None)
+            entry_intent_value = entry_intent.value if hasattr(entry_intent, "value") else str(entry_intent)
+            target_stage_value = (
+                target_stage.value if target_stage is not None and hasattr(target_stage, "value") else target_stage
+            )
             payload = {
-                "plan": result.plan.model_dump(exclude_none=True),
-                "checker": result.checker.model_dump(exclude_none=True),
+                "entry_intent": entry_intent_value,
+                "target_stage": target_stage_value,
+                "confidence": float(getattr(result, "confidence", 0.0)),
+                "routing_signals": list(getattr(result, "routing_signals", []) or []),
+                "current_stage": getattr(result, "current_stage", None),
+                "missing_user_inputs": list(getattr(result, "missing_user_inputs", []) or []),
+                "status": str(getattr(result, "status", "unknown_terminal")),
             }
+            self._trace_logger.info(
+                "reasoning graph result: id=%s intent=%s stage=%s confidence=%.2f status=%s signals=%d",
+                request_id,
+                payload["entry_intent"],
+                payload["target_stage"] or "-",
+                payload["confidence"],
+                payload["status"],
+                len(payload["routing_signals"]),
+            )
+        else:
+            issue_count = len(result.checker.issues)
+            self._trace_logger.info(
+                (
+                    "reasoning graph result (legacy): id=%s intent=%s node_cards=%d doc_chunks=%d "
+                    "max_tokens=%d estimated_tokens=%d second_iteration=%s issues=%d"
+                ),
+                request_id,
+                result.router.intent,
+                len(result.context_pack.nodeCards),
+                len(result.context_pack.docChunks),
+                result.context_pack.budget.maxContextTokens,
+                result.context_pack.budget.estimatedTokens,
+                result.second_iteration_used,
+                issue_count,
+            )
+            if result.checker.ok:
+                payload = result.plan.model_dump(exclude_none=True)
+            else:
+                payload = {
+                    "plan": result.plan.model_dump(exclude_none=True),
+                    "checker": result.checker.model_dump(exclude_none=True),
+                }
 
         assistant_text_raw = json.dumps(payload, ensure_ascii=False)
         model = resolve_model(request.model)

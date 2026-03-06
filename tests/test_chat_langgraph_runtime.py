@@ -5,19 +5,13 @@ import json
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.features.reasoning.multi_agent_contracts import (
+    AgentStage,
+    EntryIntent,
+    MultiAgentGraphResult,
+)
 from app.main import app
 from app.memory.in_memory import InMemoryStore
-from app.reasoning.types import (
-    CheckerResult,
-    ContextDocChunk,
-    ContextPack,
-    ContextPackBudget,
-    PlanSpec,
-    PlanStep,
-    ReasoningPipelineResult,
-    RouterConstraints,
-    RouterOutput,
-)
 from app.services.chat_service import ChatService
 import app.api.routes as routes
 
@@ -29,40 +23,18 @@ def _client_with_store() -> tuple[TestClient, ChatService]:
     return TestClient(app), service
 
 
-def _fake_reasoning_result() -> ReasoningPipelineResult:
-    return ReasoningPipelineResult(
-        plan=PlanSpec(
-            summary="graph plan",
-            steps=[
-                PlanStep(
-                    id="s1",
-                    nodeType="n8n-nodes-base.webhook",
-                    purpose="Trigger workflow",
-                    inputs=[],
-                    outputs=["json"],
-                )
-            ],
-            dataFlowNotes=[],
-            questionsForUser=[],
-        ),
-        checker=CheckerResult(ok=True, issues=[]),
-        router=RouterOutput(
-            intent="create",
-            goal="create",
-            constraints=RouterConstraints(),
-            missing_info=[],
-            complexity_score=1,
-        ),
-        context_pack=ContextPack(
-            nodeCards=[],
-            docChunks=[ContextDocChunk(id="d1", text="doc", source="docs")],
-            budget=ContextPackBudget(
-                maxNodeCards=10,
-                maxDocChunks=6,
-                maxContextTokens=2500,
-                estimatedTokens=120,
-            ),
-        ),
+def _fake_reasoning_result() -> MultiAgentGraphResult:
+    return MultiAgentGraphResult(
+        user_query="Crea un workflow",
+        entry_intent=EntryIntent.workflow_build_request,
+        target_stage=AgentStage.product_manager_agent,
+        confidence=0.83,
+        routing_signals=["build_signals_detected"],
+        current_stage="product_manager_agent",
+        missing_user_inputs=[],
+        qa_enabled=True,
+        needs_replan=False,
+        status="stub_routed",
     )
 
 
@@ -94,7 +66,8 @@ def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) ->
     payload = response.json()
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
-    assert parsed["summary"] == "graph plan"
+    assert parsed["entry_intent"] == "workflow_build_request"
+    assert parsed["target_stage"] == "product_manager_agent"
 
 
 def test_workflow_uses_langgraph_runtime_when_enabled(monkeypatch) -> None:

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Union
 
+from ..reasoning.multi_agent_contracts import MultiAgentGraphResult
 from ...reasoning.types import ReasoningPipelineResult
 
 
@@ -27,7 +28,7 @@ class ReasoningPort(Protocol):
         request_id: Optional[str],
         existing_workflow: Any,
         run_config: Optional[Dict[str, Any]] = None,
-    ) -> ReasoningPipelineResult:
+    ) -> Union[ReasoningPipelineResult, MultiAgentGraphResult]:
         ...
 
 

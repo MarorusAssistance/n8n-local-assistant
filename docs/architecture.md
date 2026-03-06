@@ -15,7 +15,11 @@ The backend uses a modular vertical-slice architecture:
 ## Runtime orchestration
 - Chat mode selection is handled by `ChatModePolicy` in `features/chat`.
 - Reasoning and workflow execution are routed through `MasterGraphRuntime`.
-- Legacy runtime paths remain only for emergency fallback when
+- Reasoning runtime in LangGraph now uses a multi-agent entry graph:
+  - `entry_router` (structured intent classification)
+  - stub stages: `commercial_agent`, `consultant_agent`, `product_manager_agent`, `engineer_agent`, `qa_agent`
+  - terminal `unknown` route without forced stage.
+- Legacy reasoning fallback remains only for emergency mode when
   `LANGGRAPH_EMERGENCY_LEGACY_FALLBACK=true`.
 
 ## Public API compatibility

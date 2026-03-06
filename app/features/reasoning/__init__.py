@@ -12,6 +12,14 @@ from ...reasoning.types import (
     RouterConstraints,
     RouterOutput,
 )
+from .multi_agent_contracts import (
+    AgentStage,
+    EntryIntent,
+    EntryRouterDecision,
+    MultiAgentGraphResult,
+    TemplateCandidate,
+    UseCase,
+)
 
 __all__ = [
     "run_reasoning_pipeline",
@@ -26,4 +34,10 @@ __all__ = [
     "CheckerIssue",
     "CheckerResult",
     "ReasoningPipelineResult",
+    "EntryIntent",
+    "AgentStage",
+    "UseCase",
+    "TemplateCandidate",
+    "EntryRouterDecision",
+    "MultiAgentGraphResult",
 ]

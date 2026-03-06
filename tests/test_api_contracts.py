@@ -6,17 +6,13 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.features.reasoning.multi_agent_contracts import (
+    AgentStage,
+    EntryIntent,
+    MultiAgentGraphResult,
+)
 from app.main import app
 from app.memory.in_memory import InMemoryStore
-from app.reasoning.types import (
-    CheckerResult,
-    ContextPack,
-    ContextPackBudget,
-    PlanSpec,
-    ReasoningPipelineResult,
-    RouterConstraints,
-    RouterOutput,
-)
 from app.services.chat_service import ChatService
 import app.api.routes as routes
 
@@ -27,32 +23,18 @@ def _client_with_store() -> tuple[TestClient, InMemoryStore]:
     return TestClient(app), store
 
 
-def _fake_reasoning_result() -> ReasoningPipelineResult:
-    return ReasoningPipelineResult(
-        plan=PlanSpec(
-            summary="Contract plan",
-            steps=[],
-            dataFlowNotes=[],
-            questionsForUser=["Need target sheet."],
-        ),
-        checker=CheckerResult(ok=True, issues=[]),
-        router=RouterOutput(
-            intent="create",
-            goal="Create workflow",
-            constraints=RouterConstraints(),
-            missing_info=[],
-            complexity_score=1,
-        ),
-        context_pack=ContextPack(
-            nodeCards=[],
-            docChunks=[],
-            budget=ContextPackBudget(
-                maxNodeCards=10,
-                maxDocChunks=6,
-                maxContextTokens=2500,
-                estimatedTokens=120,
-            ),
-        ),
+def _fake_reasoning_result() -> MultiAgentGraphResult:
+    return MultiAgentGraphResult(
+        user_query="Crea un flujo",
+        entry_intent=EntryIntent.workflow_build_request,
+        target_stage=AgentStage.product_manager_agent,
+        confidence=0.84,
+        routing_signals=["build_signals_detected"],
+        current_stage="product_manager_agent",
+        missing_user_inputs=[],
+        qa_enabled=True,
+        needs_replan=False,
+        status="stub_routed",
     )
 
 
@@ -113,7 +95,8 @@ def test_chat_completion_contract_non_stream(monkeypatch) -> None:
     assert isinstance(payload["choices"], list) and payload["choices"]
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
-    assert parsed["summary"] == "Contract plan"
+    assert parsed["entry_intent"] == "workflow_build_request"
+    assert parsed["target_stage"] == "product_manager_agent"
 
 
 def test_chat_completion_contract_stream(monkeypatch) -> None:
