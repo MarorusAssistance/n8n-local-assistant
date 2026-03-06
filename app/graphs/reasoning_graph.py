@@ -8,9 +8,9 @@ from ..features.reasoning.multi_agent_contracts import (
     MultiAgentGraphResult,
 )
 from .multi_agent_state import MultiAgentGraphState
+from .nodes.commercial_agent import commercial_agent_node
 from .nodes.multi_agent_router import route_entry_intent
 from .nodes.multi_agent_stubs import (
-    commercial_agent_node,
     consultant_agent_node,
     engineer_agent_node,
     product_manager_agent_node,
@@ -116,7 +116,11 @@ class ReasoningGraphRuntime:
     def _build_result(state: MultiAgentGraphState) -> MultiAgentGraphResult:
         target_stage = state.get("target_stage")
         current_stage = state.get("current_stage")
-        status = "stub_routed" if target_stage is not None and current_stage else "unknown_terminal"
+        selected_use_case = state.get("selected_use_case")
+        if current_stage == "commercial_agent" and selected_use_case is None:
+            status = "unknown_terminal"
+        else:
+            status = "stub_routed" if target_stage is not None and current_stage else "unknown_terminal"
         entry_intent = state.get("entry_intent") or EntryIntent.unknown
         return MultiAgentGraphResult(
             user_query=state.get("user_query") or "",
@@ -126,6 +130,11 @@ class ReasoningGraphRuntime:
             routing_signals=list(state.get("routing_signals") or []),
             current_stage=current_stage,
             missing_user_inputs=list(state.get("missing_user_inputs") or []),
+            business_context_summary=state.get("business_context_summary"),
+            discovered_use_cases=list(state.get("discovered_use_cases") or []),
+            selected_use_case=selected_use_case,
+            alternative_use_cases=list(state.get("alternative_use_cases") or []),
+            selection_reason=state.get("selection_reason"),
             qa_enabled=bool(state.get("qa_enabled", False)),
             needs_replan=bool(state.get("needs_replan", False)),
             status=status,
@@ -148,9 +157,11 @@ class ReasoningGraphRuntime:
             "confidence": 0.0,
             "routing_signals": [],
             "current_stage": None,
+            "business_context_summary": None,
             "discovered_use_cases": [],
             "selected_use_case": None,
             "alternative_use_cases": [],
+            "selection_reason": None,
             "workflow_context": {"model": model, "request_id": request_id},
             "architecture_plan": {},
             "missing_user_inputs": [],
@@ -171,4 +182,3 @@ class ReasoningGraphRuntime:
             result_state = self._run_sequential(state)
 
         return self._build_result(result_state)
-

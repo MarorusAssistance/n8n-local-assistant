@@ -567,6 +567,10 @@ class ChatService:
             target_stage_value = (
                 target_stage.value if target_stage is not None and hasattr(target_stage, "value") else target_stage
             )
+            business_context_summary = getattr(result, "business_context_summary", None)
+            discovered_use_cases = list(getattr(result, "discovered_use_cases", []) or [])
+            selected_use_case = getattr(result, "selected_use_case", None)
+            alternative_use_cases = list(getattr(result, "alternative_use_cases", []) or [])
             payload = {
                 "entry_intent": entry_intent_value,
                 "target_stage": target_stage_value,
@@ -574,6 +578,25 @@ class ChatService:
                 "routing_signals": list(getattr(result, "routing_signals", []) or []),
                 "current_stage": getattr(result, "current_stage", None),
                 "missing_user_inputs": list(getattr(result, "missing_user_inputs", []) or []),
+                "business_context_summary": (
+                    business_context_summary.model_dump(exclude_none=True)
+                    if hasattr(business_context_summary, "model_dump")
+                    else business_context_summary
+                ),
+                "discovered_use_cases": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in discovered_use_cases
+                ],
+                "selected_use_case": (
+                    selected_use_case.model_dump(exclude_none=True)
+                    if hasattr(selected_use_case, "model_dump")
+                    else selected_use_case
+                ),
+                "alternative_use_cases": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in alternative_use_cases
+                ],
+                "selection_reason": getattr(result, "selection_reason", None),
                 "status": str(getattr(result, "status", "unknown_terminal")),
             }
             self._trace_logger.info(

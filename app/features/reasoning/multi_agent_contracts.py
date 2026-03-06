@@ -34,6 +34,13 @@ class UseCase(BaseModel):
     why_selected: str
 
 
+class BusinessContextSummary(BaseModel):
+    process_scope: str = ""
+    pain_points: List[str] = Field(default_factory=list)
+    desired_outcomes: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+
+
 class TemplateCandidate(BaseModel):
     template_id: str
     title: str
@@ -61,7 +68,11 @@ class MultiAgentGraphResult(BaseModel):
     routing_signals: List[str] = Field(default_factory=list)
     current_stage: Optional[str] = None
     missing_user_inputs: List[str] = Field(default_factory=list)
+    business_context_summary: Optional[BusinessContextSummary] = None
+    discovered_use_cases: List[UseCase] = Field(default_factory=list)
+    selected_use_case: Optional[UseCase] = None
+    alternative_use_cases: List[UseCase] = Field(default_factory=list)
+    selection_reason: Optional[str] = None
     qa_enabled: bool = False
     needs_replan: bool = False
     status: Literal["stub_routed", "unknown_terminal"]
-

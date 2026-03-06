@@ -7,8 +7,10 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
+    BusinessContextSummary,
     EntryIntent,
     MultiAgentGraphResult,
+    UseCase,
 )
 from app.main import app
 from app.memory.in_memory import InMemoryStore
@@ -26,12 +28,42 @@ def _client_with_store() -> tuple[TestClient, ChatService]:
 def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un workflow",
-        entry_intent=EntryIntent.workflow_build_request,
+        entry_intent=EntryIntent.business_discovery_conversation,
         target_stage=AgentStage.product_manager_agent,
         confidence=0.83,
-        routing_signals=["build_signals_detected"],
-        current_stage="product_manager_agent",
+        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager"],
+        current_stage="commercial_agent",
         missing_user_inputs=[],
+        business_context_summary=BusinessContextSummary(
+            process_scope="Customer support operations",
+            pain_points=["manual escalations"],
+            desired_outcomes=["faster response times"],
+            constraints=[],
+        ),
+        discovered_use_cases=[
+            UseCase(
+                id="uc_1",
+                title="Support escalation automation",
+                business_problem="Critical support tickets are escalated too late.",
+                desired_outcome="Escalate priority tickets automatically before SLA breach.",
+                expected_value="Reduce churn and avoid SLA penalties.",
+                feasibility="medium",
+                priority_score=88.0,
+                why_selected="Selected due to highest business value.",
+            )
+        ],
+        selected_use_case=UseCase(
+            id="uc_1",
+            title="Support escalation automation",
+            business_problem="Critical support tickets are escalated too late.",
+            desired_outcome="Escalate priority tickets automatically before SLA breach.",
+            expected_value="Reduce churn and avoid SLA penalties.",
+            feasibility="medium",
+            priority_score=88.0,
+            why_selected="Selected due to highest business value.",
+        ),
+        alternative_use_cases=[],
+        selection_reason="Highest expected business value with clear and actionable scope.",
         qa_enabled=True,
         needs_replan=False,
         status="stub_routed",
@@ -66,8 +98,12 @@ def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) ->
     payload = response.json()
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
-    assert parsed["entry_intent"] == "workflow_build_request"
+    assert parsed["entry_intent"] == "business_discovery_conversation"
     assert parsed["target_stage"] == "product_manager_agent"
+    assert parsed["current_stage"] == "commercial_agent"
+    assert parsed["selected_use_case"]["id"] == "uc_1"
+    assert parsed["alternative_use_cases"] == []
+    assert "selection_reason" in parsed
 
 
 def test_workflow_uses_langgraph_runtime_when_enabled(monkeypatch) -> None:

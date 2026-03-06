@@ -14,6 +14,7 @@ from ...reasoning.types import (
 )
 from .multi_agent_contracts import (
     AgentStage,
+    BusinessContextSummary,
     EntryIntent,
     EntryRouterDecision,
     MultiAgentGraphResult,
@@ -36,6 +37,7 @@ __all__ = [
     "ReasoningPipelineResult",
     "EntryIntent",
     "AgentStage",
+    "BusinessContextSummary",
     "UseCase",
     "TemplateCandidate",
     "EntryRouterDecision",

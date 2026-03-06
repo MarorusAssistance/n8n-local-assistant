@@ -8,8 +8,10 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
+    BusinessContextSummary,
     EntryIntent,
     MultiAgentGraphResult,
+    UseCase,
 )
 from app.main import app
 from app.memory.in_memory import InMemoryStore
@@ -26,12 +28,42 @@ def _client_with_store() -> tuple[TestClient, InMemoryStore]:
 def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un flujo",
-        entry_intent=EntryIntent.workflow_build_request,
+        entry_intent=EntryIntent.business_discovery_conversation,
         target_stage=AgentStage.product_manager_agent,
         confidence=0.84,
-        routing_signals=["build_signals_detected"],
-        current_stage="product_manager_agent",
+        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager"],
+        current_stage="commercial_agent",
         missing_user_inputs=[],
+        business_context_summary=BusinessContextSummary(
+            process_scope="Finance operations",
+            pain_points=["manual approvals"],
+            desired_outcomes=["faster approvals"],
+            constraints=[],
+        ),
+        discovered_use_cases=[
+            UseCase(
+                id="uc_1",
+                title="Invoice approval reminders",
+                business_problem="Invoice approvals are delayed due to manual follow-up.",
+                desired_outcome="Automate reminders and escalation for pending approvals.",
+                expected_value="Reduce delays and improve payment throughput.",
+                feasibility="medium",
+                priority_score=85.0,
+                why_selected="Selected due to high business value.",
+            )
+        ],
+        selected_use_case=UseCase(
+            id="uc_1",
+            title="Invoice approval reminders",
+            business_problem="Invoice approvals are delayed due to manual follow-up.",
+            desired_outcome="Automate reminders and escalation for pending approvals.",
+            expected_value="Reduce delays and improve payment throughput.",
+            feasibility="medium",
+            priority_score=85.0,
+            why_selected="Selected due to high business value.",
+        ),
+        alternative_use_cases=[],
+        selection_reason="Top business-value opportunity with clear desired outcome.",
         qa_enabled=True,
         needs_replan=False,
         status="stub_routed",
@@ -95,8 +127,9 @@ def test_chat_completion_contract_non_stream(monkeypatch) -> None:
     assert isinstance(payload["choices"], list) and payload["choices"]
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
-    assert parsed["entry_intent"] == "workflow_build_request"
+    assert parsed["entry_intent"] == "business_discovery_conversation"
     assert parsed["target_stage"] == "product_manager_agent"
+    assert parsed["selected_use_case"]["id"] == "uc_1"
 
 
 def test_chat_completion_contract_stream(monkeypatch) -> None:
