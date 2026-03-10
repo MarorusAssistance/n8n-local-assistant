@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     MAX_NODE_CARDS: int = 10
     MAX_DOC_CHUNKS: int = 6
     MAX_CONTEXT_TOKENS: int = 2500
+    PM_MAX_STAGE_RETRIEVAL_PASSES: int = 3
+    PM_MAX_USER_CLARIFICATIONS: int = 2
+    PM_FIT_SCORE_THRESHOLD: float = 0.70
+    PM_RERANK_THRESHOLD: float = 0.55
+    PM_TOP_MARGIN_THRESHOLD: float = 0.10
     ENABLE_RERANK: bool = False
     RERANK_MODEL: str = "BAAI/bge-reranker-v2.5-gemma2-lightweight"
     RERANK_FALLBACK_MODEL: Optional[str] = "BAAI/bge-reranker-v2-m3"
@@ -79,6 +84,7 @@ class Settings(BaseSettings):
     LANGSMITH_TRACING: bool = True
     LANGSMITH_PROJECT: str = "n8n-assistant"
     LANGSMITH_ENDPOINT: Optional[str] = None
+    LANGSMITH_API_KEY: Optional[str] = None
 
     @field_validator("LOG_LEVEL", "TRACE_LOG_LEVEL", mode="before")
     @classmethod
@@ -154,6 +160,7 @@ class Settings(BaseSettings):
         "N8N_API_KEY",
         "APP_ENV",
         "LANGSMITH_ENDPOINT",
+        "LANGSMITH_API_KEY",
         "RERANK_FALLBACK_MODEL",
         "RERANK_DEVICE",
         "RERANK_CUTOFF_LAYERS",
@@ -223,6 +230,8 @@ class Settings(BaseSettings):
         "MAX_NODE_CARDS",
         "MAX_DOC_CHUNKS",
         "MAX_CONTEXT_TOKENS",
+        "PM_MAX_STAGE_RETRIEVAL_PASSES",
+        "PM_MAX_USER_CLARIFICATIONS",
         "LANGGRAPH_RECURSION_LIMIT",
         mode="after",
     )
@@ -230,6 +239,18 @@ class Settings(BaseSettings):
     def _validate_reasoning_limits(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("Reasoning limits must be > 0")
+        return value
+
+    @field_validator(
+        "PM_FIT_SCORE_THRESHOLD",
+        "PM_RERANK_THRESHOLD",
+        "PM_TOP_MARGIN_THRESHOLD",
+        mode="after",
+    )
+    @classmethod
+    def _validate_pm_thresholds(cls, value: float) -> float:
+        if value < 0.0 or value > 1.0:
+            raise ValueError("PM thresholds must be within [0, 1]")
         return value
 
     @field_validator("DISTANCE_OP")

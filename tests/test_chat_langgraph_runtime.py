@@ -14,6 +14,12 @@ from app.features.reasoning.multi_agent_contracts import (
     ImplementationStatus,
     ImplementedNode,
     MissingUserInput,
+    PMClarificationState,
+    PMNodeCandidate,
+    PMProgressState,
+    PMStagePlan,
+    PMStageSelection,
+    PMStatus,
     ProposedNode,
     RequiredCredential,
     BusinessContextSummary,
@@ -137,6 +143,57 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
             notes=["required_nodes=1"],
         ),
         planning_summary="Architecture plan is ready for engineer handoff with evidence-backed required nodes.",
+        pm_status=PMStatus.pm_completed,
+        pm_stage_plan=[
+            PMStagePlan(
+                id="stage_intake",
+                name="Intake",
+                objective="Capture support event",
+                expected_inputs=["Support event"],
+                expected_outputs=["Normalized payload"],
+                success_criteria=["Event captured"],
+                dependencies=[],
+            )
+        ],
+        pm_stage_selections=[
+            PMStageSelection(
+                stage_id="stage_intake",
+                selected_node_types=["n8n-nodes-base.webhook"],
+                selected_nodes=[
+                    PMNodeCandidate(
+                        node_type="n8n-nodes-base.webhook",
+                        capability_summary="Capture inbound events.",
+                        limitations=[],
+                        usage_mode="action_only",
+                        evidence_chunk_ids=["chunk-1"],
+                        evidence_refs=["ref-1"],
+                        rerank_confidence=0.74,
+                        pm_fit_score=0.85,
+                    )
+                ],
+                rationale="Best fit for stage objective.",
+                pm_fit_score=0.85,
+                rerank_confidence=0.74,
+                top_margin=0.12,
+                gate_passed=True,
+                passes_used=1,
+                missing_information=[],
+                search_history=[],
+            )
+        ],
+        pm_stage_progress=PMProgressState(
+            total_stages=1,
+            current_stage_id="stage_intake",
+            completed_stage_ids=["stage_intake"],
+            blocked_stage_ids=[],
+            passes_by_stage={"stage_intake": 1},
+        ),
+        pm_clarification_state=PMClarificationState(
+            attempts_used=0,
+            max_attempts=2,
+            pending_questions=[],
+            turns=[],
+        ),
         qa_enabled=True,
         needs_replan=False,
         status="stub_routed",
@@ -324,6 +381,9 @@ def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) ->
     assert parsed["alternative_use_cases"] == []
     assert parsed["architecture_plan"]["required_nodes"][0]["node_type"] == "n8n-nodes-base.webhook"
     assert parsed["workflow_context"]["planning_ready"] is True
+    assert parsed["pm_status"] == "pm_completed"
+    assert parsed["pm_stage_plan"][0]["id"] == "stage_intake"
+    assert parsed["pm_stage_selections"][0]["selected_node_types"] == ["n8n-nodes-base.webhook"]
     assert "selection_reason" in parsed
 
 

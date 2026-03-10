@@ -13,6 +13,12 @@ from ..features.reasoning.multi_agent_contracts import (
     ImplementationQueueItem,
     ImplementationStatus,
     ImplementedNode,
+    PMClarificationState,
+    PMProgressState,
+    PMStagePlan,
+    PMStageSearchState,
+    PMStageSelection,
+    PMStatus,
     MissingUserInput,
     MultiAgentGraphResult,
     ProposedNode,
@@ -123,6 +129,17 @@ def _normalize_impl_status(value: Any) -> Optional[ImplementationStatus]:
     return None
 
 
+def _normalize_pm_status(value: Any) -> Optional[PMStatus]:
+    if isinstance(value, PMStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return PMStatus(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _model_or_none(value: Any, model_cls: Type[T]) -> Optional[T]:
     if isinstance(value, model_cls):
         return value
@@ -152,6 +169,15 @@ def _is_engineer_blocked_state(state: Optional[MultiAgentGraphState]) -> bool:
         return False
     status = _normalize_impl_status(state.get("implementation_status"))
     return status == ImplementationStatus.blocked_waiting_user
+
+
+def _is_pm_blocked_state(state: Optional[MultiAgentGraphState]) -> bool:
+    if not isinstance(state, dict):
+        return False
+    if state.get("current_stage") != "product_manager_agent":
+        return False
+    status = _normalize_pm_status(state.get("pm_status"))
+    return status == PMStatus.pm_blocked_waiting_user
 
 
 def _route_after_entry(state: MultiAgentGraphState) -> str:
@@ -256,6 +282,19 @@ class ReasoningGraphRuntime:
                     "current_stage": None,
                 }
             )
+        if bool(state.get("resume_requested")) and _is_pm_blocked_state(state):
+            signals = list(state.get("routing_signals") or [])
+            if "resume_pm_from_checkpoint" not in signals:
+                signals.append("resume_pm_from_checkpoint")
+            return _sanitize_updates(
+                {
+                    "entry_intent": state.get("entry_intent") or EntryIntent.workflow_build_request,
+                    "target_stage": AgentStage.product_manager_agent,
+                    "confidence": float(state.get("confidence", 0.0) or 0.0),
+                    "routing_signals": signals,
+                    "current_stage": None,
+                }
+            )
 
         runtime_context = _runtime_context(state)
         model = runtime_context.get("model")
@@ -329,6 +368,7 @@ class ReasoningGraphRuntime:
         architecture_plan = _model_or_none(state.get("architecture_plan"), ArchitecturePlan)
         workflow_context = _model_or_none(state.get("workflow_context"), WorkflowContext)
         implementation_status = _normalize_impl_status(state.get("implementation_status"))
+        pm_status = _normalize_pm_status(state.get("pm_status"))
         final_workflow_json = (
             dict(state.get("final_workflow_json"))
             if isinstance(state.get("final_workflow_json"), dict)
@@ -343,7 +383,10 @@ class ReasoningGraphRuntime:
                 planning_ready = bool(
                     architecture_plan is not None and target_stage_enum == AgentStage.engineer_agent
                 )
-            status = "stub_routed" if planning_ready else "unknown_terminal"
+            if pm_status in (PMStatus.pm_blocked_waiting_user, PMStatus.pm_failed_no_solution):
+                status = "unknown_terminal"
+            else:
+                status = "stub_routed" if planning_ready else "unknown_terminal"
         elif current_stage == "engineer_agent":
             if implementation_status == ImplementationStatus.completed and final_workflow_json:
                 status = "stub_routed"
@@ -375,6 +418,13 @@ class ReasoningGraphRuntime:
             architecture_plan=architecture_plan,
             workflow_context=workflow_context,
             planning_summary=state.get("planning_summary"),
+            pm_status=pm_status,
+            pm_stage_plan=_model_list(state.get("pm_stage_plan"), PMStagePlan),
+            pm_stage_selections=_model_list(state.get("pm_stage_selections"), PMStageSelection),
+            pm_stage_progress=_model_or_none(state.get("pm_stage_progress"), PMProgressState),
+            pm_clarification_state=_model_or_none(
+                state.get("pm_clarification_state"), PMClarificationState
+            ),
             proposed_nodes=_model_list(state.get("proposed_nodes"), ProposedNode),
             required_credentials=_model_list(state.get("required_credentials"), RequiredCredential),
             workflow_draft=_model_or_none(state.get("workflow_draft"), WorkflowDraft),
@@ -457,7 +507,7 @@ class ReasoningGraphRuntime:
         )
         thread_id = _thread_id_from_run_config(run_config)
         previous_state = self._load_previous_state(thread_id)
-        resume_from_blocked = _is_engineer_blocked_state(previous_state)
+        resume_from_blocked = _is_engineer_blocked_state(previous_state) or _is_pm_blocked_state(previous_state)
 
         if resume_from_blocked and isinstance(previous_state, dict):
             state: MultiAgentGraphState = dict(previous_state)
@@ -484,6 +534,13 @@ class ReasoningGraphRuntime:
                 "workflow_context": None,
                 "architecture_plan": None,
                 "planning_summary": None,
+                "pm_status": None,
+                "pm_stage_plan": [],
+                "pm_stage_selections": [],
+                "pm_stage_progress": None,
+                "pm_clarification_state": None,
+                "pm_stage_search_history": [],
+                "pm_reasoning_trace_full": [],
                 "proposed_nodes": [],
                 "required_credentials": [],
                 "workflow_draft": None,

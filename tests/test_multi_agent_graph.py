@@ -480,3 +480,144 @@ def test_runtime_resumes_blocked_engineer_state_on_same_thread(
     assert second.implementation_status == ImplementationStatus.completed
     assert second.final_workflow_json.get("nodes")
     assert second.target_stage == AgentStage.qa_agent
+
+
+def test_runtime_resumes_blocked_pm_state_on_same_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ReasoningGraphRuntime()
+    route_calls = {"count": 0}
+
+    def _route(**kwargs):
+        route_calls["count"] += 1
+        return _decision(EntryIntent.workflow_build_request, AgentStage.product_manager_agent)
+
+    monkeypatch.setattr("app.graphs.reasoning_graph.route_entry_intent", _route)
+
+    def _pm_node(state):
+        if state.get("pm_status") == "pm_blocked_waiting_user":
+            return {
+                "current_stage": "product_manager_agent",
+                "pm_status": "pm_completed",
+                "pm_stage_plan": [
+                    {
+                        "id": "stage_1",
+                        "name": "Intake",
+                        "objective": "Capture input",
+                        "expected_inputs": ["event"],
+                        "expected_outputs": ["payload"],
+                        "success_criteria": ["captured"],
+                        "dependencies": [],
+                    }
+                ],
+                "pm_stage_selections": [
+                    {
+                        "stage_id": "stage_1",
+                        "selected_node_types": ["n8n-nodes-base.webhook"],
+                        "selected_nodes": [
+                            {
+                                "node_type": "n8n-nodes-base.webhook",
+                                "capability_summary": "Capture event",
+                                "limitations": [],
+                                "usage_mode": "action_only",
+                                "evidence_chunk_ids": ["chunk-1"],
+                                "evidence_refs": ["ref-1"],
+                                "rerank_confidence": 0.7,
+                                "pm_fit_score": 0.85,
+                            }
+                        ],
+                        "rationale": "Match stage objective",
+                        "pm_fit_score": 0.85,
+                        "rerank_confidence": 0.7,
+                        "top_margin": 0.15,
+                        "gate_passed": True,
+                        "passes_used": 1,
+                        "missing_information": [],
+                        "search_history": [],
+                    }
+                ],
+                "pm_stage_progress": {
+                    "total_stages": 1,
+                    "current_stage_id": "stage_1",
+                    "completed_stage_ids": ["stage_1"],
+                    "blocked_stage_ids": [],
+                    "passes_by_stage": {"stage_1": 1},
+                },
+                "pm_clarification_state": {
+                    "attempts_used": 1,
+                    "max_attempts": 2,
+                    "pending_questions": [],
+                    "turns": [
+                        {
+                            "stage_id": "stage_1",
+                            "question": "Need details",
+                            "answer": "Use webhook + Google Sheets",
+                        }
+                    ],
+                },
+                "target_stage": AgentStage.engineer_agent,
+                "workflow_context": WorkflowContext(
+                    use_case_id="uc_pm_resume",
+                    planning_ready=True,
+                    handoff_target=AgentStage.engineer_agent,
+                    required_node_types=["n8n-nodes-base.webhook"],
+                    unresolved_inputs=[],
+                    notes=["pm-resumed"],
+                ),
+                "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+            }
+        return {
+            "current_stage": "product_manager_agent",
+            "pm_status": "pm_blocked_waiting_user",
+            "pm_stage_plan": [],
+            "pm_stage_selections": [],
+            "pm_stage_progress": {
+                "total_stages": 1,
+                "current_stage_id": "stage_1",
+                "completed_stage_ids": [],
+                "blocked_stage_ids": ["stage_1"],
+                "passes_by_stage": {"stage_1": 3},
+            },
+            "pm_clarification_state": {
+                "attempts_used": 1,
+                "max_attempts": 2,
+                "pending_questions": ["Need details"],
+                "turns": [{"stage_id": "stage_1", "question": "Need details", "answer": None}],
+            },
+            "target_stage": None,
+            "routing_signals": list(state.get("routing_signals") or []) + ["pm_blocked_waiting_user"],
+        }
+
+    monkeypatch.setattr("app.graphs.reasoning_graph.product_manager_agent_node", _pm_node)
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.engineer_agent_node",
+        lambda state: {
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.blocked_waiting_user,
+            "routing_signals": list(state.get("routing_signals") or []),
+        },
+    )
+
+    run_config = {"configurable": {"thread_id": "thread-pm-resume-1"}}
+    first = runtime.run(
+        user_prompt="Build a workflow",
+        model=None,
+        request_id="req-pm-1",
+        existing_workflow=None,
+        run_config=run_config,
+    )
+    assert first.pm_status == "pm_blocked_waiting_user"
+    assert first.current_stage == "product_manager_agent"
+
+    second = runtime.run(
+        user_prompt="Use webhook and persist into sheets",
+        model=None,
+        request_id="req-pm-2",
+        existing_workflow=None,
+        run_config=run_config,
+    )
+    assert route_calls["count"] == 1
+    assert second.current_stage == "engineer_agent"
+    assert second.pm_status == "pm_completed"
+    assert "resume_pm_from_checkpoint" in second.routing_signals

@@ -130,6 +130,81 @@ class WorkflowContext(BaseModel):
     notes: List[str] = Field(default_factory=list)
 
 
+class PMStatus(str, Enum):
+    pm_in_progress = "pm_in_progress"
+    pm_blocked_waiting_user = "pm_blocked_waiting_user"
+    pm_completed = "pm_completed"
+    pm_failed_no_solution = "pm_failed_no_solution"
+
+
+class PMStagePlan(BaseModel):
+    id: str
+    name: str
+    objective: str
+    expected_inputs: List[str] = Field(default_factory=list)
+    expected_outputs: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
+    dependencies: List[str] = Field(default_factory=list)
+
+
+class PMStageSearchState(BaseModel):
+    stage_id: str
+    pass_index: int = Field(ge=1)
+    query: str
+    retrieved_chunk_count: int = Field(default=0, ge=0)
+    candidate_node_types: List[str] = Field(default_factory=list)
+    top_rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    top_margin: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class PMNodeCandidate(BaseModel):
+    node_type: str
+    display_name: Optional[str] = None
+    capability_summary: str
+    limitations: List[str] = Field(default_factory=list)
+    usage_mode: Literal["action_only", "tool_only", "both", "unknown"] = "unknown"
+    evidence_chunk_ids: List[str] = Field(default_factory=list)
+    evidence_refs: List[str] = Field(default_factory=list)
+    rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    pm_fit_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    top_margin: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class PMStageSelection(BaseModel):
+    stage_id: str
+    selected_node_types: List[str] = Field(default_factory=list)
+    selected_nodes: List[PMNodeCandidate] = Field(default_factory=list)
+    rationale: str = ""
+    pm_fit_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    top_margin: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    gate_passed: bool = False
+    passes_used: int = Field(default=0, ge=0)
+    missing_information: List[str] = Field(default_factory=list)
+    search_history: List[PMStageSearchState] = Field(default_factory=list)
+
+
+class PMProgressState(BaseModel):
+    total_stages: int = Field(default=0, ge=0)
+    current_stage_id: Optional[str] = None
+    completed_stage_ids: List[str] = Field(default_factory=list)
+    blocked_stage_ids: List[str] = Field(default_factory=list)
+    passes_by_stage: Dict[str, int] = Field(default_factory=dict)
+
+
+class PMClarificationTurn(BaseModel):
+    stage_id: Optional[str] = None
+    question: str
+    answer: Optional[str] = None
+
+
+class PMClarificationState(BaseModel):
+    attempts_used: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=2, ge=1)
+    pending_questions: List[str] = Field(default_factory=list)
+    turns: List[PMClarificationTurn] = Field(default_factory=list)
+
+
 class ImplementationStatus(str, Enum):
     ready = "ready"
     in_progress = "in_progress"
@@ -268,6 +343,11 @@ class MultiAgentGraphResult(BaseModel):
     architecture_plan: Optional[ArchitecturePlan] = None
     workflow_context: Optional[WorkflowContext] = None
     planning_summary: Optional[str] = None
+    pm_status: Optional[PMStatus] = None
+    pm_stage_plan: List[PMStagePlan] = Field(default_factory=list)
+    pm_stage_selections: List[PMStageSelection] = Field(default_factory=list)
+    pm_stage_progress: Optional[PMProgressState] = None
+    pm_clarification_state: Optional[PMClarificationState] = None
     proposed_nodes: List[ProposedNode] = Field(default_factory=list)
     required_credentials: List[RequiredCredential] = Field(default_factory=list)
     workflow_draft: Optional[WorkflowDraft] = None

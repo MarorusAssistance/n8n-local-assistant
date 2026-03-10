@@ -13,6 +13,12 @@ from ..features.reasoning.multi_agent_contracts import (
     ImplementationQueueItem,
     ImplementationStatus,
     ImplementedNode,
+    PMClarificationState,
+    PMProgressState,
+    PMStagePlan,
+    PMStageSearchState,
+    PMStageSelection,
+    PMStatus,
     MissingUserInput,
     ProposedNode,
     RequiredCredential,
@@ -39,6 +45,13 @@ class MultiAgentGraphState(TypedDict, total=False):
     workflow_context: Optional[WorkflowContext | Dict[str, Any]]
     architecture_plan: Optional[ArchitecturePlan | Dict[str, Any]]
     planning_summary: Optional[str]
+    pm_status: Optional[PMStatus | str]
+    pm_stage_plan: List[PMStagePlan | Dict[str, Any]]
+    pm_stage_selections: List[PMStageSelection | Dict[str, Any]]
+    pm_stage_progress: Optional[PMProgressState | Dict[str, Any]]
+    pm_clarification_state: Optional[PMClarificationState | Dict[str, Any]]
+    pm_stage_search_history: List[PMStageSearchState | Dict[str, Any]]
+    pm_reasoning_trace_full: List[Dict[str, Any]]
     proposed_nodes: List[ProposedNode | Dict[str, Any]]
     required_credentials: List[RequiredCredential | Dict[str, Any]]
     workflow_draft: Optional[WorkflowDraft | Dict[str, Any]]

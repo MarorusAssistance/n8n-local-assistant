@@ -582,6 +582,11 @@ class ChatService:
             alternative_use_cases = list(getattr(result, "alternative_use_cases", []) or [])
             architecture_plan = getattr(result, "architecture_plan", None)
             workflow_context = getattr(result, "workflow_context", None)
+            pm_status = getattr(result, "pm_status", None)
+            pm_stage_plan = list(getattr(result, "pm_stage_plan", []) or [])
+            pm_stage_selections = list(getattr(result, "pm_stage_selections", []) or [])
+            pm_stage_progress = getattr(result, "pm_stage_progress", None)
+            pm_clarification_state = getattr(result, "pm_clarification_state", None)
             proposed_nodes = list(getattr(result, "proposed_nodes", []) or [])
             required_credentials = list(getattr(result, "required_credentials", []) or [])
             workflow_draft = getattr(result, "workflow_draft", None)
@@ -636,6 +641,25 @@ class ChatService:
                     else workflow_context
                 ),
                 "planning_summary": getattr(result, "planning_summary", None),
+                "pm_status": (pm_status.value if hasattr(pm_status, "value") else pm_status),
+                "pm_stage_plan": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in pm_stage_plan
+                ],
+                "pm_stage_selections": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in pm_stage_selections
+                ],
+                "pm_stage_progress": (
+                    pm_stage_progress.model_dump(exclude_none=True)
+                    if hasattr(pm_stage_progress, "model_dump")
+                    else pm_stage_progress
+                ),
+                "pm_clarification_state": (
+                    pm_clarification_state.model_dump(exclude_none=True)
+                    if hasattr(pm_clarification_state, "model_dump")
+                    else pm_clarification_state
+                ),
                 "proposed_nodes": [
                     item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
                     for item in proposed_nodes

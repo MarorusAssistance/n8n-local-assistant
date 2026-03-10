@@ -5,9 +5,8 @@ import json
 import logging
 import math
 import re
-import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -20,11 +19,19 @@ from ...features.reasoning.multi_agent_contracts import (
     ArchitectureStage,
     EntryIntent,
     NodeRequirement,
+    PMClarificationState,
+    PMClarificationTurn,
+    PMNodeCandidate,
+    PMProgressState,
+    PMStagePlan,
+    PMStageSearchState,
+    PMStageSelection,
+    PMStatus,
     ProposedNode,
     UseCase,
     WorkflowContext,
 )
-from ...llm import get_langchain_chat_model, resolve_model
+from ...llm import get_langchain_chat_model
 from ...observability import emit_llm_output_event, emit_llm_prompt_event, emit_trace_event
 from ...token_budget import estimate_messages_tokens
 from ...workflow.retriever import retrieve_docs
@@ -33,16 +40,10 @@ from ..multi_agent_state import MultiAgentGraphState
 logger = logging.getLogger("n8n-assistant")
 trace_logger = logging.getLogger("n8n-assistant.trace")
 
-_MAX_REQUIRED_NODES = 12
+_MAX_REQUIRED_NODES = 20
 _NODE_TYPE_LINE_RE = re.compile(r"(?im)^Node Type:\s*(.+?)\s*$")
 _USABLE_AS_TOOL_LINE_RE = re.compile(r"(?im)^Usable As Tool:\s*(true|false)\s*$")
 _INPUTS_LINE_RE = re.compile(r"(?im)^Inputs:\s*(.+?)\s*$")
-_BLEND_EVIDENCE_ALPHA = 0.75
-_BLEND_RERANK_BETA = 0.25
-_MAX_PM_SUMMARY_SNIPPETS = 3
-_PM_MAX_SNIPPET_CHARS = 280
-_PM_MAX_PROMPT_TOKENS_FALLBACK = 2500
-_PM_PLAN_TEMPERATURE = 0.1
 
 
 class NodeFunctionalSummary(BaseModel):
@@ -55,44 +56,27 @@ class NodeFunctionalSummary(BaseModel):
     data_io_hints: List[str] = Field(default_factory=list)
     evidence_refs: List[str] = Field(default_factory=list)
     evidence_snippets: List[str] = Field(default_factory=list)
-    sources: List[str] = Field(default_factory=list)
 
 
-class NodeEvidenceCompactionItem(BaseModel):
+class _StagePlanOutput(BaseModel):
+    stages: List[PMStagePlan] = Field(default_factory=list)
+
+
+class _CandidateSummaryItem(BaseModel):
     node_type: str
-    purpose: str = ""
-    capabilities: List[str] = Field(default_factory=list)
+    capability_summary: str
     limitations: List[str] = Field(default_factory=list)
-    usage_constraints: List[str] = Field(default_factory=list)
-    data_io_hints: List[str] = Field(default_factory=list)
-    evidence_snippets: List[str] = Field(default_factory=list)
 
 
-class NodeEvidenceCompactionOutput(BaseModel):
-    compacted_nodes: List[NodeEvidenceCompactionItem] = Field(default_factory=list)
+class _CandidateSummaryOutput(BaseModel):
+    summaries: List[_CandidateSummaryItem] = Field(default_factory=list)
 
 
-class NodeEvidenceSummaryItem(BaseModel):
-    node_type: str
-    purpose: str
-    capabilities: List[str] = Field(default_factory=list)
-    limitations: List[str] = Field(default_factory=list)
-    usage_constraints: List[str] = Field(default_factory=list)
-    data_io_hints: List[str] = Field(default_factory=list)
-
-
-class NodeEvidenceSummaryOutput(BaseModel):
-    summaries: List[NodeEvidenceSummaryItem] = Field(default_factory=list)
-
-
-class ArchitecturePlanDraft(BaseModel):
-    workflow_summary: str
-    stages: List[ArchitectureStage] = Field(default_factory=list)
-    data_flow: List[ArchitectureDataFlowItem] = Field(default_factory=list)
-    assumptions: List[str] = Field(default_factory=list)
+class _StageSelectionOutput(BaseModel):
+    selected_node_types: List[str] = Field(default_factory=list)
+    rationale: str = ""
+    pm_fit_score: float = Field(default=0.0, ge=0.0, le=1.0)
     missing_information: List[str] = Field(default_factory=list)
-    implementation_notes_for_engineer: List[str] = Field(default_factory=list)
-    planning_summary: Optional[str] = None
 
 
 @dataclass
@@ -111,8 +95,6 @@ class _NodeEvidenceAccumulator:
     ai_input_count: int = 0
     input_connection_types: List[str] = field(default_factory=list)
     all_texts: List[str] = field(default_factory=list)
-    source_counts: Dict[str, int] = field(default_factory=dict)
-    docs_page_keys: List[str] = field(default_factory=list)
 
     def add(
         self,
@@ -127,8 +109,6 @@ class _NodeEvidenceAccumulator:
         has_ai_input: Optional[bool],
         input_types: List[str],
         text: str,
-        source: str,
-        docs_page_key: Optional[str],
     ) -> None:
         if chunk_id and chunk_id not in self.chunk_ids:
             self.chunk_ids.append(chunk_id)
@@ -152,12 +132,26 @@ class _NodeEvidenceAccumulator:
                 self.input_connection_types.append(item)
         if text:
             self.all_texts.append(text)
-        if source:
-            self.source_counts[source] = self.source_counts.get(source, 0) + 1
-        if docs_page_key and docs_page_key not in self.docs_page_keys:
-            self.docs_page_keys.append(docs_page_key)
         if display_name and not self.display_name:
             self.display_name = display_name
+
+
+def _pm_int(name: str, default: int) -> int:
+    raw = getattr(settings, name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = default
+    return max(1, value)
+
+
+def _pm_float(name: str, default: float) -> float:
+    raw = getattr(settings, name, default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = default
+    return min(1.0, max(0.0, value))
 
 
 def _compact(text: str, max_chars: int = 220) -> str:
@@ -182,7 +176,6 @@ def _sanitize_ref_value(value: Any) -> str:
             text = match.group(0)
     text = text.replace("&quot;", "")
     text = text.rstrip("\"'`])},; ")
-    # If a JSON fragment leaks into the reference, keep only the left side.
     spillover_markers = (
         '"], "',
         '"}, "',
@@ -199,34 +192,16 @@ def _sanitize_ref_value(value: Any) -> str:
     return _compact(text, max_chars=240)
 
 
-def _safe_list(values: List[str]) -> List[str]:
-    output: List[str] = []
+def _safe_list(values: Iterable[str]) -> List[str]:
+    out: List[str] = []
     seen = set()
     for value in values:
         item = _sanitize_text(value)
         if not item or item in seen:
             continue
         seen.add(item)
-        output.append(item)
-    return output
-
-
-def _use_case_query(use_case: UseCase) -> str:
-    return (
-        f"Use case title: {use_case.title}\n"
-        f"Business problem: {use_case.business_problem}\n"
-        f"Desired outcome: {use_case.desired_outcome}\n"
-        f"Expected business value: {use_case.expected_value}\n"
-        "Goal: retrieve n8n API/docs evidence for required workflow nodes."
-    )
-
-
-def retrieve_pm_api_docs(
-    use_case: UseCase,
-    request_id: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    query = _use_case_query(use_case)
-    return retrieve_docs(query, request_id=request_id)
+        out.append(item)
+    return out
 
 
 def _chunk_metadata(chunk: Any) -> Dict[str, Any]:
@@ -277,8 +252,7 @@ def _normalize_connection_type(value: Any) -> Optional[str]:
     lowered = text.lower()
     if "nodeconnectiontypes." in lowered:
         lowered = lowered.split("nodeconnectiontypes.", 1)[1]
-    lowered = lowered.replace(" ", "")
-    lowered = lowered.replace("-", "_")
+    lowered = lowered.replace(" ", "").replace("-", "_")
     if lowered == "main":
         return "main"
     if lowered.startswith("ai"):
@@ -370,6 +344,33 @@ def _chunk_ref(chunk: Dict[str, Any]) -> str:
     return "unknown-reference"
 
 
+def _normalize_rerank_score(raw_score: Any) -> Optional[float]:
+    if raw_score is None:
+        return None
+    try:
+        score = float(raw_score)
+    except (TypeError, ValueError):
+        return None
+    if 0.0 <= score <= 1.0:
+        return score
+    if score > 50:
+        return 1.0
+    if score < -50:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-score))
+
+
+def _chunk_doc_page_key(chunk: Dict[str, Any]) -> str:
+    context_kind = str(chunk.get("context_kind") or "").strip().lower()
+    if context_kind == "linked_def":
+        explicit = str(chunk.get("link_doc_page_key") or "").strip()
+        if explicit:
+            return explicit
+    metadata = _chunk_metadata(chunk)
+    page_key, _, _ = derive_doc_page_key(metadata, row_url=str(chunk.get("url") or ""))
+    return str(page_key or "").strip()
+
+
 def _chunk_score(chunk: Dict[str, Any]) -> float:
     metadata = _chunk_metadata(chunk)
     score = 0.0
@@ -386,28 +387,7 @@ def _chunk_score(chunk: Dict[str, Any]) -> float:
     return score
 
 
-def _chunk_source_label(chunk: Dict[str, Any]) -> str:
-    context_kind = str(chunk.get("context_kind") or "").strip().lower()
-    if context_kind == "linked_def":
-        return "linked_def"
-    rerank_score = _normalize_rerank_score(chunk.get("rerank_score"))
-    if rerank_score is not None:
-        return "docs_reranked"
-    return "docs"
-
-
-def _chunk_doc_page_key(chunk: Dict[str, Any]) -> str:
-    context_kind = str(chunk.get("context_kind") or "").strip().lower()
-    if context_kind == "linked_def":
-        explicit = str(chunk.get("link_doc_page_key") or "").strip()
-        if explicit:
-            return explicit
-    metadata = _chunk_metadata(chunk)
-    page_key, _, _ = derive_doc_page_key(metadata, row_url=str(chunk.get("url") or ""))
-    return str(page_key or "").strip()
-
-
-def _docs_rerank_scores_by_page(chunks: List[Dict[str, Any]]) -> Dict[str, List[float]]:
+def _docs_rerank_scores_by_page(chunks: Sequence[Dict[str, Any]]) -> Dict[str, List[float]]:
     by_page: Dict[str, List[float]] = {}
     for chunk in chunks:
         if not isinstance(chunk, dict):
@@ -429,8 +409,7 @@ def _collect_docs_rerank_scores(
     docs_rerank_by_page: Dict[str, List[float]],
 ) -> List[float]:
     output: List[float] = []
-    source = _chunk_source_label(chunk)
-    if source != "linked_def":
+    if str(chunk.get("context_kind") or "").strip().lower() != "linked_def":
         score = _normalize_rerank_score(chunk.get("rerank_score"))
         if score is not None:
             output.append(score)
@@ -494,7 +473,9 @@ def _usage_constraints_from_accumulator(
     else:
         constraints.append("Usage mode is unclear from evidence; validate node placement.")
     if accumulator.input_connection_types:
-        constraints.append(f"Observed input connection types: {', '.join(accumulator.input_connection_types[:4])}.")
+        constraints.append(
+            f"Observed input connection types: {', '.join(accumulator.input_connection_types[:4])}."
+        )
     return _safe_list(constraints)
 
 
@@ -506,20 +487,40 @@ def _build_node_functional_summary(
     usage_mode: str,
 ) -> NodeFunctionalSummary:
     snippets: List[str] = []
-    for text in accumulator.all_texts[:_MAX_PM_SUMMARY_SNIPPETS]:
-        compacted = _compact(_sanitize_text(text), max_chars=_PM_MAX_SNIPPET_CHARS)
+    for text in accumulator.all_texts[:3]:
+        compacted = _compact(_sanitize_text(text), max_chars=280)
         if compacted:
             snippets.append(compacted)
 
     purpose = ""
+    preferred_markers = (
+        "supports",
+        "can ",
+        "use",
+        "trigger",
+        "send",
+        "receive",
+        "read",
+        "write",
+        "execute",
+        "transform",
+    )
     for text in accumulator.all_texts:
         units = _split_text_units(text)
-        if units:
-            purpose = units[0]
+        for unit in units:
+            lowered = unit.lower()
+            if lowered.startswith(("kind:", "node type:", "inputs:", "outputs:")):
+                continue
+            if any(marker in lowered for marker in preferred_markers):
+                purpose = unit
+                break
+            if not purpose:
+                purpose = unit
+        if purpose:
             break
     if not purpose:
         label = display_name or node_type
-        purpose = f"Use '{label}' to implement one required capability of the selected use case."
+        purpose = f"Use '{label}' to implement one required capability of the selected workflow stage."
 
     capabilities = _extract_signal_items(
         accumulator.all_texts,
@@ -552,7 +553,6 @@ def _build_node_functional_summary(
             "can't",
             "limit",
             "warning",
-            "note",
             "credential",
             "auth",
             "permission",
@@ -562,16 +562,15 @@ def _build_node_functional_summary(
     data_io_hints: List[str] = []
     if accumulator.input_connection_types:
         data_io_hints.append(f"Input types: {', '.join(accumulator.input_connection_types[:4])}.")
-    io_units = _extract_signal_items(
-        accumulator.all_texts,
-        keywords=("input", "output", "payload", "data", "item"),
-        max_items=3,
-        max_chars=170,
+    data_io_hints.extend(
+        _extract_signal_items(
+            accumulator.all_texts,
+            keywords=("input", "output", "payload", "data", "item"),
+            max_items=3,
+            max_chars=170,
+        )
     )
-    data_io_hints.extend(io_units)
-    data_io_hints = _safe_list(data_io_hints)
 
-    sources = sorted(accumulator.source_counts.keys())
     return NodeFunctionalSummary(
         node_type=node_type,
         display_name=display_name,
@@ -579,58 +578,10 @@ def _build_node_functional_summary(
         capabilities=_safe_list(capabilities[:4]),
         limitations=_safe_list(limitations[:3]),
         usage_constraints=_usage_constraints_from_accumulator(accumulator, usage_mode),
-        data_io_hints=data_io_hints[:4],
+        data_io_hints=_safe_list(data_io_hints[:4]),
         evidence_refs=list(accumulator.refs[:6]),
         evidence_snippets=snippets,
-        sources=sources,
     )
-
-
-def _build_why_required(summary: NodeFunctionalSummary) -> str:
-    parts = [summary.purpose]
-    if summary.capabilities:
-        parts.append(f"Capabilities: {', '.join(summary.capabilities[:2])}.")
-    if summary.usage_constraints:
-        parts.append(summary.usage_constraints[0])
-    return _compact(" ".join(parts), max_chars=260)
-
-
-def _apply_summaries_to_required_nodes(
-    required_nodes: List[NodeRequirement],
-    node_summaries: Dict[str, NodeFunctionalSummary],
-) -> List[NodeRequirement]:
-    output: List[NodeRequirement] = []
-    for node in required_nodes:
-        summary = node_summaries.get(node.node_type)
-        if summary is None:
-            output.append(node)
-            continue
-        output.append(
-            node.model_copy(
-                update={
-                    "why_required": _build_why_required(summary),
-                    "display_name": summary.display_name or node.display_name,
-                }
-            )
-        )
-    return output
-
-
-def _normalize_rerank_score(raw_score: Any) -> Optional[float]:
-    if raw_score is None:
-        return None
-    try:
-        score = float(raw_score)
-    except (TypeError, ValueError):
-        return None
-    if 0.0 <= score <= 1.0:
-        return score
-    # Reranker models can return logits; map them to [0,1].
-    if score > 50:
-        return 1.0
-    if score < -50:
-        return 0.0
-    return 1.0 / (1.0 + math.exp(-score))
 
 
 def _blended_confidence(evidence_confidence: float, rerank_confidence: Optional[float]) -> float:
@@ -638,15 +589,16 @@ def _blended_confidence(evidence_confidence: float, rerank_confidence: Optional[
     if rerank_confidence is None:
         return evidence
     rerank = min(1.0, max(0.0, float(rerank_confidence)))
-    blended = (_BLEND_EVIDENCE_ALPHA * evidence) + (_BLEND_RERANK_BETA * rerank)
+    blended = (0.75 * evidence) + (0.25 * rerank)
     return min(1.0, max(0.0, blended))
 
 
 def _extract_required_nodes_with_summaries(
-    chunks: List[Dict[str, Any]]
-) -> Tuple[List[NodeRequirement], Dict[str, NodeFunctionalSummary], Dict[str, List[str]]]:
+    chunks: List[Dict[str, Any]],
+) -> Tuple[List[NodeRequirement], Dict[str, NodeFunctionalSummary]]:
     by_type: Dict[str, _NodeEvidenceAccumulator] = {}
     docs_rerank_by_page = _docs_rerank_scores_by_page(chunks)
+
     for chunk in chunks:
         if not isinstance(chunk, dict):
             continue
@@ -655,6 +607,7 @@ def _extract_required_nodes_with_summaries(
         node_type = _extract_node_type(chunk)
         if not node_type:
             continue
+
         chunk_id = str(chunk.get("doc_id") or "").strip() or f"chunk-{len(by_type) + 1}"
         metadata = _chunk_metadata(chunk)
         display_name = str(metadata.get("displayName") or "").strip() or None
@@ -665,8 +618,7 @@ def _extract_required_nodes_with_summaries(
         has_main_input = "main" in input_types if input_types else None
         has_ai_input = any(item.startswith("ai") for item in input_types) if input_types else None
         usable_as_tool = _extract_usable_as_tool(chunk)
-        source = _chunk_source_label(chunk)
-        page_key = _chunk_doc_page_key(chunk)
+
         acc = by_type.get(node_type)
         if acc is None:
             acc = _NodeEvidenceAccumulator(node_type=node_type)
@@ -682,8 +634,6 @@ def _extract_required_nodes_with_summaries(
             has_ai_input=has_ai_input,
             input_types=input_types,
             text=_sanitize_text(chunk.get("text") or ""),
-            source=source,
-            docs_page_key=page_key,
         )
 
     ranked = sorted(
@@ -697,30 +647,32 @@ def _extract_required_nodes_with_summaries(
 
     requirements: List[NodeRequirement] = []
     node_summaries: Dict[str, NodeFunctionalSummary] = {}
-    raw_evidence_by_type: Dict[str, List[str]] = {}
     for item in ranked[:_MAX_REQUIRED_NODES]:
         avg_strength = item.strength / item.count if item.count > 0 else 0.0
         evidence_confidence = min(1.0, 0.25 + (0.12 * item.count) + (0.10 * avg_strength))
         rerank_confidence: Optional[float] = None
         if item.rerank_count > 0:
             rerank_confidence = item.rerank_strength / item.rerank_count
+
         blended_confidence = _blended_confidence(evidence_confidence, rerank_confidence)
         usable_as_tool: Optional[bool] = None
         if item.usable_true_count > 0 and item.usable_false_count == 0:
             usable_as_tool = True
         elif item.usable_false_count > 0 and item.usable_true_count == 0:
             usable_as_tool = False
+
         has_main_input: Optional[bool] = None
         if item.main_input_count > 0:
             has_main_input = True
         elif item.ai_input_count > 0:
             has_main_input = False
-        has_ai_input = item.ai_input_count > 0
+
         usage_mode = _classify_usage_mode(
             usable_as_tool=usable_as_tool,
             has_main_input=has_main_input,
-            has_ai_input=has_ai_input,
+            has_ai_input=(item.ai_input_count > 0),
         )
+
         node_summary = _build_node_functional_summary(
             node_type=item.node_type,
             display_name=item.display_name,
@@ -728,12 +680,12 @@ def _extract_required_nodes_with_summaries(
             usage_mode=usage_mode,
         )
         node_summaries[item.node_type] = node_summary
-        raw_evidence_by_type[item.node_type] = list(item.all_texts)
+
         requirements.append(
             NodeRequirement(
                 node_type=item.node_type,
                 display_name=item.display_name,
-                why_required=_build_why_required(node_summary),
+                why_required=node_summary.purpose,
                 evidence_chunk_ids=item.chunk_ids[:8],
                 evidence_refs=item.refs[:6],
                 evidence_confidence=round(evidence_confidence, 2),
@@ -747,539 +699,13 @@ def _extract_required_nodes_with_summaries(
                 input_connection_types=list(item.input_connection_types),
             )
         )
-    return requirements, node_summaries, raw_evidence_by_type
+
+    return requirements, node_summaries
 
 
 def extract_required_nodes_from_docs(chunks: List[Dict[str, Any]]) -> List[NodeRequirement]:
-    requirements, _, _ = _extract_required_nodes_with_summaries(chunks)
+    requirements, _summaries = _extract_required_nodes_with_summaries(chunks)
     return requirements
-
-
-def _render_node_summary_line(
-    node: NodeRequirement,
-    summary: Optional[NodeFunctionalSummary],
-) -> str:
-    if summary is None:
-        return (
-            f"- {node.node_type} | display={node.display_name or '-'} "
-            f"| evidence_confidence={node.evidence_confidence} "
-            f"| rerank_confidence={node.rerank_confidence if node.rerank_confidence is not None else 'n/a'} "
-            f"| blended_confidence={node.blended_confidence if node.blended_confidence is not None else 'n/a'} "
-            f"| usage_mode={node.usage_mode}"
-        )
-    return (
-        f"- {node.node_type} | display={summary.display_name or node.display_name or '-'} "
-        f"| evidence_confidence={node.evidence_confidence} "
-        f"| rerank_confidence={node.rerank_confidence if node.rerank_confidence is not None else 'n/a'} "
-        f"| blended_confidence={node.blended_confidence if node.blended_confidence is not None else 'n/a'} "
-        f"| usage_mode={node.usage_mode} "
-        f"| purpose={summary.purpose} "
-        f"| capabilities={'; '.join(summary.capabilities[:3]) if summary.capabilities else '-'} "
-        f"| limitations={'; '.join(summary.limitations[:2]) if summary.limitations else '-'} "
-        f"| usage_constraints={'; '.join(summary.usage_constraints[:2]) if summary.usage_constraints else '-'} "
-        f"| data_io_hints={'; '.join(summary.data_io_hints[:2]) if summary.data_io_hints else '-'} "
-        f"| evidence_refs={'; '.join(summary.evidence_refs[:2]) if summary.evidence_refs else '-'}"
-    )
-
-
-def _plan_prompts(
-    use_case: UseCase,
-    required_nodes: List[NodeRequirement],
-    node_summaries: Optional[Dict[str, NodeFunctionalSummary]] = None,
-) -> Tuple[str, str]:
-    allowed_node_types = [node.node_type for node in required_nodes]
-    node_lines = [
-        _render_node_summary_line(node, (node_summaries or {}).get(node.node_type))
-        for node in required_nodes
-    ]
-    system_prompt = (
-        "You are a product manager for automation architecture planning. "
-        "Produce implementation-oriented planning output, not workflow JSON."
-    )
-    user_prompt = (
-        "Create a planning-level architecture for a future engineer implementation.\n"
-        "Rules:\n"
-        "- Do not generate workflow JSON.\n"
-        "- Do not set node parameters or credential values.\n"
-        "- Keep the plan one level above implementation details.\n"
-        "- Stages must be concrete and implementation-ready.\n"
-        "- Record assumptions and missing information instead of guessing.\n"
-        "- Use the provided functional summaries and evidence snippets to justify node inclusion.\n"
-        "- Keep architecture planning-level; engineer will configure params/credentials later.\n"
-        "- Treat nodes with usage_mode=tool_only as AI-tool sub-nodes; do not use them as standard action steps.\n"
-        "- You may reference only these node types as required nodes, and order them logically. Do not need to use all of them. You must deeply think which nodes fit the best for the selected use case: "
-        f"{', '.join(allowed_node_types)}.\n\n"
-        "Selected use case:\n"
-        f"- id: {use_case.id}\n"
-        f"- title: {use_case.title}\n"
-        f"- business_problem: {use_case.business_problem}\n"
-        f"- desired_outcome: {use_case.desired_outcome}\n"
-        f"- expected_value: {use_case.expected_value}\n\n"
-        "Retrieved node evidence:\n"
-        f"{chr(10).join(node_lines)}\n\n"
-        "Return structured output only."
-    )
-    return system_prompt, user_prompt
-
-
-def _estimate_prompt_tokens(system_prompt: str, user_prompt: str) -> int:
-    return estimate_messages_tokens(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-    )
-
-
-def _plan_with_structured_output(
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    model: Optional[str],
-    request_id: Optional[str],
-) -> ArchitecturePlanDraft:
-    chat_model = get_langchain_chat_model(model=model, temperature=_PM_PLAN_TEMPERATURE)
-    if chat_model is None:
-        raise RuntimeError("langchain chat model unavailable")
-
-    resolved_model = resolve_model(model)
-    prompt_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    emit_llm_prompt_event(
-        trace_logger,
-        request_id=request_id,
-        stage="multi_agent.product_manager.structured",
-        model=resolved_model,
-        messages=prompt_messages,
-        estimated_tokens=_estimate_prompt_tokens(system_prompt, user_prompt),
-        params={"temperature": _PM_PLAN_TEMPERATURE},
-    )
-
-    structured_llm = chat_model.with_structured_output(ArchitecturePlanDraft)
-    started = time.perf_counter()
-    output = structured_llm.invoke(
-        [
-            ("system", system_prompt),
-            ("human", user_prompt),
-        ]
-    )
-    latency_ms = (time.perf_counter() - started) * 1000.0
-    serialized = output.model_dump(exclude_none=True) if isinstance(output, ArchitecturePlanDraft) else output
-    emit_llm_output_event(
-        trace_logger,
-        request_id=request_id,
-        stage="multi_agent.product_manager.structured",
-        model=resolved_model,
-        latency_ms=latency_ms,
-        content=json.dumps(serialized, ensure_ascii=False),
-        usage=None,
-        extra={"temperature": _PM_PLAN_TEMPERATURE},
-    )
-    if isinstance(output, ArchitecturePlanDraft):
-        return output
-    return ArchitecturePlanDraft.model_validate(output)
-
-
-def _deterministic_compact_summary(summary: NodeFunctionalSummary) -> NodeFunctionalSummary:
-    return NodeFunctionalSummary(
-        node_type=summary.node_type,
-        display_name=summary.display_name,
-        purpose=_compact(summary.purpose, max_chars=150),
-        capabilities=[_compact(item, max_chars=110) for item in summary.capabilities[:2]],
-        limitations=[_compact(item, max_chars=110) for item in summary.limitations[:1]],
-        usage_constraints=[_compact(item, max_chars=120) for item in summary.usage_constraints[:1]],
-        data_io_hints=[_compact(item, max_chars=110) for item in summary.data_io_hints[:2]],
-        evidence_refs=list(summary.evidence_refs[:2]),
-        evidence_snippets=[_compact(item, max_chars=150) for item in summary.evidence_snippets[:1]],
-        sources=list(summary.sources),
-    )
-
-
-def _compact_node_evidence_with_structured_output(
-    *,
-    use_case: UseCase,
-    required_nodes: List[NodeRequirement],
-    node_summaries: Dict[str, NodeFunctionalSummary],
-    model: Optional[str],
-    request_id: Optional[str],
-) -> Dict[str, NodeFunctionalSummary]:
-    chat_model = get_langchain_chat_model(model=model, temperature=0.0)
-    if chat_model is None:
-        raise RuntimeError("langchain chat model unavailable")
-
-    compactable_payload = [
-        {
-            "node_type": item.node_type,
-            "display_name": item.display_name,
-            "purpose": item.purpose,
-            "capabilities": list(item.capabilities),
-            "limitations": list(item.limitations),
-            "usage_constraints": list(item.usage_constraints),
-            "data_io_hints": list(item.data_io_hints),
-            "evidence_snippets": list(item.evidence_snippets),
-        }
-        for item in node_summaries.values()
-    ]
-    compactable_json = json.dumps(compactable_payload, ensure_ascii=False)
-
-    system_prompt = (
-        "You compact node evidence summaries for a product manager planning prompt. "
-        "Preserve the most relevant functional meaning. Do not invent facts."
-    )
-    user_prompt = (
-        "Compact these node summaries while preserving business-relevant capabilities and constraints.\n"
-        "Rules:\n"
-        "- Keep one record per node_type.\n"
-        "- Keep purpose concise and factual.\n"
-        "- Keep only the most relevant capabilities/limitations for architecture decisions.\n"
-        "- Keep usage constraints and data-flow hints if present.\n"
-        "- Do not remove key constraints that could cause wrong node selection.\n"
-        "- Do not output workflow JSON.\n\n"
-        f"Use case title: {use_case.title}\n"
-        f"Desired outcome: {use_case.desired_outcome}\n"
-        f"Allowed node types: {', '.join(node.node_type for node in required_nodes)}\n\n"
-        f"Node summaries JSON:\n{compactable_json}"
-    )
-    resolved_model = resolve_model(model)
-    emit_llm_prompt_event(
-        trace_logger,
-        request_id=request_id,
-        stage="multi_agent.product_manager.compaction",
-        model=resolved_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        estimated_tokens=_estimate_prompt_tokens(system_prompt, user_prompt),
-        params={"temperature": 0.0},
-    )
-
-    structured_llm = chat_model.with_structured_output(NodeEvidenceCompactionOutput)
-    started = time.perf_counter()
-    output = structured_llm.invoke(
-        [
-            ("system", system_prompt),
-            ("human", user_prompt),
-        ]
-    )
-    latency_ms = (time.perf_counter() - started) * 1000.0
-    serialized = (
-        output.model_dump(exclude_none=True) if isinstance(output, NodeEvidenceCompactionOutput) else output
-    )
-    emit_llm_output_event(
-        trace_logger,
-        request_id=request_id,
-        stage="multi_agent.product_manager.compaction",
-        model=resolved_model,
-        latency_ms=latency_ms,
-        content=json.dumps(serialized, ensure_ascii=False),
-        usage=None,
-        extra={"temperature": 0.0},
-    )
-
-    compacted = (
-        output
-        if isinstance(output, NodeEvidenceCompactionOutput)
-        else NodeEvidenceCompactionOutput.model_validate(output)
-    )
-    by_type = {item.node_type: item for item in compacted.compacted_nodes}
-    result: Dict[str, NodeFunctionalSummary] = {}
-    for node_type, summary in node_summaries.items():
-        compact_item = by_type.get(node_type)
-        if compact_item is None:
-            result[node_type] = _deterministic_compact_summary(summary)
-            continue
-        result[node_type] = NodeFunctionalSummary(
-            node_type=node_type,
-            display_name=summary.display_name,
-            purpose=_compact(compact_item.purpose or summary.purpose, max_chars=170),
-            capabilities=_safe_list([_compact(item, max_chars=120) for item in compact_item.capabilities[:3]]),
-            limitations=_safe_list([_compact(item, max_chars=120) for item in compact_item.limitations[:2]]),
-            usage_constraints=_safe_list(
-                [_compact(item, max_chars=140) for item in compact_item.usage_constraints[:2]]
-            )
-            or list(summary.usage_constraints[:1]),
-            data_io_hints=_safe_list([_compact(item, max_chars=120) for item in compact_item.data_io_hints[:2]]),
-            evidence_refs=list(summary.evidence_refs[:3]),
-            evidence_snippets=_safe_list(
-                [_compact(item, max_chars=170) for item in compact_item.evidence_snippets[:2]]
-            ),
-            sources=list(summary.sources),
-        )
-    return result
-
-
-def _summarize_node_evidence_with_structured_output(
-    *,
-    use_case: UseCase,
-    required_nodes: List[NodeRequirement],
-    node_summaries: Dict[str, NodeFunctionalSummary],
-    raw_evidence_by_type: Dict[str, List[str]],
-    model: Optional[str],
-    request_id: Optional[str],
-) -> Dict[str, NodeFunctionalSummary]:
-    # Keep tests and offline runs stable; if no model is passed, fall back to deterministic summaries.
-    if not isinstance(model, str) or not model.strip():
-        return node_summaries
-
-    chat_model = get_langchain_chat_model(model=model, temperature=0.0)
-    if chat_model is None:
-        raise RuntimeError("langchain chat model unavailable")
-
-    payload = []
-    for node in required_nodes:
-        summary = node_summaries.get(node.node_type)
-        if summary is None:
-            continue
-        raw_texts = raw_evidence_by_type.get(node.node_type) or []
-        payload.append(
-            {
-                "node_type": node.node_type,
-                "display_name": summary.display_name or node.display_name,
-                "usage_mode": node.usage_mode,
-                "usable_as_tool": node.usable_as_tool,
-                "has_main_input": node.has_main_input,
-                "input_connection_types": list(node.input_connection_types),
-                "evidence_refs": list(node.evidence_refs[:4]),
-                "evidence_texts": [
-                    _compact(_sanitize_text(item), max_chars=650) for item in raw_texts[:3] if _sanitize_text(item)
-                ]
-                or list(summary.evidence_snippets[:2]),
-                "fallback_summary": {
-                    "purpose": summary.purpose,
-                    "capabilities": list(summary.capabilities),
-                    "limitations": list(summary.limitations),
-                    "usage_constraints": list(summary.usage_constraints),
-                    "data_io_hints": list(summary.data_io_hints),
-                },
-            }
-        )
-
-    if not payload:
-        return node_summaries
-
-    payload_json = json.dumps(payload, ensure_ascii=False)
-    system_prompt = (
-        "You are a product manager assistant that summarizes API-doc node evidence. "
-        "Extract factual capabilities and limitations from provided evidence only."
-    )
-    user_prompt = (
-        "For each node, produce a concise planning-oriented functional summary.\n"
-        "Rules:\n"
-        "- Use only the provided evidence_texts and metadata; do not invent facts.\n"
-        "- Keep architecture-level language (no parameter values, no credential values).\n"
-        "- capability items should describe what the node can do.\n"
-        "- limitation items should describe constraints, requirements, or caveats.\n"
-        "- usage_constraints must reflect usage_mode/tool-vs-action behavior.\n"
-        "- data_io_hints should mention practical input/output semantics when evidenced.\n"
-        "- Return structured output only.\n\n"
-        f"Use case title: {use_case.title}\n"
-        f"Desired outcome: {use_case.desired_outcome}\n\n"
-        f"Node evidence JSON:\n{payload_json}"
-    )
-
-    resolved_model = resolve_model(model)
-    emit_llm_prompt_event(
-        trace_logger,
-        request_id=request_id,
-        stage="multi_agent.product_manager.node_summary",
-        model=resolved_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        estimated_tokens=_estimate_prompt_tokens(system_prompt, user_prompt),
-        params={"temperature": 0.0},
-    )
-    structured_llm = chat_model.with_structured_output(NodeEvidenceSummaryOutput)
-    started = time.perf_counter()
-    output = structured_llm.invoke(
-        [
-            ("system", system_prompt),
-            ("human", user_prompt),
-        ]
-    )
-    latency_ms = (time.perf_counter() - started) * 1000.0
-    serialized = output.model_dump(exclude_none=True) if isinstance(output, NodeEvidenceSummaryOutput) else output
-    emit_llm_output_event(
-        trace_logger,
-        request_id=request_id,
-        stage="multi_agent.product_manager.node_summary",
-        model=resolved_model,
-        latency_ms=latency_ms,
-        content=json.dumps(serialized, ensure_ascii=False),
-        usage=None,
-        extra={"temperature": 0.0},
-    )
-
-    validated = (
-        output
-        if isinstance(output, NodeEvidenceSummaryOutput)
-        else NodeEvidenceSummaryOutput.model_validate(output)
-    )
-    by_type = {item.node_type: item for item in validated.summaries}
-    enriched: Dict[str, NodeFunctionalSummary] = {}
-    for node_type, summary in node_summaries.items():
-        llm_summary = by_type.get(node_type)
-        if llm_summary is None:
-            enriched[node_type] = summary
-            continue
-        usage_constraints = _safe_list(
-            [_compact(item, max_chars=150) for item in llm_summary.usage_constraints]
-        ) or list(summary.usage_constraints[:2])
-        enriched[node_type] = NodeFunctionalSummary(
-            node_type=node_type,
-            display_name=summary.display_name,
-            purpose=_compact(llm_summary.purpose or summary.purpose, max_chars=220),
-            capabilities=_safe_list([_compact(item, max_chars=140) for item in llm_summary.capabilities[:4]]),
-            limitations=_safe_list([_compact(item, max_chars=140) for item in llm_summary.limitations[:3]]),
-            usage_constraints=usage_constraints,
-            data_io_hints=_safe_list([_compact(item, max_chars=140) for item in llm_summary.data_io_hints[:4]]),
-            evidence_refs=list(summary.evidence_refs),
-            evidence_snippets=list(summary.evidence_snippets),
-            sources=list(summary.sources),
-        )
-    return enriched
-
-
-def _trim_node_summaries_for_budget(
-    *,
-    use_case: UseCase,
-    required_nodes: List[NodeRequirement],
-    node_summaries: Dict[str, NodeFunctionalSummary],
-    max_prompt_tokens: int,
-) -> Tuple[Dict[str, NodeFunctionalSummary], List[str], int]:
-    if not node_summaries:
-        return {}, [], 0
-
-    kept_nodes = list(required_nodes)
-    summaries = dict(node_summaries)
-    excluded: List[str] = []
-
-    while kept_nodes:
-        selected = {node.node_type: summaries[node.node_type] for node in kept_nodes if node.node_type in summaries}
-        system_prompt, user_prompt = _plan_prompts(use_case, kept_nodes, selected)
-        estimated = _estimate_prompt_tokens(system_prompt, user_prompt)
-        if estimated <= max_prompt_tokens:
-            return selected, excluded, estimated
-        if len(kept_nodes) == 1:
-            only_type = kept_nodes[0].node_type
-            selected[only_type] = _deterministic_compact_summary(selected[only_type])
-            system_prompt, user_prompt = _plan_prompts(use_case, kept_nodes, selected)
-            estimated = _estimate_prompt_tokens(system_prompt, user_prompt)
-            return selected, excluded, estimated
-        removed = kept_nodes.pop()
-        excluded.append(removed.node_type)
-
-    return {}, excluded, 0
-
-
-def _heuristic_draft(use_case: UseCase, required_nodes: List[NodeRequirement]) -> ArchitecturePlanDraft:
-    node_types = [node.node_type for node in required_nodes]
-    stages = [
-        ArchitectureStage(
-            id="stage_intake",
-            name="Intake and Trigger",
-            purpose="Capture the event or record that starts the business process.",
-            required_capabilities=[
-                "Receive or detect business event",
-                "Normalize the initial payload shape",
-            ],
-            expected_inputs=["Business event context"],
-            expected_outputs=["Normalized payload"],
-            dependencies=[],
-            notes="Engineer should pick concrete trigger and normalization setup.",
-        ),
-        ArchitectureStage(
-            id="stage_processing",
-            name="Business Processing",
-            purpose="Apply business rules and transform payload into actionable records.",
-            required_capabilities=[
-                "Validate required business fields",
-                "Apply routing/decision logic",
-                "Prepare target-system payload",
-            ],
-            expected_inputs=["Normalized payload"],
-            expected_outputs=["Action-ready payload"],
-            dependencies=["stage_intake"],
-            notes="Keep logic modular to allow iteration in engineering.",
-        ),
-        ArchitectureStage(
-            id="stage_delivery",
-            name="Delivery and Confirmation",
-            purpose="Send data to destination systems and capture delivery outcomes.",
-            required_capabilities=[
-                "Write/update target system",
-                "Record success/failure outcomes",
-                "Notify stakeholders on failure paths",
-            ],
-            expected_inputs=["Action-ready payload"],
-            expected_outputs=["Delivery status", "Audit trace"],
-            dependencies=["stage_processing"],
-            notes="Include retry and error-routing strategy in engineer implementation.",
-        ),
-    ]
-    data_flow = [
-        ArchitectureDataFlowItem(
-            source_stage_id="stage_intake",
-            target_stage_id="stage_processing",
-            data_items=["normalized payload", "event metadata"],
-            notes=None,
-        ),
-        ArchitectureDataFlowItem(
-            source_stage_id="stage_processing",
-            target_stage_id="stage_delivery",
-            data_items=["action-ready payload", "decision outcome"],
-            notes=None,
-        ),
-    ]
-    assumptions = [
-        "Business input has a stable event source for automation.",
-        "Downstream destination supports the required write/update operation.",
-    ]
-    if node_types:
-        assumptions.append(
-            "Engineer should configure only the evidence-backed node set for the first implementation iteration."
-        )
-    return ArchitecturePlanDraft(
-        workflow_summary=(
-            f"Implement '{use_case.title}' with a three-stage flow that ingests business events, "
-            "applies business processing rules, and delivers outcomes to the destination system."
-        ),
-        stages=stages,
-        data_flow=data_flow,
-        assumptions=assumptions,
-        missing_information=[],
-        implementation_notes_for_engineer=[
-            "Configure parameters and credentials in engineering phase only.",
-            "Preserve a clear mapping from stage outputs to downstream inputs.",
-            "Validate failure handling and operational visibility before production rollout.",
-        ],
-        planning_summary=(
-            f"Architecture planning prepared for use case '{use_case.id}' using "
-            f"{len(required_nodes)} evidence-backed node type(s)."
-        ),
-    )
-
-
-def _collect_missing_inputs(
-    use_case: UseCase,
-    required_nodes: List[NodeRequirement],
-    *,
-    include_missing_evidence_msg: bool = True,
-) -> List[str]:
-    missing: List[str] = []
-    if len(use_case.business_problem.strip()) < 20:
-        missing.append("Please provide more detail about the business problem impact and current process.")
-    if len(use_case.desired_outcome.strip()) < 15:
-        missing.append("Please clarify the desired workflow outcome and success criteria.")
-    if include_missing_evidence_msg and not required_nodes:
-        missing.append(
-            "No explicit node evidence was retrieved from API docs. Please provide a more specific integration context."
-        )
-    return _safe_list(missing)
 
 
 def _is_agentic_tool_calling_use_case(use_case: UseCase) -> bool:
@@ -1321,155 +747,6 @@ def _filter_required_nodes_for_usage(
     return kept, dropped
 
 
-def _derive_proposed_nodes_from_plan(plan: ArchitecturePlan) -> List[ProposedNode]:
-    stage_ids = [stage.id for stage in plan.stages]
-    output: List[ProposedNode] = []
-    for idx, requirement in enumerate(plan.required_nodes, start=1):
-        stage_id = stage_ids[min(idx - 1, len(stage_ids) - 1)] if stage_ids else None
-        output.append(
-            ProposedNode(
-                node_id=f"pn_{idx}",
-                node_type=requirement.node_type,
-                stage_id=stage_id,
-                purpose=requirement.why_required,
-                depends_on=[f"pn_{idx - 1}"] if idx > 1 else [],
-                usage_mode=requirement.usage_mode,
-                usable_as_tool=requirement.usable_as_tool,
-                has_main_input=requirement.has_main_input,
-                input_connection_types=list(requirement.input_connection_types),
-            )
-        )
-    return output
-
-
-def _remove_json_like_content(text: str) -> str:
-    cleaned = str(text or "")
-    cleaned = re.sub(r"\{[\s\S]*\}", "", cleaned)
-    return _compact(cleaned, max_chars=240)
-
-
-def build_architecture_plan(
-    *,
-    selected_use_case: UseCase,
-    required_nodes: List[NodeRequirement],
-    node_summaries: Dict[str, NodeFunctionalSummary],
-    model: Optional[str],
-    request_id: Optional[str],
-) -> Tuple[Optional[ArchitecturePlan], Optional[str]]:
-    if not required_nodes:
-        return None, None
-
-    base_missing = _collect_missing_inputs(selected_use_case, required_nodes)
-    max_prompt_tokens = max(
-        1,
-        int(getattr(settings, "MAX_CONTEXT_TOKENS", _PM_MAX_PROMPT_TOKENS_FALLBACK) or _PM_MAX_PROMPT_TOKENS_FALLBACK),
-    )
-    active_summaries = dict(node_summaries)
-    llm_calls_used = 0
-    compacted = False
-    excluded_nodes: List[str] = []
-
-    system_prompt, user_prompt = _plan_prompts(selected_use_case, required_nodes, active_summaries)
-    initial_tokens = _estimate_prompt_tokens(system_prompt, user_prompt)
-    final_tokens = initial_tokens
-    compacted_tokens = initial_tokens
-    if initial_tokens > max_prompt_tokens:
-        compacted = True
-        try:
-            active_summaries = _compact_node_evidence_with_structured_output(
-                use_case=selected_use_case,
-                required_nodes=required_nodes,
-                node_summaries=active_summaries,
-                model=model,
-                request_id=request_id,
-            )
-            llm_calls_used += 1
-        except Exception as exc:
-            logger.warning("product manager compaction failed, using deterministic compaction: %s", str(exc))
-            active_summaries = {
-                node_type: _deterministic_compact_summary(summary)
-                for node_type, summary in active_summaries.items()
-            }
-
-        system_prompt, user_prompt = _plan_prompts(selected_use_case, required_nodes, active_summaries)
-        compacted_tokens = _estimate_prompt_tokens(system_prompt, user_prompt)
-        if compacted_tokens > max_prompt_tokens:
-            trimmed_summaries, excluded_nodes, compacted_tokens = _trim_node_summaries_for_budget(
-                use_case=selected_use_case,
-                required_nodes=required_nodes,
-                node_summaries=active_summaries,
-                max_prompt_tokens=max_prompt_tokens,
-            )
-            if trimmed_summaries:
-                active_summaries = trimmed_summaries
-                required_nodes = [node for node in required_nodes if node.node_type in trimmed_summaries]
-            system_prompt, user_prompt = _plan_prompts(selected_use_case, required_nodes, active_summaries)
-            compacted_tokens = _estimate_prompt_tokens(system_prompt, user_prompt)
-        final_tokens = compacted_tokens
-
-    emit_trace_event(
-        trace_logger,
-        event="pm_planning_budget",
-        request_id=request_id,
-        stage="multi_agent.product_manager.planning",
-        payload={
-            "max_prompt_tokens": max_prompt_tokens,
-            "initial_tokens": initial_tokens,
-            "compacted_tokens": compacted_tokens,
-            "final_tokens": final_tokens,
-            "compacted": compacted,
-            "excluded_nodes": excluded_nodes,
-            "required_nodes_after_budget": len(required_nodes),
-        },
-    )
-
-    try:
-        draft = _plan_with_structured_output(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=model,
-            request_id=request_id,
-        )
-        llm_calls_used += 1
-    except Exception as exc:
-        logger.warning("product manager structured planning failed, using fallback: %s", str(exc))
-        draft = _heuristic_draft(selected_use_case, required_nodes)
-
-    missing_information = _safe_list(list(draft.missing_information) + base_missing)
-    notes = [_remove_json_like_content(item) for item in draft.implementation_notes_for_engineer]
-    notes = [item for item in notes if item]
-    plan = ArchitecturePlan(
-        use_case_id=selected_use_case.id,
-        title=selected_use_case.title,
-        business_objective=_compact(selected_use_case.business_problem),
-        desired_outcome=_compact(selected_use_case.desired_outcome),
-        workflow_summary=_remove_json_like_content(draft.workflow_summary),
-        stages=list(draft.stages),
-        data_flow=list(draft.data_flow),
-        assumptions=_safe_list([_compact(item) for item in draft.assumptions]),
-        missing_information=missing_information,
-        implementation_notes_for_engineer=notes,
-        required_nodes=required_nodes,
-    )
-    planning_summary = draft.planning_summary or (
-        f"Prepared architecture plan for use case '{selected_use_case.id}' with "
-        f"{len(required_nodes)} evidence-backed nodes."
-    )
-    emit_trace_event(
-        trace_logger,
-        event="pm_planning_outcome",
-        request_id=request_id,
-        stage="multi_agent.product_manager.planning",
-        payload={
-            "llm_calls_used": llm_calls_used,
-            "compacted": compacted,
-            "excluded_nodes": excluded_nodes,
-            "required_nodes_final": len(required_nodes),
-        },
-    )
-    return plan, _compact(planning_summary, max_chars=260)
-
-
 def _runtime_context(state: MultiAgentGraphState) -> Tuple[Optional[str], Optional[str]]:
     runtime_context = state.get("runtime_context")
     if not isinstance(runtime_context, dict):
@@ -1497,43 +774,897 @@ def _normalize_use_case(value: Any) -> Optional[UseCase]:
 
 def _derive_use_case_from_direct_build_request(user_query: str) -> Optional[UseCase]:
     query = _compact(str(user_query or ""), max_chars=220)
-    if len(query) < 12:
+    if len(query) < 10:
         return None
-
-    title = _compact(query, max_chars=80)
     return UseCase(
         id="direct_build_request",
-        title=title,
-        business_problem=f"User requested a new workflow to solve: {query}",
-        desired_outcome=f"Deliver a workflow architecture for: {query}",
-        expected_value="Provide a working first version of the requested automation.",
-        feasibility="unknown: implementation details must be defined in engineering.",
+        title=_compact(query, max_chars=80),
+        business_problem=f"User requested a new workflow for: {query}",
+        desired_outcome=f"Deliver a workflow architecture that satisfies: {query}",
+        expected_value="Deliver a first production-ready workflow candidate.",
+        feasibility="unknown",
         priority_score=70.0,
         why_selected="Direct workflow build request routed to product manager.",
+    )
+
+
+def _normalize_pm_status(value: Any) -> Optional[PMStatus]:
+    if isinstance(value, PMStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return PMStatus(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_model(value: Any, model_cls: Any) -> Optional[Any]:
+    if isinstance(value, model_cls):
+        return value
+    if isinstance(value, dict):
+        try:
+            return model_cls.model_validate(value)
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_model_list(values: Any, model_cls: Any) -> List[Any]:
+    if not isinstance(values, list):
+        return []
+    out: List[Any] = []
+    for value in values:
+        model = _normalize_model(value, model_cls)
+        if model is not None:
+            out.append(model)
+    return out
+
+
+def _problem_statement(use_case: UseCase) -> str:
+    return (
+        f"Use case title: {use_case.title}\n"
+        f"Business problem: {use_case.business_problem}\n"
+        f"Desired outcome: {use_case.desired_outcome}\n"
+        f"Expected business value: {use_case.expected_value}"
+    )
+
+
+def _invoke_structured_output(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    output_model: Any,
+    model: Optional[str],
+    request_id: Optional[str],
+    temperature: float,
+    stage: str,
+) -> Any:
+    if not isinstance(model, str) or not model.strip():
+        raise RuntimeError("No model configured for PM structured output")
+
+    llm = get_langchain_chat_model(model=model, temperature=temperature)
+    if llm is None:
+        raise RuntimeError("LangChain chat model is unavailable")
+
+    try:
+        structured = llm.with_structured_output(output_model)
+    except Exception as exc:
+        raise RuntimeError(f"Structured output unavailable: {exc}") from exc
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    prompt_tokens = estimate_messages_tokens(messages)
+    emit_llm_prompt_event(
+        trace_logger,
+        request_id=request_id,
+        stage=stage,
+        model=model,
+        messages=messages,
+        estimated_tokens=prompt_tokens,
+        params={"temperature": temperature, "structured": True},
+    )
+
+    response = structured.invoke(messages)
+    emit_llm_output_event(
+        trace_logger,
+        request_id=request_id,
+        stage=stage,
+        model=model,
+        latency_ms=None,
+        content=response.model_dump_json(exclude_none=True) if hasattr(response, "model_dump_json") else str(response),
+        usage=None,
+        extra={"structured": True},
+    )
+    return response
+
+
+def _heuristic_stage_plan(use_case: UseCase) -> List[PMStagePlan]:
+    return [
+        PMStagePlan(
+            id="stage_intake",
+            name="Intake",
+            objective="Capture the incoming trigger/event and normalize payload.",
+            expected_inputs=["Business event or external trigger"],
+            expected_outputs=["Normalized payload"],
+            success_criteria=["Workflow receives event reliably", "Payload is normalized for downstream steps"],
+            dependencies=[],
+        ),
+        PMStagePlan(
+            id="stage_processing",
+            name="Processing",
+            objective="Apply business logic and prepare actions.",
+            expected_inputs=["Normalized payload"],
+            expected_outputs=["Actionable command payload"],
+            success_criteria=["Business rules are represented", "Action payload is complete"],
+            dependencies=["stage_intake"],
+        ),
+        PMStagePlan(
+            id="stage_delivery",
+            name="Delivery",
+            objective="Execute final actions on target systems and record outcome.",
+            expected_inputs=["Actionable command payload"],
+            expected_outputs=["Delivery result"],
+            success_criteria=["Target action executed", "Result is logged"],
+            dependencies=["stage_processing"],
+        ),
+    ]
+
+
+def _plan_stages_with_structured_output(
+    *,
+    use_case: UseCase,
+    model: Optional[str],
+    request_id: Optional[str],
+) -> List[PMStagePlan]:
+    system_prompt = (
+        "You are a Product Manager for n8n workflow architecture. "
+        "Create planning stages only (no node parameters, no workflow JSON). "
+        "Each stage must be implementation-oriented and explicit."
+    )
+    user_prompt = (
+        "Create a stage-first plan for this use case.\n"
+        f"{_problem_statement(use_case)}\n\n"
+        "Rules:\n"
+        "- Produce 2 to 6 stages.\n"
+        "- Every stage must define objective, expected inputs/outputs, and success criteria.\n"
+        "- Keep planning level only; do not include secrets or exact node parameter values."
+    )
+    output = _invoke_structured_output(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output_model=_StagePlanOutput,
+        model=model,
+        request_id=request_id,
+        temperature=0.2,
+        stage="multi_agent.product_manager.stage_plan",
+    )
+    stages = [stage for stage in output.stages if isinstance(stage, PMStagePlan)]
+    return stages
+
+
+def _build_stage_query(
+    *,
+    use_case: UseCase,
+    stage: PMStagePlan,
+    pass_index: int,
+    prior_missing: List[str],
+    clarification_turns: List[PMClarificationTurn],
+) -> str:
+    clarification_bits = [
+        f"Q: {turn.question} A: {turn.answer}"
+        for turn in clarification_turns
+        if turn.stage_id == stage.id and turn.answer
+    ]
+    clarification_text = "\n".join(clarification_bits[:3])
+    missing_text = "\n".join(prior_missing[:3])
+    refine_hint = ""
+    if pass_index > 1:
+        refine_hint = (
+            "Refine retrieval toward explicit n8n node documentation for this stage only. "
+            "Favor chunks with concrete node capabilities/limitations."
+        )
+
+    return (
+        "Retrieve explicit n8n node docs evidence for this workflow stage.\n"
+        f"Use case: {use_case.title}\n"
+        f"Business problem: {use_case.business_problem}\n"
+        f"Desired outcome: {use_case.desired_outcome}\n"
+        f"Stage id: {stage.id}\n"
+        f"Stage objective: {stage.objective}\n"
+        f"Stage expected inputs: {', '.join(stage.expected_inputs) or '-'}\n"
+        f"Stage expected outputs: {', '.join(stage.expected_outputs) or '-'}\n"
+        f"Previous gaps: {missing_text or '-'}\n"
+        f"Clarifications: {clarification_text or '-'}\n"
+        f"Pass: {pass_index}\n"
+        f"{refine_hint}"
+    )
+
+
+def retrieve_pm_api_docs(
+    use_case: UseCase,
+    request_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    return retrieve_docs(_problem_statement(use_case), request_id=request_id)
+
+
+def _retrieve_stage_docs(
+    *,
+    use_case: UseCase,
+    stage: PMStagePlan,
+    pass_index: int,
+    prior_missing: List[str],
+    clarification_turns: List[PMClarificationTurn],
+    request_id: Optional[str],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    query = _build_stage_query(
+        use_case=use_case,
+        stage=stage,
+        pass_index=pass_index,
+        prior_missing=prior_missing,
+        clarification_turns=clarification_turns,
+    )
+    chunks = retrieve_docs(query, request_id=request_id)
+    return query, chunks
+
+
+def _build_stage_candidates(
+    *,
+    required_nodes: List[NodeRequirement],
+    node_summaries: Dict[str, NodeFunctionalSummary],
+) -> List[PMNodeCandidate]:
+    candidates: List[PMNodeCandidate] = []
+    for req in required_nodes:
+        summary = node_summaries.get(req.node_type)
+        capability_summary = summary.purpose if summary else req.why_required
+        limitations = list(summary.limitations if summary else [])
+        candidates.append(
+            PMNodeCandidate(
+                node_type=req.node_type,
+                display_name=req.display_name,
+                capability_summary=_compact(capability_summary, max_chars=280),
+                limitations=limitations[:4],
+                usage_mode=req.usage_mode,
+                evidence_chunk_ids=list(req.evidence_chunk_ids),
+                evidence_refs=list(req.evidence_refs),
+                rerank_confidence=req.rerank_confidence,
+                pm_fit_score=float(req.blended_confidence or req.evidence_confidence or 0.0),
+                top_margin=None,
+            )
+        )
+    return candidates
+
+
+def _summarize_stage_candidates_with_structured_output(
+    *,
+    stage: PMStagePlan,
+    candidates: List[PMNodeCandidate],
+    use_case: UseCase,
+    model: Optional[str],
+    request_id: Optional[str],
+) -> List[PMNodeCandidate]:
+    if not candidates:
+        return []
+    system_prompt = (
+        "You are a Product Manager assistant. "
+        "Summarize node candidates based strictly on evidence."
+    )
+    candidate_lines = [
+        (
+            f"- {item.node_type} | capability={item.capability_summary} "
+            f"| limitations={'; '.join(item.limitations) if item.limitations else '-'} "
+            f"| usage_mode={item.usage_mode}"
+        )
+        for item in candidates
+    ]
+    user_prompt = (
+        "Summarize each node candidate for this stage with concise capability summary and limitations.\n"
+        f"Use case: {use_case.title}\n"
+        f"Stage: {stage.id} - {stage.objective}\n"
+        "Candidates:\n"
+        + "\n".join(candidate_lines)
+    )
+    output = _invoke_structured_output(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output_model=_CandidateSummaryOutput,
+        model=model,
+        request_id=request_id,
+        temperature=0.1,
+        stage="multi_agent.product_manager.stage_candidate_summary",
+    )
+
+    by_type = {item.node_type: item for item in candidates}
+    for summary in output.summaries:
+        current = by_type.get(summary.node_type)
+        if current is None:
+            continue
+        by_type[summary.node_type] = current.model_copy(
+            update={
+                "capability_summary": _compact(summary.capability_summary, max_chars=280),
+                "limitations": _safe_list(summary.limitations)[:4],
+            }
+        )
+    return list(by_type.values())
+
+
+def _heuristic_stage_selection(
+    candidates: List[PMNodeCandidate],
+) -> _StageSelectionOutput:
+    if not candidates:
+        return _StageSelectionOutput(
+            selected_node_types=[],
+            rationale="No explicit API-doc node evidence available for this stage.",
+            pm_fit_score=0.0,
+            missing_information=["No explicit node evidence retrieved from API docs for this stage."],
+        )
+
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            -float(item.pm_fit_score or 0.0),
+            -(item.rerank_confidence or 0.0),
+            item.node_type,
+        ),
+    )
+    top = sorted_candidates[:2]
+    best = top[0]
+    return _StageSelectionOutput(
+        selected_node_types=[item.node_type for item in top],
+        rationale=(
+            f"Selected '{best.node_type}' (and optional companion nodes) because it best matches stage objective."
+        ),
+        pm_fit_score=min(1.0, max(0.0, float(best.pm_fit_score or 0.0))),
+        missing_information=[],
+    )
+
+
+def _select_stage_nodes_with_structured_output(
+    *,
+    stage: PMStagePlan,
+    candidates: List[PMNodeCandidate],
+    use_case: UseCase,
+    model: Optional[str],
+    request_id: Optional[str],
+) -> _StageSelectionOutput:
+    if not candidates:
+        return _heuristic_stage_selection(candidates)
+
+    system_prompt = (
+        "You are a Product Manager selecting nodes for one workflow stage. "
+        "Select only from provided candidates."
+    )
+    lines = [
+        (
+            f"- {item.node_type} | fit_hint={item.pm_fit_score:.2f} | rerank={item.rerank_confidence} "
+            f"| capability={item.capability_summary} | limitations={'; '.join(item.limitations) if item.limitations else '-'}"
+        )
+        for item in candidates
+    ]
+    user_prompt = (
+        "Select the best node bundle for this stage.\n"
+        f"Use case: {use_case.title}\n"
+        f"Stage id: {stage.id}\n"
+        f"Stage objective: {stage.objective}\n"
+        f"Expected inputs: {', '.join(stage.expected_inputs) or '-'}\n"
+        f"Expected outputs: {', '.join(stage.expected_outputs) or '-'}\n"
+        "Rules:\n"
+        "- Select only node types listed in candidates.\n"
+        "- Prefer business-fit and stage objective alignment.\n"
+        "- If evidence is insufficient, return empty selected_node_types and explain missing information.\n"
+        "Candidates:\n"
+        + "\n".join(lines)
+    )
+
+    output = _invoke_structured_output(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        output_model=_StageSelectionOutput,
+        model=model,
+        request_id=request_id,
+        temperature=0.1,
+        stage="multi_agent.product_manager.stage_selection",
+    )
+
+    allowed = {item.node_type for item in candidates}
+    selected = [node_type for node_type in output.selected_node_types if node_type in allowed]
+    if not selected:
+        return _heuristic_stage_selection(candidates).model_copy(
+            update={
+                "missing_information": _safe_list(output.missing_information) or [
+                    "Node evidence was not strong enough for confident stage selection."
+                ],
+                "rationale": _compact(output.rationale or "Evidence too weak for confident selection.", max_chars=280),
+                "pm_fit_score": float(output.pm_fit_score or 0.0),
+            }
+        )
+
+    return _StageSelectionOutput(
+        selected_node_types=selected,
+        rationale=_compact(output.rationale, max_chars=320),
+        pm_fit_score=float(output.pm_fit_score),
+        missing_information=_safe_list(output.missing_information),
+    )
+
+
+def _top_margin(candidates: List[PMNodeCandidate]) -> Optional[float]:
+    scores = sorted(
+        [float(item.rerank_confidence) for item in candidates if item.rerank_confidence is not None],
+        reverse=True,
+    )
+    if len(scores) < 2:
+        return None
+    return max(0.0, min(1.0, scores[0] - scores[1]))
+
+
+def _stage_rerank_from_selected(selected_nodes: List[PMNodeCandidate]) -> Optional[float]:
+    scores = [float(item.rerank_confidence) for item in selected_nodes if item.rerank_confidence is not None]
+    if not scores:
+        return None
+    return max(0.0, min(1.0, max(scores)))
+
+
+def _stage_gate_pass(
+    *,
+    pm_fit_score: float,
+    rerank_confidence: Optional[float],
+    top_margin: Optional[float],
+) -> bool:
+    fit_threshold = _pm_float("PM_FIT_SCORE_THRESHOLD", 0.70)
+    rerank_threshold = _pm_float("PM_RERANK_THRESHOLD", 0.55)
+    margin_threshold = _pm_float("PM_TOP_MARGIN_THRESHOLD", 0.10)
+
+    if pm_fit_score < fit_threshold:
+        return False
+    rerank_ok = rerank_confidence is not None and rerank_confidence >= rerank_threshold
+    margin_ok = top_margin is not None and top_margin >= margin_threshold
+    return rerank_ok or margin_ok
+
+
+def _stage_progress_summary(
+    *,
+    stage: PMStagePlan,
+    pass_index: int,
+    query: str,
+    candidates: List[PMNodeCandidate],
+    top_margin: Optional[float],
+) -> PMStageSearchState:
+    top_rerank = None
+    if candidates:
+        top_rerank = max(
+            [item.rerank_confidence for item in candidates if item.rerank_confidence is not None],
+            default=None,
+        )
+    return PMStageSearchState(
+        stage_id=stage.id,
+        pass_index=pass_index,
+        query=_compact(query, max_chars=500),
+        retrieved_chunk_count=len(candidates),
+        candidate_node_types=[item.node_type for item in candidates],
+        top_rerank_confidence=top_rerank,
+        top_margin=top_margin,
+    )
+
+
+def _run_stage_selection_passes(
+    *,
+    use_case: UseCase,
+    stage: PMStagePlan,
+    model: Optional[str],
+    request_id: Optional[str],
+    clarification_state: PMClarificationState,
+    trace_events: List[Dict[str, Any]],
+) -> PMStageSelection:
+    max_passes = _pm_int("PM_MAX_STAGE_RETRIEVAL_PASSES", 3)
+    prior_missing: List[str] = []
+    search_history: List[PMStageSearchState] = []
+    best_selection: Optional[PMStageSelection] = None
+
+    for pass_index in range(1, max_passes + 1):
+        query, chunks = _retrieve_stage_docs(
+            use_case=use_case,
+            stage=stage,
+            pass_index=pass_index,
+            prior_missing=prior_missing,
+            clarification_turns=clarification_state.turns,
+            request_id=request_id,
+        )
+
+        required_nodes, node_summaries = _extract_required_nodes_with_summaries(chunks)
+        required_nodes, dropped = _filter_required_nodes_for_usage(
+            use_case=use_case,
+            required_nodes=required_nodes,
+        )
+        if dropped:
+            prior_missing = _safe_list(
+                prior_missing
+                + [
+                    "Retrieved evidence is mostly tool-only nodes. Clarify if this stage is agent tool-calling or main-action workflow."
+                ]
+            )
+
+        candidates = _build_stage_candidates(required_nodes=required_nodes, node_summaries=node_summaries)
+        if candidates and isinstance(model, str) and model.strip():
+            try:
+                candidates = _summarize_stage_candidates_with_structured_output(
+                    stage=stage,
+                    candidates=candidates,
+                    use_case=use_case,
+                    model=model,
+                    request_id=request_id,
+                )
+            except Exception as exc:
+                logger.warning("pm stage candidate summary failed (stage=%s pass=%d): %s", stage.id, pass_index, str(exc))
+
+        margin = _top_margin(candidates)
+        search_state = _stage_progress_summary(
+            stage=stage,
+            pass_index=pass_index,
+            query=query,
+            candidates=candidates,
+            top_margin=margin,
+        )
+        search_history.append(search_state)
+
+        selection_output: _StageSelectionOutput
+        if candidates and isinstance(model, str) and model.strip():
+            try:
+                selection_output = _select_stage_nodes_with_structured_output(
+                    stage=stage,
+                    candidates=candidates,
+                    use_case=use_case,
+                    model=model,
+                    request_id=request_id,
+                )
+            except Exception as exc:
+                logger.warning("pm stage selection failed (stage=%s pass=%d): %s", stage.id, pass_index, str(exc))
+                selection_output = _heuristic_stage_selection(candidates)
+        else:
+            selection_output = _heuristic_stage_selection(candidates)
+
+        selected_nodes = [
+            item for item in candidates if item.node_type in set(selection_output.selected_node_types)
+        ]
+        for item in selected_nodes:
+            item.top_margin = margin
+
+        rerank_confidence = _stage_rerank_from_selected(selected_nodes)
+        gate_passed = _stage_gate_pass(
+            pm_fit_score=float(selection_output.pm_fit_score),
+            rerank_confidence=rerank_confidence,
+            top_margin=margin,
+        )
+
+        stage_selection = PMStageSelection(
+            stage_id=stage.id,
+            selected_node_types=[item.node_type for item in selected_nodes],
+            selected_nodes=selected_nodes,
+            rationale=_compact(selection_output.rationale, max_chars=320),
+            pm_fit_score=float(selection_output.pm_fit_score),
+            rerank_confidence=rerank_confidence,
+            top_margin=margin,
+            gate_passed=gate_passed,
+            passes_used=pass_index,
+            missing_information=_safe_list(selection_output.missing_information),
+            search_history=list(search_history),
+        )
+
+        trace_events.append(
+            {
+                "stage_id": stage.id,
+                "pass_index": pass_index,
+                "query": query,
+                "retrieved_chunks": len(chunks),
+                "candidate_count": len(candidates),
+                "candidate_node_types": [item.node_type for item in candidates],
+                "selected_node_types": list(stage_selection.selected_node_types),
+                "pm_fit_score": stage_selection.pm_fit_score,
+                "rerank_confidence": stage_selection.rerank_confidence,
+                "top_margin": stage_selection.top_margin,
+                "gate_passed": gate_passed,
+            }
+        )
+
+        if gate_passed and stage_selection.selected_node_types:
+            return stage_selection
+
+        best_selection = stage_selection
+        if selection_output.missing_information:
+            prior_missing = _safe_list(prior_missing + selection_output.missing_information)
+        else:
+            prior_missing = _safe_list(prior_missing + ["Need stronger explicit node evidence for this stage objective."])
+
+    if best_selection is None:
+        best_selection = PMStageSelection(
+            stage_id=stage.id,
+            selected_node_types=[],
+            selected_nodes=[],
+            rationale="No explicit API-doc evidence was found for this stage.",
+            pm_fit_score=0.0,
+            rerank_confidence=None,
+            top_margin=None,
+            gate_passed=False,
+            passes_used=max_passes,
+            missing_information=["No explicit node evidence retrieved for this stage."],
+            search_history=list(search_history),
+        )
+    return best_selection
+
+
+def _build_clarification_question(stage: PMStagePlan, selection: PMStageSelection) -> str:
+    gaps = "; ".join(selection.missing_information[:2]) if selection.missing_information else "insufficient node evidence"
+    return _compact(
+        (
+            f"To continue planning stage '{stage.name}', clarify this: {gaps}. "
+            "Please specify integrations, trigger type, and expected outputs for this stage."
+        ),
+        max_chars=260,
+    )
+
+
+def _record_clarification_answer(
+    clarification_state: PMClarificationState,
+    user_query: str,
+) -> PMClarificationState:
+    pending = list(clarification_state.pending_questions)
+    turns = list(clarification_state.turns)
+    if not pending:
+        return clarification_state
+    question = pending.pop(0)
+    answer = _compact(user_query, max_chars=320)
+    for idx in range(len(turns) - 1, -1, -1):
+        if turns[idx].question == question and not turns[idx].answer:
+            turns[idx] = turns[idx].model_copy(update={"answer": answer})
+            break
+    else:
+        turns.append(PMClarificationTurn(question=question, answer=answer))
+    return clarification_state.model_copy(
+        update={
+            "pending_questions": pending,
+            "turns": turns,
+        }
+    )
+
+
+def _derive_required_nodes_from_stage_selections(
+    selections: List[PMStageSelection],
+) -> List[NodeRequirement]:
+    output: List[NodeRequirement] = []
+    seen = set()
+    for selection in selections:
+        for candidate in selection.selected_nodes:
+            if candidate.node_type in seen:
+                continue
+            seen.add(candidate.node_type)
+            evidence_conf = min(1.0, max(0.0, float(candidate.pm_fit_score or 0.0)))
+            blended = _blended_confidence(evidence_conf, candidate.rerank_confidence)
+            output.append(
+                NodeRequirement(
+                    node_type=candidate.node_type,
+                    display_name=candidate.display_name,
+                    why_required=_compact(
+                        f"Stage {selection.stage_id}: {selection.rationale or candidate.capability_summary}",
+                        max_chars=260,
+                    ),
+                    evidence_chunk_ids=list(candidate.evidence_chunk_ids[:8]),
+                    evidence_refs=list(candidate.evidence_refs[:6]),
+                    evidence_confidence=round(evidence_conf, 2),
+                    rerank_confidence=(
+                        round(candidate.rerank_confidence, 2)
+                        if isinstance(candidate.rerank_confidence, float)
+                        else None
+                    ),
+                    blended_confidence=round(blended, 2),
+                    usage_mode=candidate.usage_mode,
+                    usable_as_tool=None,
+                    has_main_input=None,
+                    input_connection_types=[],
+                )
+            )
+    return output
+
+
+def _derive_proposed_nodes(
+    *,
+    stage_plan: List[PMStagePlan],
+    selections: List[PMStageSelection],
+) -> List[ProposedNode]:
+    output: List[ProposedNode] = []
+    by_stage = {item.stage_id: item for item in selections}
+    idx = 0
+    for stage in stage_plan:
+        selection = by_stage.get(stage.id)
+        if selection is None:
+            continue
+        stage_selected = selection.selected_nodes or []
+        if not stage_selected and selection.selected_node_types:
+            stage_selected = [
+                PMNodeCandidate(
+                    node_type=node_type,
+                    capability_summary=selection.rationale,
+                )
+                for node_type in selection.selected_node_types
+            ]
+        for candidate in stage_selected:
+            idx += 1
+            output.append(
+                ProposedNode(
+                    node_id=f"pn_{idx}",
+                    node_type=candidate.node_type,
+                    stage_id=stage.id,
+                    purpose=_compact(
+                        f"{stage.objective} | {selection.rationale or candidate.capability_summary}",
+                        max_chars=260,
+                    ),
+                    depends_on=[f"pn_{idx - 1}"] if idx > 1 else [],
+                    expected_inputs=list(stage.expected_inputs),
+                    expected_outputs=list(stage.expected_outputs),
+                    usage_mode=candidate.usage_mode,
+                )
+            )
+    return output
+
+
+def _derive_architecture_plan(
+    *,
+    use_case: UseCase,
+    stage_plan: List[PMStagePlan],
+    selections: List[PMStageSelection],
+    missing_information: List[str],
+) -> ArchitecturePlan:
+    stage_models = [
+        ArchitectureStage(
+            id=stage.id,
+            name=stage.name,
+            purpose=stage.objective,
+            required_capabilities=list(stage.success_criteria),
+            expected_inputs=list(stage.expected_inputs),
+            expected_outputs=list(stage.expected_outputs),
+            dependencies=list(stage.dependencies),
+            notes=None,
+        )
+        for stage in stage_plan
+    ]
+
+    data_flow: List[ArchitectureDataFlowItem] = []
+    for stage in stage_plan:
+        for dependency in stage.dependencies:
+            data_flow.append(
+                ArchitectureDataFlowItem(
+                    source_stage_id=dependency,
+                    target_stage_id=stage.id,
+                    data_items=list(stage.expected_inputs) or ["stage_input"],
+                    notes="Derived from PM stage dependency.",
+                )
+            )
+
+    required_nodes = _derive_required_nodes_from_stage_selections(selections)
+    notes = [
+        _compact(
+            f"Stage {item.stage_id}: {item.rationale}",
+            max_chars=280,
+        )
+        for item in selections
+        if item.rationale
+    ]
+    return ArchitecturePlan(
+        use_case_id=use_case.id,
+        title=use_case.title,
+        business_objective=_compact(use_case.business_problem, max_chars=260),
+        desired_outcome=_compact(use_case.desired_outcome, max_chars=260),
+        workflow_summary=_compact(
+            f"Stage-first PM plan with {len(stage_plan)} stages and {len(required_nodes)} evidence-backed nodes.",
+            max_chars=320,
+        ),
+        stages=stage_models,
+        data_flow=data_flow,
+        assumptions=[
+            "Node selection is constrained to explicit API-doc evidence.",
+            "Engineer stage will configure parameters and credentials.",
+        ],
+        missing_information=_safe_list(missing_information),
+        implementation_notes_for_engineer=_safe_list(notes),
+        required_nodes=required_nodes,
+    )
+
+
+def build_architecture_plan(
+    *,
+    selected_use_case: UseCase,
+    required_nodes: List[NodeRequirement],
+    node_summaries: Dict[str, NodeFunctionalSummary],
+    model: Optional[str],
+    request_id: Optional[str],
+) -> Tuple[Optional[ArchitecturePlan], Optional[str]]:
+    _ = node_summaries, model, request_id
+    if not required_nodes:
+        return None, None
+
+    stages = [
+        PMStagePlan(
+            id="stage_1",
+            name="Workflow Stage",
+            objective="Implement core use-case flow.",
+            expected_inputs=["Input payload"],
+            expected_outputs=["Processed result"],
+            success_criteria=["Business objective covered"],
+            dependencies=[],
+        )
+    ]
+    selection = PMStageSelection(
+        stage_id="stage_1",
+        selected_node_types=[node.node_type for node in required_nodes],
+        selected_nodes=[
+            PMNodeCandidate(
+                node_type=node.node_type,
+                display_name=node.display_name,
+                capability_summary=node.why_required,
+                limitations=[],
+                usage_mode=node.usage_mode,
+                evidence_chunk_ids=list(node.evidence_chunk_ids),
+                evidence_refs=list(node.evidence_refs),
+                rerank_confidence=node.rerank_confidence,
+                pm_fit_score=float(node.blended_confidence or node.evidence_confidence or 0.0),
+            )
+            for node in required_nodes
+        ],
+        rationale="Derived from PM stage bridge.",
+        pm_fit_score=0.8,
+        rerank_confidence=None,
+        top_margin=None,
+        gate_passed=True,
+        passes_used=1,
+        missing_information=[],
+        search_history=[],
+    )
+    plan = _derive_architecture_plan(
+        use_case=selected_use_case,
+        stage_plan=stages,
+        selections=[selection],
+        missing_information=[],
+    )
+    return plan, "Architecture plan bridge generated from selected nodes."
+
+
+def _planning_summary(
+    *,
+    use_case: UseCase,
+    stage_plan: List[PMStagePlan],
+    selections: List[PMStageSelection],
+    pm_status: PMStatus,
+) -> str:
+    selected_nodes = sum(len(item.selected_node_types) for item in selections)
+    return _compact(
+        (
+            f"PM status={pm_status.value}; use_case={use_case.id}; "
+            f"stages={len(stage_plan)}; selected_nodes={selected_nodes}."
+        ),
+        max_chars=260,
     )
 
 
 def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     model, request_id = _runtime_context(state)
     routing_signals = list(state.get("routing_signals") or [])
-    routing_signals.append("entered_product_manager_agent")
-    missing_user_inputs = list(state.get("missing_user_inputs") or [])
+    if "entered_product_manager_agent" not in routing_signals:
+        routing_signals.append("entered_product_manager_agent")
 
+    missing_user_inputs = list(state.get("missing_user_inputs") or [])
     entry_intent = state.get("entry_intent")
+
     selected_use_case = _normalize_use_case(state.get("selected_use_case"))
     if selected_use_case is None and entry_intent == EntryIntent.workflow_build_request:
         selected_use_case = _derive_use_case_from_direct_build_request(state.get("user_query") or "")
         if selected_use_case is not None:
             routing_signals.append("pm_use_case_derived_from_direct_build_request")
-            routing_signals.append(f"selected_use_case:{selected_use_case.id}")
 
     if selected_use_case is None:
-        missing_msg = "A selected use case is required before product manager planning can continue."
+        message = "A selected use case is required before PM planning can continue."
         if entry_intent == EntryIntent.workflow_build_request:
-            missing_msg = "Please provide a clearer workflow build request so planning can continue."
-        missing_user_inputs = _safe_list(
-            missing_user_inputs + [missing_msg]
-        )
+            message = "Please provide a clearer workflow build request so PM planning can continue."
+        missing_user_inputs = _safe_list(missing_user_inputs + [message])
         routing_signals.append("pm_missing_selected_use_case")
         workflow_context = WorkflowContext(
             use_case_id="unknown",
@@ -1545,6 +1676,18 @@ def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         )
         return {
             "current_stage": "product_manager_agent",
+            "pm_status": PMStatus.pm_failed_no_solution,
+            "pm_stage_plan": [],
+            "pm_stage_selections": [],
+            "pm_stage_progress": PMProgressState(total_stages=0),
+            "pm_clarification_state": PMClarificationState(
+                attempts_used=0,
+                max_attempts=_pm_int("PM_MAX_USER_CLARIFICATIONS", 2),
+                pending_questions=[],
+                turns=[],
+            ),
+            "pm_stage_search_history": [],
+            "pm_reasoning_trace_full": [],
             "architecture_plan": None,
             "workflow_context": workflow_context,
             "planning_summary": None,
@@ -1555,190 +1698,227 @@ def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             "required_credentials": [],
         }
 
-    docs_chunks = retrieve_pm_api_docs(selected_use_case, request_id=request_id)
-    required_nodes, node_summaries, raw_evidence_by_type = _extract_required_nodes_with_summaries(docs_chunks)
-    required_nodes_before_usage_filter = len(required_nodes)
-    required_nodes, dropped_tool_only_nodes = _filter_required_nodes_for_usage(
-        use_case=selected_use_case,
-        required_nodes=required_nodes,
-    )
-    kept_types = {node.node_type for node in required_nodes}
-    node_summaries = {
-        node_type: summary for node_type, summary in node_summaries.items() if node_type in kept_types
-    }
-    raw_evidence_by_type = {
-        node_type: values for node_type, values in raw_evidence_by_type.items() if node_type in kept_types
-    }
-    if required_nodes and isinstance(model, str) and model.strip():
+    pm_status = _normalize_pm_status(state.get("pm_status"))
+    stage_plan = _normalize_model_list(state.get("pm_stage_plan"), PMStagePlan)
+    stage_selections = _normalize_model_list(state.get("pm_stage_selections"), PMStageSelection)
+    stage_progress = _normalize_model(state.get("pm_stage_progress"), PMProgressState)
+    clarification_state = _normalize_model(state.get("pm_clarification_state"), PMClarificationState)
+    stage_search_history = _normalize_model_list(state.get("pm_stage_search_history"), PMStageSearchState)
+    reasoning_trace = list(state.get("pm_reasoning_trace_full") or [])
+
+    if stage_progress is None:
+        stage_progress = PMProgressState(total_stages=0)
+    if clarification_state is None:
+        clarification_state = PMClarificationState(
+            attempts_used=0,
+            max_attempts=_pm_int("PM_MAX_USER_CLARIFICATIONS", 2),
+            pending_questions=[],
+            turns=[],
+        )
+
+    if pm_status == PMStatus.pm_blocked_waiting_user and clarification_state.pending_questions:
+        user_query = _compact(str(state.get("user_query") or ""), max_chars=320)
+        if user_query:
+            clarification_state = _record_clarification_answer(clarification_state, user_query)
+            routing_signals.append("pm_clarification_answer_received")
+
+    if not stage_plan:
         try:
-            node_summaries = _summarize_node_evidence_with_structured_output(
+            stage_plan = _plan_stages_with_structured_output(
                 use_case=selected_use_case,
-                required_nodes=required_nodes,
-                node_summaries=node_summaries,
-                raw_evidence_by_type=raw_evidence_by_type,
                 model=model,
                 request_id=request_id,
             )
         except Exception as exc:
-            logger.warning("product manager node evidence summarization failed, using fallback: %s", str(exc))
-        required_nodes = _apply_summaries_to_required_nodes(required_nodes, node_summaries)
-    emit_trace_event(
-        trace_logger,
-        event="pm_node_evidence",
-        request_id=request_id,
-        stage="multi_agent.product_manager.evidence",
-        payload={
-            "docs_chunks": len(docs_chunks),
-            "required_nodes_before_usage_filter": required_nodes_before_usage_filter,
-            "required_nodes_after_usage_filter": len(required_nodes),
-            "node_types": [node.node_type for node in required_nodes],
-            "rerank_sources": {
-                node.node_type: (
-                    "docs_rerank"
-                    if node.rerank_confidence is not None
-                    else "none"
-                )
-                for node in required_nodes
-            },
-        },
-    )
-    if dropped_tool_only_nodes:
-        routing_signals.append(f"pm_filtered_tool_only_nodes:{len(dropped_tool_only_nodes)}")
-        trace_logger.info(
-            "product manager node-usage filter: request_id=%s dropped_tool_only=%d kept=%d",
-            request_id or "-",
-            len(dropped_tool_only_nodes),
-            len(required_nodes),
+            logger.warning("pm stage planning fallback to heuristic: %s", str(exc))
+            stage_plan = _heuristic_stage_plan(selected_use_case)
+        stage_progress = stage_progress.model_copy(update={"total_stages": len(stage_plan)})
+
+    stage_selection_by_id: Dict[str, PMStageSelection] = {item.stage_id: item for item in stage_selections}
+    completed_stage_ids = set(stage_progress.completed_stage_ids)
+    blocked_stage_ids = set(stage_progress.blocked_stage_ids)
+    trace_events: List[Dict[str, Any]] = []
+
+    for stage in stage_plan:
+        existing_selection = stage_selection_by_id.get(stage.id)
+        if existing_selection and existing_selection.gate_passed:
+            completed_stage_ids.add(stage.id)
+            blocked_stage_ids.discard(stage.id)
+            continue
+
+        stage_progress = stage_progress.model_copy(update={"current_stage_id": stage.id})
+        selection = _run_stage_selection_passes(
+            use_case=selected_use_case,
+            stage=stage,
+            model=model,
+            request_id=request_id,
+            clarification_state=clarification_state,
+            trace_events=trace_events,
         )
-    if not required_nodes:
-        if dropped_tool_only_nodes:
-            missing_user_inputs = _safe_list(
-                missing_user_inputs
-                + [
-                    (
-                        "Retrieved node evidence is tool-only for AI agent tool-calling. "
-                        "Confirm if this workflow should run as an AI agent tool-calling design "
-                        "or provide action-node constraints."
-                    )
-                ]
+
+        stage_selection_by_id[stage.id] = selection
+        stage_search_history.extend(selection.search_history)
+
+        passes_by_stage = dict(stage_progress.passes_by_stage)
+        passes_by_stage[stage.id] = max(passes_by_stage.get(stage.id, 0), selection.passes_used)
+        stage_progress = stage_progress.model_copy(update={"passes_by_stage": passes_by_stage})
+
+        if selection.gate_passed and selection.selected_node_types:
+            completed_stage_ids.add(stage.id)
+            blocked_stage_ids.discard(stage.id)
+            continue
+
+        question = _build_clarification_question(stage, selection)
+        if clarification_state.attempts_used < clarification_state.max_attempts:
+            clarification_state = clarification_state.model_copy(
+                update={
+                    "attempts_used": clarification_state.attempts_used + 1,
+                    "pending_questions": clarification_state.pending_questions + [question],
+                    "turns": clarification_state.turns + [
+                        PMClarificationTurn(stage_id=stage.id, question=question, answer=None)
+                    ],
+                }
             )
-            routing_signals.append("pm_only_tool_nodes_after_usage_filter")
+            missing_user_inputs = _safe_list(missing_user_inputs + [question])
+            blocked_stage_ids.add(stage.id)
+            routing_signals.append("pm_blocked_waiting_user")
+            pm_status = PMStatus.pm_blocked_waiting_user
+            break
+
+        blocked_stage_ids.add(stage.id)
         missing_user_inputs = _safe_list(
             missing_user_inputs
-            + _collect_missing_inputs(
-                selected_use_case,
-                required_nodes,
-                include_missing_evidence_msg=not bool(dropped_tool_only_nodes),
-            )
+            + [
+                f"PM could not find a confident stage solution after {clarification_state.max_attempts} clarifications for '{stage.name}'."
+            ]
         )
-        routing_signals.append("pm_no_explicit_node_evidence")
-        routing_signals.append("pm_no_actionable_plan")
-        workflow_context = WorkflowContext(
-            use_case_id=selected_use_case.id,
-            planning_ready=False,
-            handoff_target=None,
-            required_node_types=[],
-            unresolved_inputs=missing_user_inputs,
-            notes=["strict_evidence_policy_blocked_planning"],
-        )
-        trace_logger.info(
-            (
-                "product manager planning: request_id=%s use_case=%s docs=%d required_nodes=0 "
-                "actionable=false dropped_tool_only=%d"
-            ),
-            request_id or "-",
-            selected_use_case.id,
-            len(docs_chunks),
-            len(dropped_tool_only_nodes),
-        )
-        return {
-            "current_stage": "product_manager_agent",
-            "architecture_plan": None,
-            "workflow_context": workflow_context,
-            "planning_summary": "No actionable plan generated: explicit node evidence was not found.",
-            "missing_user_inputs": missing_user_inputs,
-            "routing_signals": routing_signals,
-            "target_stage": None,
-            "proposed_nodes": [],
-            "required_credentials": [],
-        }
+        routing_signals.append("pm_failed_no_solution")
+        pm_status = PMStatus.pm_failed_no_solution
+        break
 
-    architecture_plan, planning_summary = build_architecture_plan(
-        selected_use_case=selected_use_case,
-        required_nodes=required_nodes,
-        node_summaries=node_summaries,
-        model=model,
+    if pm_status in (PMStatus.pm_blocked_waiting_user, PMStatus.pm_failed_no_solution):
+        if len(completed_stage_ids) == len(stage_plan):
+            pm_status = PMStatus.pm_completed
+            blocked_stage_ids.clear()
+    if pm_status is None:
+        pm_status = PMStatus.pm_completed
+
+    stage_progress = stage_progress.model_copy(
+        update={
+            "completed_stage_ids": sorted(completed_stage_ids),
+            "blocked_stage_ids": sorted(blocked_stage_ids),
+            "total_stages": len(stage_plan),
+        }
+    )
+
+    stage_selections = [stage_selection_by_id[stage.id] for stage in stage_plan if stage.id in stage_selection_by_id]
+    reasoning_trace.extend(trace_events)
+
+    emit_trace_event(
+        trace_logger,
+        event="pm_stage_run",
         request_id=request_id,
+        stage="multi_agent.product_manager",
+        payload={
+            "use_case_id": selected_use_case.id,
+            "pm_status": pm_status.value,
+            "stages_total": len(stage_plan),
+            "stages_completed": len(stage_progress.completed_stage_ids),
+            "stages_blocked": len(stage_progress.blocked_stage_ids),
+            "clarifications_used": clarification_state.attempts_used,
+            "llm_calls_trace_items": len(trace_events),
+        },
     )
-    if architecture_plan is None:
-        missing_user_inputs = _safe_list(
-            missing_user_inputs + ["Unable to produce architecture plan from current evidence."]
+
+    if pm_status in (PMStatus.pm_blocked_waiting_user, PMStatus.pm_failed_no_solution):
+        partial_plan = _derive_architecture_plan(
+            use_case=selected_use_case,
+            stage_plan=stage_plan,
+            selections=[item for item in stage_selections if item.gate_passed],
+            missing_information=missing_user_inputs,
         )
-        routing_signals.append("pm_no_actionable_plan")
+        proposed_nodes = _derive_proposed_nodes(
+            stage_plan=stage_plan,
+            selections=[item for item in stage_selections if item.gate_passed],
+        )
         workflow_context = WorkflowContext(
             use_case_id=selected_use_case.id,
             planning_ready=False,
             handoff_target=None,
-            required_node_types=[node.node_type for node in required_nodes],
+            required_node_types=[node.node_type for node in partial_plan.required_nodes],
             unresolved_inputs=missing_user_inputs,
-            notes=["architecture_plan_generation_failed"],
+            notes=[
+                f"pm_status={pm_status.value}",
+                f"completed_stages={len(stage_progress.completed_stage_ids)}",
+            ],
         )
         return {
             "current_stage": "product_manager_agent",
-            "architecture_plan": None,
+            "pm_status": pm_status,
+            "pm_stage_plan": stage_plan,
+            "pm_stage_selections": stage_selections,
+            "pm_stage_progress": stage_progress,
+            "pm_clarification_state": clarification_state,
+            "pm_stage_search_history": stage_search_history,
+            "pm_reasoning_trace_full": reasoning_trace,
+            "architecture_plan": partial_plan,
             "workflow_context": workflow_context,
-            "planning_summary": planning_summary,
+            "planning_summary": _planning_summary(
+                use_case=selected_use_case,
+                stage_plan=stage_plan,
+                selections=stage_selections,
+                pm_status=pm_status,
+            ),
             "missing_user_inputs": missing_user_inputs,
             "routing_signals": routing_signals,
             "target_stage": None,
-            "proposed_nodes": [],
+            "proposed_nodes": proposed_nodes,
             "required_credentials": [],
         }
 
-    missing_user_inputs = _safe_list(
-        missing_user_inputs + list(architecture_plan.missing_information)
+    architecture_plan = _derive_architecture_plan(
+        use_case=selected_use_case,
+        stage_plan=stage_plan,
+        selections=stage_selections,
+        missing_information=missing_user_inputs,
     )
-    planning_ready = bool(architecture_plan.stages and required_nodes)
-    target_stage = AgentStage.engineer_agent if planning_ready else None
-    proposed_nodes = _derive_proposed_nodes_from_plan(architecture_plan) if planning_ready else []
-    required_credentials = []
-    if planning_ready:
-        routing_signals.append("handoff_ready_engineer")
-    else:
-        routing_signals.append("pm_no_actionable_plan")
+    proposed_nodes = _derive_proposed_nodes(stage_plan=stage_plan, selections=stage_selections)
+
     workflow_context = WorkflowContext(
         use_case_id=selected_use_case.id,
-        planning_ready=planning_ready,
-        handoff_target=target_stage,
-        required_node_types=[node.node_type for node in required_nodes],
+        planning_ready=True,
+        handoff_target=AgentStage.engineer_agent,
+        required_node_types=[node.node_type for node in architecture_plan.required_nodes],
         unresolved_inputs=missing_user_inputs,
         notes=[
-            f"retrieved_doc_chunks={len(docs_chunks)}",
-            f"required_nodes={len(required_nodes)}",
+            f"pm_status={pm_status.value}",
+            f"stages={len(stage_plan)}",
+            f"required_nodes={len(architecture_plan.required_nodes)}",
         ],
     )
-
-    trace_logger.info(
-        (
-            "product manager planning: request_id=%s use_case=%s docs=%d required_nodes=%d "
-            "planning_ready=%s dropped_tool_only=%d"
-        ),
-        request_id or "-",
-        selected_use_case.id,
-        len(docs_chunks),
-        len(required_nodes),
-        planning_ready,
-        len(dropped_tool_only_nodes),
-    )
+    if "handoff_ready_engineer" not in routing_signals:
+        routing_signals.append("handoff_ready_engineer")
 
     return {
         "current_stage": "product_manager_agent",
+        "pm_status": PMStatus.pm_completed,
+        "pm_stage_plan": stage_plan,
+        "pm_stage_selections": stage_selections,
+        "pm_stage_progress": stage_progress,
+        "pm_clarification_state": clarification_state,
+        "pm_stage_search_history": stage_search_history,
+        "pm_reasoning_trace_full": reasoning_trace,
         "architecture_plan": architecture_plan,
         "workflow_context": workflow_context,
-        "planning_summary": planning_summary,
+        "planning_summary": _planning_summary(
+            use_case=selected_use_case,
+            stage_plan=stage_plan,
+            selections=stage_selections,
+            pm_status=PMStatus.pm_completed,
+        ),
         "missing_user_inputs": missing_user_inputs,
         "routing_signals": routing_signals,
-        "target_stage": target_stage,
+        "target_stage": AgentStage.engineer_agent,
         "proposed_nodes": proposed_nodes,
-        "required_credentials": required_credentials,
+        "required_credentials": [],
     }
