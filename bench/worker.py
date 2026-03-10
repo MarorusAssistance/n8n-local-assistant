@@ -9,8 +9,9 @@ from typing import Dict, List
 from uuid import uuid4
 
 from .adapter import PipelineAdapter
-from .checks import load_catalog, run_checks
+from .checks import run_checks
 from .io import append_jsonl, ensure_dir, load_cases, load_experiments, relpath_str, write_json, write_text
+from .trace import entries_for_request, parse_trace_file
 
 
 def _parse_args() -> argparse.Namespace:
@@ -43,13 +44,13 @@ def run_worker(args: argparse.Namespace) -> int:
         warmup_count = target.warmup
         repetitions = target.repetitions
 
-    catalog = load_catalog(Path("nodes.json"), Path("credentials.json"))
     adapter = PipelineAdapter(
         adapter=target.adapter,
         http_base_url=args.http_base_url,
         model=args.model,
     )
     runs_path = run_dir / "runs.jsonl"
+    trace_log_file = run_dir / "logs" / "raw" / f"{target.name}.log"
 
     try:
         for case in cases:
@@ -57,12 +58,12 @@ def run_worker(args: argparse.Namespace) -> int:
                 run_dir=run_dir,
                 runs_path=runs_path,
                 adapter=adapter,
-                catalog=catalog,
                 experiment_name=target.name,
                 case=case,
                 warmup_count=warmup_count,
                 repetitions=repetitions,
                 experiment_json_only=target.json_only,
+                trace_log_file=trace_log_file,
             )
     finally:
         adapter.close()
@@ -74,12 +75,12 @@ def _run_case(
     run_dir: Path,
     runs_path: Path,
     adapter: PipelineAdapter,
-    catalog,
     experiment_name: str,
     case,
     warmup_count: int,
     repetitions: int,
     experiment_json_only: bool,
+    trace_log_file: Path | None,
 ) -> None:
     items: List[Dict[str, int | bool]] = []
     for rep in range(1, warmup_count + 1):
@@ -118,11 +119,15 @@ def _run_case(
         check_result = run_checks(
             adapter_response.assistant_text,
             case=case,
-            catalog=catalog,
+            trace_entries=_load_trace_entries_for_run(
+                trace_log_file=trace_log_file,
+                trace_request_id=trace_request_id,
+                conversation_id=conv_id,
+            ),
         )
 
         workflow_path = None
-        workflow_payload = check_result.get("workflow")
+        workflow_payload = check_result.get("payload")
         if isinstance(workflow_payload, dict):
             workflow_path = run_dir / "workflows" / experiment_name / case.id / f"{rep_label}.json"
             write_json(workflow_path, workflow_payload)
@@ -142,6 +147,7 @@ def _run_case(
         record = {
             "experiment": experiment_name,
             "case_id": case.id,
+            "stage": case.stage,
             "rep": rep,
             "is_warmup": is_warmup,
             "conversation_id": conv_id,
@@ -167,6 +173,27 @@ def _run_case(
             },
         }
         append_jsonl(runs_path, record)
+
+
+def _load_trace_entries_for_run(
+    *,
+    trace_log_file: Path | None,
+    trace_request_id: str,
+    conversation_id: str,
+) -> List:
+    if trace_log_file is None:
+        return []
+    if not trace_log_file.exists():
+        return []
+    try:
+        entries = parse_trace_file(trace_log_file)
+    except Exception:
+        return []
+    return entries_for_request(
+        entries,
+        request_id=trace_request_id,
+        conversation_id=conversation_id,
+    )
 
 
 def main() -> int:

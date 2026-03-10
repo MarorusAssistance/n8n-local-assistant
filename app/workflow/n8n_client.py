@@ -35,15 +35,26 @@ class N8NClient:
         except Exception as exc:  # pragma: no cover - defensive
             raise N8NClientError("Invalid N8N_WORKFLOW_ENDPOINT_TEMPLATE") from exc
 
-    def get_workflow(self, workflow_id: str) -> Dict[str, Any]:
-        endpoint = self._endpoint(workflow_id)
+    def _workflows_endpoint(self) -> str:
+        token = "{workflow_id}"
+        if token in self.endpoint_template:
+            prefix = self.endpoint_template.split(token)[0]
+            return prefix.rstrip("/")
+        raise N8NClientError("Invalid N8N_WORKFLOW_ENDPOINT_TEMPLATE")
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         try:
             with httpx.Client(
                 base_url=self.base_url,
                 headers=self._headers(),
                 timeout=self.timeout_seconds,
             ) as client:
-                response = client.get(endpoint)
+                response = client.request(method, endpoint, json=payload)
                 response.raise_for_status()
                 data = response.json()
         except httpx.TimeoutException as exc:
@@ -59,3 +70,12 @@ class N8NClient:
         if not isinstance(data, dict):
             raise N8NClientError("Unexpected n8n response format")
         return data
+
+    def get_workflow(self, workflow_id: str) -> Dict[str, Any]:
+        return self._request("GET", self._endpoint(workflow_id))
+
+    def create_workflow(self, workflow_payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", self._workflows_endpoint(), payload=workflow_payload)
+
+    def update_workflow(self, workflow_id: str, workflow_payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("PATCH", self._endpoint(workflow_id), payload=workflow_payload)

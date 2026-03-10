@@ -9,7 +9,7 @@ from .runner import regenerate_report, run_benchmarks
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m bench",
-        description="Phase 1 Quality Harness for n8n workflow JSON generation.",
+        description="Phase 1 Quality Harness for multi-agent reasoning quality.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Run completed: {run_dir}")
         print(f"Summary: {run_dir / 'summary.csv'}")
+        print(f"Stage metrics: {run_dir / 'stage_metrics.csv'}")
         print(f"Report: {run_dir / 'report.html'}")
         print(f"Logs report: {run_dir / 'logs' / 'report.html'}")
         return 0
@@ -52,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "report":
         outputs = regenerate_report(Path(args.run_dir))
         print(f"Summary: {outputs['summary_csv']}")
+        stage_path = outputs.get("stage_metrics_csv")
+        if stage_path:
+            print(f"Stage metrics: {stage_path}")
         print(f"Report: {outputs['report_html']}")
         logs_path = outputs.get("logs_report_html")
         if logs_path:

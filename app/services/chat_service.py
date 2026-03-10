@@ -10,6 +10,7 @@ from fastapi import HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from ..config import settings
+from ..core.json_sanitize import safe_json_dumps, sanitize_for_json
 from ..db import check_db
 from ..features.chat import ChatModePolicy, ChatUseCaseInput, HandleChatUseCase
 from ..graphs import MasterGraphRuntime
@@ -198,6 +199,7 @@ class ChatService:
                 self._handle_reasoning_plan_only_langgraph(
                     request=chat_input.request,
                     user_message=str(chat_input.user_message or ""),
+                    existing_workflow=chat_input.active_workflow_id,
                     conversation_id=chat_input.conversation_id,
                     generated_conversation_id=chat_input.generated_conversation_id,
                     http_response=http_response,
@@ -208,6 +210,7 @@ class ChatService:
                 else self._handle_reasoning_plan_only(
                     request=chat_input.request,
                     user_message=str(chat_input.user_message or ""),
+                    existing_workflow=chat_input.active_workflow_id,
                     conversation_id=chat_input.conversation_id,
                     generated_conversation_id=chat_input.generated_conversation_id,
                     http_response=http_response,
@@ -307,6 +310,7 @@ class ChatService:
                 return self._handle_reasoning_plan_only_langgraph(
                     request=request,
                     user_message=user_message,
+                    existing_workflow=None,
                     conversation_id=conversation_id,
                     generated_conversation_id=generated_conversation_id,
                     http_response=http_response,
@@ -316,6 +320,7 @@ class ChatService:
             return self._handle_reasoning_plan_only(
                 request=request,
                 user_message=user_message,
+                existing_workflow=None,
                 conversation_id=conversation_id,
                 generated_conversation_id=generated_conversation_id,
                 http_response=http_response,
@@ -446,6 +451,7 @@ class ChatService:
         self,
         request: ChatCompletionRequest,
         user_message: str,
+        existing_workflow: Optional[str],
         conversation_id: Optional[str],
         generated_conversation_id: bool,
         http_response: Optional[Response],
@@ -459,7 +465,7 @@ class ChatService:
                 user_prompt=user_message,
                 model=request.model,
                 request_id=request_id,
-                existing_workflow=None,
+                existing_workflow=existing_workflow,
             )
         except Exception as exc:
             self._logger.exception("reasoning pipeline failed")
@@ -492,7 +498,8 @@ class ChatService:
                 "checker": result.checker.model_dump(exclude_none=True),
             }
 
-        assistant_text_raw = json.dumps(payload, ensure_ascii=False)
+        payload = sanitize_for_json(payload)
+        assistant_text_raw, payload = safe_json_dumps(payload)
         model = resolve_model(request.model)
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
@@ -517,6 +524,7 @@ class ChatService:
         self,
         request: ChatCompletionRequest,
         user_message: str,
+        existing_workflow: Optional[str],
         conversation_id: Optional[str],
         generated_conversation_id: bool,
         http_response: Optional[Response],
@@ -538,7 +546,7 @@ class ChatService:
                 user_prompt=user_message,
                 model=request.model,
                 request_id=request_id,
-                existing_workflow=None,
+                existing_workflow=existing_workflow,
                 run_config=run_config,
             )
         except Exception as exc:
@@ -552,6 +560,7 @@ class ChatService:
             return self._handle_reasoning_plan_only(
                 request=request,
                 user_message=user_message,
+                existing_workflow=existing_workflow,
                 conversation_id=conversation_id,
                 generated_conversation_id=generated_conversation_id,
                 http_response=http_response,
@@ -571,6 +580,25 @@ class ChatService:
             discovered_use_cases = list(getattr(result, "discovered_use_cases", []) or [])
             selected_use_case = getattr(result, "selected_use_case", None)
             alternative_use_cases = list(getattr(result, "alternative_use_cases", []) or [])
+            architecture_plan = getattr(result, "architecture_plan", None)
+            workflow_context = getattr(result, "workflow_context", None)
+            proposed_nodes = list(getattr(result, "proposed_nodes", []) or [])
+            required_credentials = list(getattr(result, "required_credentials", []) or [])
+            workflow_draft = getattr(result, "workflow_draft", None)
+            workflow_versions = list(getattr(result, "workflow_versions", []) or [])
+            node_implementation_queue = list(getattr(result, "node_implementation_queue", []) or [])
+            implemented_nodes = list(getattr(result, "implemented_nodes", []) or [])
+            blocked_nodes = list(getattr(result, "blocked_nodes", []) or [])
+            variable_registry = list(getattr(result, "variable_registry", []) or [])
+            missing_user_input_details = list(getattr(result, "missing_user_input_details", []) or [])
+            implementation_status = getattr(result, "implementation_status", None)
+            engineer_notes = list(getattr(result, "engineer_notes", []) or [])
+            active_workflow_id = getattr(result, "active_workflow_id", None)
+            active_workflow_name = getattr(result, "active_workflow_name", None)
+            active_workflow_url = getattr(result, "active_workflow_url", None)
+            workflow_persisted = bool(getattr(result, "workflow_persisted", False))
+            workflow_persist_action = getattr(result, "workflow_persist_action", None)
+            workflow_api_sync_result = getattr(result, "workflow_api_sync_result", {}) or {}
             payload = {
                 "entry_intent": entry_intent_value,
                 "target_stage": target_stage_value,
@@ -597,6 +625,73 @@ class ChatService:
                     for item in alternative_use_cases
                 ],
                 "selection_reason": getattr(result, "selection_reason", None),
+                "architecture_plan": (
+                    architecture_plan.model_dump(exclude_none=True)
+                    if hasattr(architecture_plan, "model_dump")
+                    else architecture_plan
+                ),
+                "workflow_context": (
+                    workflow_context.model_dump(exclude_none=True)
+                    if hasattr(workflow_context, "model_dump")
+                    else workflow_context
+                ),
+                "planning_summary": getattr(result, "planning_summary", None),
+                "proposed_nodes": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in proposed_nodes
+                ],
+                "required_credentials": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in required_credentials
+                ],
+                "workflow_draft": (
+                    workflow_draft.model_dump(exclude_none=True)
+                    if hasattr(workflow_draft, "model_dump")
+                    else workflow_draft
+                ),
+                "workflow_versions": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in workflow_versions
+                ],
+                "node_implementation_queue": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in node_implementation_queue
+                ],
+                "implemented_nodes": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in implemented_nodes
+                ],
+                "blocked_nodes": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in blocked_nodes
+                ],
+                "variable_registry": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in variable_registry
+                ],
+                "missing_user_input_details": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in missing_user_input_details
+                ],
+                "implementation_status": (
+                    implementation_status.value
+                    if hasattr(implementation_status, "value")
+                    else implementation_status
+                ),
+                "engineer_notes": engineer_notes,
+                "active_workflow_id": active_workflow_id,
+                "active_workflow_name": active_workflow_name,
+                "active_workflow_url": active_workflow_url,
+                "workflow_persisted": workflow_persisted,
+                "workflow_persist_action": workflow_persist_action,
+                "workflow_api_sync_result": workflow_api_sync_result,
+                "workflow_reference": {
+                    "id": active_workflow_id,
+                    "name": active_workflow_name,
+                    "url": active_workflow_url,
+                    "persisted": workflow_persisted,
+                    "action": workflow_persist_action,
+                },
                 "status": str(getattr(result, "status", "unknown_terminal")),
             }
             self._trace_logger.info(
@@ -632,7 +727,8 @@ class ChatService:
                     "checker": result.checker.model_dump(exclude_none=True),
                 }
 
-        assistant_text_raw = json.dumps(payload, ensure_ascii=False)
+        payload = sanitize_for_json(payload)
+        assistant_text_raw, payload = safe_json_dumps(payload)
         model = resolve_model(request.model)
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)

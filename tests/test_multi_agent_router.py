@@ -117,3 +117,34 @@ def test_direct_build_requests_route_to_product_manager(
     assert result.entry_intent == EntryIntent.workflow_build_request
     assert result.target_stage == AgentStage.product_manager_agent
 
+
+def test_router_prioritizes_fix_with_contradictory_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    query = (
+        "Build a brand new automation and also explain best practices, "
+        "but right now fix this broken workflow that fails with timeout and errors."
+    )
+    result = _route_with_heuristics(monkeypatch, query)
+    assert result.entry_intent == EntryIntent.workflow_fix_request
+    assert result.target_stage == AgentStage.qa_agent
+
+
+def test_router_long_noisy_prompt_keeps_stable_technical_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    noisy = " lorem ipsum 12345 ??? " * 60
+    query = (
+        f"{noisy}\nUser: workflow execution failed.\nAssistant: where?\n"
+        "User: HTTP Request node timeout error, please debug and repair it.\n"
+        f"{noisy}"
+    )
+    result = _route_with_heuristics(monkeypatch, query)
+    assert result.entry_intent == EntryIntent.workflow_fix_request
+    assert result.target_stage == AgentStage.qa_agent
+
+
+def test_router_short_ambiguous_input_adds_unknown_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _route_with_heuristics(monkeypatch, "ok?")
+    assert result.entry_intent == EntryIntent.unknown
+    assert result.target_stage is None
+    assert "fallback_unknown" in result.routing_signals
+    assert result.missing_user_inputs

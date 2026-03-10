@@ -17,8 +17,9 @@ The backend uses a modular vertical-slice architecture:
 - Reasoning and workflow execution are routed through `MasterGraphRuntime`.
 - Reasoning runtime in LangGraph now uses a multi-agent entry graph:
   - `entry_router` (structured intent classification)
-  - `commercial_agent` with discovery + value-first use-case prioritization + handoff-ready state
-  - stub stages: `consultant_agent`, `product_manager_agent`, `engineer_agent`, `qa_agent`
+  - `commercial_agent` with discovery + value-first use-case prioritization
+  - `product_manager_agent` with architecture planning and strict evidence-backed required node selection from retrieved API docs
+  - stub stages: `consultant_agent`, `engineer_agent`, `qa_agent`
   - terminal `unknown` route without forced stage.
 - Legacy reasoning fallback remains only for emergency mode when
   `LANGGRAPH_EMERGENCY_LEGACY_FALLBACK=true`.

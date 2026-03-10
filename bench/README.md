@@ -1,44 +1,8 @@
-# Phase 1 Quality Harness (n8n JSON estricto)
+# Phase 1 Quality Harness (Router + Commercial + Product Manager)
 
-Harness opt-in para evaluar la salida del asistente (`/v1/chat/completions`) contra checks deterministas de workflow n8n importable y comparar experimentos por metricas y logs.
+Harness opt-in para evaluar end-to-end `POST /v1/chat/completions` con contrato JSON multi-agent (router/commercial/product_manager), comparar experimentos por `env_overrides` sin tocar `.env`, y puntuar compliance determinista.
 
-## Archivos de entrada
-
-- `bench/cases.yaml`: casos de benchmark.
-- `bench/experiments.yaml`: variantes de configuracion con `env_overrides`.
-
-Formato base de `cases.yaml`:
-
-```yaml
-- id: caso_unico
-  user_message: "Prompt del usuario"
-  json_only: true
-  requirements:
-    - type: must_include_node_type
-      value: n8n-nodes-base.webhook
-  limits:
-    max_nodes: 30
-```
-
-`requirements.type` soportados:
-
-- `must_include_node_type`
-- `must_include_keyword_in_node_params`
-- `must_have_schedule_daily_at`
-- `must_have_connection`
-
-Formato base de `experiments.yaml`:
-
-```yaml
-- name: baseline
-  env_overrides: {}
-  warmup: 1
-  repetitions: 3
-  adapter: direct
-  json_only: false
-```
-
-## Ejecucion
+## Ejecutar
 
 Full:
 
@@ -46,7 +10,7 @@ Full:
 python -m bench run --cases bench/cases.yaml --experiments bench/experiments.yaml --out bench/results
 ```
 
-Quick (subset + 1 repetition):
+Quick (primeros `N` casos, `repetitions=1`, `warmup=0`):
 
 ```bash
 python -m bench run --quick
@@ -58,69 +22,93 @@ Regenerar reportes:
 python -m bench report --in bench/results/<timestamp>_<gitsha>
 ```
 
-## Env overrides sin tocar `.env`
+## Casos (`bench/cases.yaml`)
 
-- Cada experimento se ejecuta en subprocess aislado.
-- `env_overrides` se aplica solo al proceso del experimento.
-- El `.env` real no se modifica.
-- Para trazas, el runner aplica defaults por experimento (si no estan en overrides):
-  - `TRACE_LOG_ENABLED=true`
-  - `TRACE_LOG_LEVEL=INFO`
-  - `TRACE_LOG_FILE=.../logs/raw/<experiment>.log`
-  - `TRACE_LOG_MAX_BYTES=200000000`
-  - `TRACE_LOG_BACKUPS=1`
-  - `RETRIEVAL_DEBUG=true`
+Formato:
 
-## Artifacts de salida
+```yaml
+- id: router_fix_beats_edit
+  stage: router|commercial|product_manager
+  user_message: "prompt"
+  json_only: true
+  requirements:
+    - type: must_equal_field
+      value: { path: entry_intent, equals: workflow_fix_request }
+  limits:
+    max_missing_user_inputs: 3
+```
 
-Cada run crea `results/<timestamp>_<gitsha>/` con:
+`requirements.type` soportados:
+
+- `must_equal_field`
+- `must_not_equal_field`
+- `must_be_null_field`
+- `must_not_be_null_field`
+- `must_include_routing_signal`
+- `must_not_include_routing_signal`
+- `must_have_required_nodes_min`
+- `must_have_required_nodes_with_evidence`
+- `must_not_include_workflow_json_keys`
+- `must_have_planning_ready`
+- `must_have_handoff_target`
+
+`limits` soportados:
+
+- `max_missing_user_inputs`
+
+## Experimentos (`bench/experiments.yaml`)
+
+Cada experimento corre aislado en subprocess:
+
+```yaml
+- name: baseline_langgraph
+  env_overrides:
+    AGENT_RUNTIME: langgraph
+    REASONING_PIPELINE_ENABLED: "true"
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: true
+```
+
+No hace falta editar `.env`: `env_overrides` solo aplica al subprocess del experimento.
+
+## Scoring (0..100)
+
+Secciones:
+
+- `json_parse_ok` (15)
+- `router_routing_graph` (20)
+- `commercial_selection` (20)
+- `product_manager_planning` (20)
+- `planning_safety_guardrails` (10)
+- `retrieval_trace_checks` (15)
+
+Si `json_parse_ok=false`, score final `0` (short-circuit).
+
+## Artifacts
+
+En `bench/results/<run_id>/`:
 
 - `runs.jsonl`
 - `summary.csv`
+- `stage_metrics.csv`
 - `report.html`
 - `logs/report.html`
-- `workflows/<experiment>/<case_id>/<rep>.json` (si parsea)
-- `responses/<experiment>/<case_id>/<rep>.txt`
-- `checks/<experiment>/<case_id>/<rep>.json`
-- `diffs/<case_id>/<baseline>__vs__<experiment>__rep1.html`
+- `responses/<experiment>/<case>/<rep>.txt`
+- `workflows/<experiment>/<case>/<rep>.json` (payload parseado del contrato)
+- `checks/<experiment>/<case>/<rep>.json`
+- `diffs/...` y `logs/diffs/...`
 - `logs/raw/<experiment>.log`
-- `logs/slices/<experiment>/<case_id>/<rep>.log`
-- `logs/events/<experiment>/<case_id>/<rep>.json`
-- `logs/prompts/<experiment>/<case_id>/<rep>.json`
-- `logs/html/<experiment>/<case_id>/<rep>.html`
-- `logs/diffs/<case_id>/<baseline>__vs__<experiment>__rep1_prompts.html`
+- `logs/slices/...`
+- `logs/events/...`
+- `logs/prompts/...`
+- `logs/html/...`
 
-## Compliance score
+## Lectura rapida de resultados
 
-Escala `0..100`:
-
-- `json_parse_ok`: 20
-- `workflow_min_schema`: 20
-- `node_types_exist`: 20
-- `credentials_shape_and_existence`: 15
-- `credential_compatibility`: 10
-- `requirements_and_limits`: 15
-
-Si `json_parse_ok=false`, score final `0` y resto de checks marcado como `skipped_due_parse_failure`.
-
-## Logs: que se captura
-
-- Prompt/response del request (`TRACE REQUEST` / `TRACE RESPONSE`).
-- Eventos estructurados `TRACE EVENT` para llamadas LLM por etapa (`llm_prompt`, `llm_output`).
-- Retrieval final estructurado (`retrieval_final`) con chunks y linked defs.
-- Eventos legacy de budget/fallback/reasoning para timeline.
-- Redaccion ligera en artifacts de bench (tokens/secrets comunes enmascarados).
-
-## Interpretacion rapida
-
-- `report.html`: comparativa de calidad/latencia + links a artifacts.
-- `logs/report.html`: comparativa de observabilidad (llm_calls, prompt_chars, retrieval_chunks, budget trims, etc.).
-- `logs/html/...`: vista por run tipo pagina dedicada con:
-  - prompts agrupados por `stage` y rol (`system/user/assistant`)
-  - retrieval pre-rerank y post-rerank
-  - linked defs de `nodes.json` y `credentials.json` separadas
-  - solo `score + content` para evitar ruido visual.
-
-## Nota importante
-
-Con la configuracion actual del repo, el camino docs-only puede devolver `PlanSpec` en vez de workflow n8n importable. En contrato estricto, eso baja la compliance salvo experimentos que cambien runtime/prompt.
+- `summary.csv`: error rate, latencia p50/p95, compliance p50/p95 por experimento.
+- `stage_metrics.csv`: metricas de router/commercial/product_manager y parse rate transversal.
+- `report.html`: comparacion por experimento y por caso con links a artifacts.
+- `logs/report.html`: metricas derivadas de trazas y links a logs por run.
+- `logs/html/...`: vista de prompts por etapa y retrieval pre/post-rerank.

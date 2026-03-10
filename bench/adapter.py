@@ -12,7 +12,9 @@ from .models import AdapterType
 
 
 JSON_ONLY_INSTRUCTION = (
-    "Responde SOLO con JSON valido de workflow n8n importable, sin markdown ni texto adicional."
+    "Responde SOLO con JSON valido del contrato multi-agent (sin markdown ni texto adicional). "
+    "Incluye al menos: entry_intent, target_stage, confidence, routing_signals, "
+    "current_stage, missing_user_inputs y status."
 )
 
 

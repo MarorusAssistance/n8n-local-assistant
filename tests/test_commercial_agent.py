@@ -181,7 +181,7 @@ def test_multiple_use_cases_select_one_primary(
         _candidate(
             title="Customer onboarding status updates",
             business_problem="Customers ask repeatedly for onboarding status due to poor visibility.",
-            desired_outcome="Send proactive status updates at each milestone.",
+            desired_outcome="Send proactive status updates at each process step.",
             expected_value="Reduce support load and improve customer confidence.",
             feasibility="medium: milestones are documented.",
             value_score=4.1,
@@ -512,3 +512,86 @@ def test_commercial_agent_does_not_call_retrieval_or_templates(
         }
     )
     assert updates["current_stage"] == "commercial_agent"
+
+
+def test_commercial_deduplicates_candidates_deterministically() -> None:
+    duplicate = _candidate(
+        title="Invoice dispute triage",
+        business_problem="Finance team manually triages invoice disputes with long delays.",
+        desired_outcome="Route invoice disputes automatically by owner and SLA.",
+        expected_value="Reduce penalties and improve cashflow reliability.",
+        feasibility="medium",
+        value_score=4.8,
+        clarity_score=4.3,
+        actionability_score=4.1,
+    )
+    other = _candidate(
+        title="Support escalation automation",
+        business_problem="Critical tickets are escalated late and breach SLA.",
+        desired_outcome="Escalate high-priority tickets automatically.",
+        expected_value="Reduce churn and SLA penalties.",
+        feasibility="medium",
+        value_score=4.7,
+        clarity_score=4.0,
+        actionability_score=3.9,
+    )
+    output = _output(duplicate, duplicate, other)
+    discovered_1, selected_1, alternatives_1, _ = commercial.rank_and_select_use_cases(output)
+    discovered_2, selected_2, alternatives_2, _ = commercial.rank_and_select_use_cases(output)
+
+    assert len(discovered_1) == 2
+    assert len(discovered_2) == 2
+    assert selected_1 is not None and selected_2 is not None
+    assert selected_1.id == selected_2.id
+    assert [item.id for item in alternatives_1] == [item.id for item in alternatives_2]
+
+
+def test_commercial_tie_break_is_stable_by_input_order() -> None:
+    candidate_a = _candidate(
+        title="Use case A",
+        business_problem="Manual incident triage causes delays.",
+        desired_outcome="Automate incident triage routing.",
+        expected_value="Reduce delays and improve SLA.",
+        feasibility="medium",
+        value_score=4.0,
+        clarity_score=4.0,
+        actionability_score=4.0,
+    )
+    candidate_b = _candidate(
+        title="Use case B",
+        business_problem="Manual incident triage causes delays.",
+        desired_outcome="Automate incident triage routing.",
+        expected_value="Reduce delays and improve SLA.",
+        feasibility="medium",
+        value_score=4.0,
+        clarity_score=4.0,
+        actionability_score=4.0,
+    )
+    discovered, selected, _alternatives, _reason = commercial.rank_and_select_use_cases(
+        _output(candidate_a, candidate_b)
+    )
+    assert len(discovered) == 2
+    assert selected is not None
+    assert selected.title == "Use case A"
+
+
+def test_commercial_node_vague_input_does_not_fabricate_precise_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        commercial,
+        "_analyze_with_structured_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    updates = commercial.commercial_agent_node(
+        {
+            "user_query": "Maybe automate something eventually, not sure yet.",
+            "routing_signals": [],
+            "workflow_context": {"model": None, "request_id": "req-vague"},
+            "missing_user_inputs": [],
+        }
+    )
+    assert updates["current_stage"] == "commercial_agent"
+    assert updates["selected_use_case"] is None
+    assert updates["discovered_use_cases"] == []
+    assert updates["target_stage"] is None

@@ -1,31 +1,35 @@
-- name: baseline
-  env_overrides:
-    AGENT_RUNTIME: legacy
-    REASONING_PIPELINE_ENABLED: "false"
-    LANGGRAPH_REASONING_ENABLED: "false"
-    LANGGRAPH_WORKFLOW_ENABLED: "false"
-  warmup: 1
-  repetitions: 3
-  adapter: direct
-  json_only: true
-
-- name: legacy_json_only_reasoning
-  env_overrides:
-    AGENT_RUNTIME: legacy
-    REASONING_PIPELINE_ENABLED: "true"
-    LANGGRAPH_REASONING_ENABLED: "false"
-    LANGGRAPH_WORKFLOW_ENABLED: "false"
-  warmup: 1
-  repetitions: 3
-  adapter: direct
-  json_only: true
-
-- name: langgraph_json_only_reasoning
+- name: baseline_langgraph
   env_overrides:
     AGENT_RUNTIME: langgraph
     REASONING_PIPELINE_ENABLED: "true"
     LANGGRAPH_REASONING_ENABLED: "true"
     LANGGRAPH_WORKFLOW_ENABLED: "true"
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: true
+
+- name: langgraph_more_context
+  env_overrides:
+    AGENT_RUNTIME: langgraph
+    REASONING_PIPELINE_ENABLED: "true"
+    LANGGRAPH_REASONING_ENABLED: "true"
+    LANGGRAPH_WORKFLOW_ENABLED: "true"
+    TOP_K: "10"
+    RERANK_POOL_SIZE: "20"
+    CONVERSATION_MAX_TOKENS: "8192"
+  warmup: 1
+  repetitions: 3
+  adapter: direct
+  json_only: true
+
+- name: langgraph_tight_budget
+  env_overrides:
+    AGENT_RUNTIME: langgraph
+    REASONING_PIPELINE_ENABLED: "true"
+    LANGGRAPH_REASONING_ENABLED: "true"
+    LANGGRAPH_WORKFLOW_ENABLED: "true"
+    CONVERSATION_MAX_TOKENS: "2048"
   warmup: 1
   repetitions: 3
   adapter: direct

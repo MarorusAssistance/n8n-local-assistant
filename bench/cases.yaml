@@ -1,65 +1,135 @@
-- id: emails_daily_summary
+- id: router_fix_beats_edit
+  stage: router
   user_message: |
-    Necesito un workflow n8n importable que lea los correos recientes y me genere un resumen diario.
-    Debe ejecutarse todos los dias a las 08:00 y limitar el procesamiento a 10 items.
+    Edita este workflow existente para agregar un nodo IF, pero primero arregla el error
+    de timeout que rompe la ejecucion del HTTP Request.
   json_only: true
   requirements:
-    - type: must_have_schedule_daily_at
-      value: "08:00"
-    - type: must_include_node_type
-      value: n8n-nodes-base.scheduleTrigger
-    - type: must_include_keyword_in_node_params
+    - type: must_equal_field
       value:
-        key: limit
-        equals: 10
-  limits:
-    max_nodes: 30
-
-- id: webhook_to_sheets
-  user_message: |
-    Genera un workflow n8n importable que reciba leads por Webhook y los escriba en Google Sheets.
-    Quiero un flujo sencillo y listo para importar.
-  json_only: true
-  requirements:
-    - type: must_include_node_type
-      value: n8n-nodes-base.webhook
-    - type: must_include_node_type
-      value: n8n-nodes-base.googleSheets
-    - type: must_have_connection
+        path: entry_intent
+        equals: workflow_fix_request
+    - type: must_equal_field
       value:
-        from_type: n8n-nodes-base.webhook
-        to_type: n8n-nodes-base.googleSheets
-  limits:
-    max_nodes: 20
+        path: target_stage
+        equals: qa_agent
+    - type: must_include_routing_signal
+      value: fix_signals_detected
 
-- id: http_alert_slack
+- id: commercial_discovery_with_candidates
+  stage: commercial
   user_message: |
-    Crea un workflow n8n importable que llame una API con HTTP Request y envie alerta a Slack
-    cuando el status sea error.
+    Somos un equipo de operaciones con problemas en aprobaciones manuales de facturas y tambien
+    en el triaje de tickets de soporte. Queremos priorizar oportunidades de automatizacion por
+    valor de negocio y factibilidad.
   json_only: true
   requirements:
-    - type: must_include_node_type
-      value: n8n-nodes-base.httpRequest
-    - type: must_include_node_type
-      value: n8n-nodes-base.slack
-    - type: must_include_keyword_in_node_params
+    - type: must_equal_field
       value:
-        key: channel
-        contains: "#"
-  limits:
-    max_nodes: 25
+        path: entry_intent
+        equals: business_discovery_conversation
+    - type: must_not_be_null_field
+      value:
+        path: selected_use_case
+    - type: must_not_be_null_field
+      value:
+        path: selection_reason
+    - type: must_not_include_workflow_json_keys
+      value: ["nodes", "connections", "final_workflow_json"]
 
-- id: schedule_postgres_sync
+- id: product_manager_build_webhook_sheets
+  stage: product_manager
   user_message: |
-    Quiero un workflow n8n importable que ejecute una sincronizacion diaria a las 02:30
-    y haga escritura en PostgreSQL.
+    Crea una automatizacion nueva para captar leads por Webhook y registrarlos en Google Sheets.
+    Quiero pasar a implementacion tecnica despues del plan de arquitectura.
   json_only: true
   requirements:
-    - type: must_have_schedule_daily_at
-      value: "02:30"
-    - type: must_include_node_type
-      value: n8n-nodes-base.scheduleTrigger
-    - type: must_include_node_type
-      value: n8n-nodes-base.postgres
+    - type: must_equal_field
+      value:
+        path: entry_intent
+        equals: workflow_build_request
+    - type: must_have_required_nodes_min
+      value: 1
+    - type: must_have_required_nodes_with_evidence
+      value: true
+    - type: must_have_planning_ready
+      value: true
+    - type: must_have_handoff_target
+      value: engineer_agent
+    - type: must_not_include_workflow_json_keys
+      value: ["nodes", "connections", "final_workflow_json"]
   limits:
-    max_nodes: 25
+    max_missing_user_inputs: 3
+
+- id: router_unknown_short
+  stage: router
+  user_message: "Ayuda"
+  json_only: true
+  requirements:
+    - type: must_equal_field
+      value:
+        path: entry_intent
+        equals: unknown
+    - type: must_be_null_field
+      value:
+        path: target_stage
+    - type: must_include_routing_signal
+      value: fallback_unknown
+  limits:
+    max_missing_user_inputs: 3
+
+- id: router_information_route
+  stage: router
+  user_message: |
+    Explica la diferencia entre Webhook y Schedule Trigger en n8n y cuando conviene usar cada uno.
+  json_only: true
+  requirements:
+    - type: must_equal_field
+      value:
+        path: entry_intent
+        equals: information_request
+    - type: must_equal_field
+      value:
+        path: target_stage
+        equals: consultant_agent
+    - type: must_not_include_routing_signal
+      value: fix_signals_detected
+
+- id: commercial_discovery_no_actionable
+  stage: commercial
+  user_message: |
+    Queremos automatizar algo en algun momento, pero no sabemos todavia ni proceso ni objetivo.
+    Solo estamos explorando de forma muy general.
+  json_only: true
+  requirements:
+    - type: must_equal_field
+      value:
+        path: entry_intent
+        equals: business_discovery_conversation
+    - type: must_be_null_field
+      value:
+        path: selected_use_case
+    - type: must_equal_field
+      value:
+        path: alternative_use_cases
+        equals: []
+  limits:
+    max_missing_user_inputs: 4
+
+- id: product_manager_build_incident_alerts
+  stage: product_manager
+  user_message: |
+    Necesito una nueva automatizacion para incidentes: recibir evento por Webhook, aplicar reglas
+    y enviar alertas. Dame un plan de arquitectura listo para handoff al engineer.
+  json_only: true
+  requirements:
+    - type: must_equal_field
+      value:
+        path: entry_intent
+        equals: workflow_build_request
+    - type: must_have_required_nodes_min
+      value: 1
+    - type: must_have_required_nodes_with_evidence
+      value: true
+    - type: must_not_include_workflow_json_keys
+      value: ["nodes", "connections", "final_workflow_json"]

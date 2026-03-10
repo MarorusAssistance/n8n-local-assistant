@@ -1,7 +1,7 @@
-# Multi-Agent Milestone 2
+# Multi-Agent Commercial Stage
 
 ## Scope
-Milestone 2 adds real behavior to the `commercial_agent` path only.
+This stage adds real behavior to the `commercial_agent` path only.
 
 Included:
 - Extract business automation use-case candidates from discovery input.

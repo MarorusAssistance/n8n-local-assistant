@@ -363,9 +363,11 @@ def rank_and_select_use_cases(
 
 
 def commercial_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
-    workflow_context = state.get("workflow_context") or {}
-    model = workflow_context.get("model")
-    request_id = workflow_context.get("request_id")
+    runtime_context = state.get("runtime_context")
+    if not isinstance(runtime_context, dict):
+        runtime_context = state.get("workflow_context") if isinstance(state.get("workflow_context"), dict) else {}
+    model = runtime_context.get("model")
+    request_id = runtime_context.get("request_id")
 
     discovery = analyze_commercial_discovery(
         user_query=state.get("user_query") or "",
@@ -411,4 +413,3 @@ def commercial_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         "missing_user_inputs": missing_user_inputs,
         "target_stage": target_stage,
     }
-

@@ -4,17 +4,19 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        
         {
-            "name": "Python Debugger: FastAPI",
+            "name": "Python Debugger: FastAPI (.venv)",
             "type": "debugpy",
             "request": "launch",
+            "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
             "module": "uvicorn",
             "args": [
-                "app.main:app",
-                "--reload"
+                "app.main:app"
             ],
-            "jinja": true
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}\\.env",
+            "jinja": true,
+            "justMyCode": false
         }
     ]
 }

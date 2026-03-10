@@ -104,6 +104,7 @@ usuario:
     try:
         outputs = generate_report(run_dir)
         assert Path(outputs["summary_csv"]).exists()
+        assert Path(outputs["stage_metrics_csv"]).exists()
         assert Path(outputs["report_html"]).exists()
         assert Path(outputs["logs_report_html"]).exists()
 

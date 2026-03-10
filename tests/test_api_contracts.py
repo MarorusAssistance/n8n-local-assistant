@@ -8,10 +8,16 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
+    ArchitectureDataFlowItem,
+    ArchitecturePlan,
+    ArchitectureStage,
+    ImplementationStatus,
     BusinessContextSummary,
     EntryIntent,
     MultiAgentGraphResult,
+    NodeRequirement,
     UseCase,
+    WorkflowContext,
 )
 from app.main import app
 from app.memory.in_memory import InMemoryStore
@@ -29,10 +35,10 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un flujo",
         entry_intent=EntryIntent.business_discovery_conversation,
-        target_stage=AgentStage.product_manager_agent,
+        target_stage=AgentStage.engineer_agent,
         confidence=0.84,
-        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager"],
-        current_stage="commercial_agent",
+        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_engineer"],
+        current_stage="product_manager_agent",
         missing_user_inputs=[],
         business_context_summary=BusinessContextSummary(
             process_scope="Finance operations",
@@ -64,6 +70,54 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
         ),
         alternative_use_cases=[],
         selection_reason="Top business-value opportunity with clear desired outcome.",
+        architecture_plan=ArchitecturePlan(
+            use_case_id="uc_1",
+            title="Invoice approval reminders",
+            business_objective="Reduce delays in invoice approvals.",
+            desired_outcome="Automate reminders and escalation for pending approvals.",
+            workflow_summary="Three-stage architecture with intake, decisioning and delivery.",
+            stages=[
+                ArchitectureStage(
+                    id="stage_intake",
+                    name="Intake",
+                    purpose="Capture approval events",
+                    required_capabilities=["Capture events"],
+                    expected_inputs=["Approval event"],
+                    expected_outputs=["Normalized payload"],
+                    dependencies=[],
+                )
+            ],
+            data_flow=[
+                ArchitectureDataFlowItem(
+                    source_stage_id="stage_intake",
+                    target_stage_id="stage_intake",
+                    data_items=["payload"],
+                )
+            ],
+            assumptions=["Approval source emits stable events."],
+            missing_information=[],
+            implementation_notes_for_engineer=["Configure exact node parameters in engineering phase."],
+            required_nodes=[
+                NodeRequirement(
+                    node_type="n8n-nodes-base.webhook",
+                    why_required="Evidence-backed trigger node from retrieved docs.",
+                    evidence_chunk_ids=["linked:node:n8n-nodes-base.webhook"],
+                    evidence_refs=["Node: Webhook"],
+                    evidence_confidence=0.88,
+                    rerank_confidence=0.76,
+                    blended_confidence=0.85,
+                )
+            ],
+        ),
+        workflow_context=WorkflowContext(
+            use_case_id="uc_1",
+            planning_ready=True,
+            handoff_target=AgentStage.engineer_agent,
+            required_node_types=["n8n-nodes-base.webhook"],
+            unresolved_inputs=[],
+            notes=["required_nodes=1"],
+        ),
+        planning_summary="Architecture plan prepared with evidence-backed required nodes.",
         qa_enabled=True,
         needs_replan=False,
         status="stub_routed",
@@ -128,8 +182,9 @@ def test_chat_completion_contract_non_stream(monkeypatch) -> None:
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
     assert parsed["entry_intent"] == "business_discovery_conversation"
-    assert parsed["target_stage"] == "product_manager_agent"
+    assert parsed["target_stage"] == "engineer_agent"
     assert parsed["selected_use_case"]["id"] == "uc_1"
+    assert parsed["architecture_plan"]["required_nodes"][0]["node_type"] == "n8n-nodes-base.webhook"
 
 
 def test_chat_completion_contract_stream(monkeypatch) -> None:
@@ -180,3 +235,50 @@ def test_chat_completion_preserves_conversation_header(monkeypatch) -> None:
     )
     assert response.status_code == 200
     assert response.headers.get("x-conversation-id") == "conv-contract-1"
+
+
+def test_chat_completion_contract_accepts_additive_engineer_fields(monkeypatch) -> None:
+    client, _store = _client_with_store()
+    monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
+
+    result = _fake_reasoning_result().model_copy(
+        update={
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.blocked_waiting_user,
+            "missing_user_input_details": [],
+            "workflow_versions": [],
+            "active_workflow_id": "wf_contract_1",
+            "active_workflow_name": "Contract Flow",
+            "active_workflow_url": "http://localhost:5678/workflow/wf_contract_1",
+            "workflow_persisted": True,
+            "workflow_persist_action": "updated",
+            "workflow_api_sync_result": {"ok": True, "action": "updated", "id": "wf_contract_1"},
+        }
+    )
+    monkeypatch.setattr(
+        routes.chat_service._graph_runtime,  # noqa: SLF001
+        "run_reasoning",
+        lambda **kwargs: result,
+    )
+    monkeypatch.setattr("app.services.chat_service.resolve_model", lambda *_: "local-model")
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local-model",
+            "messages": [{"role": "user", "content": "Continue workflow implementation"}],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    parsed = json.loads(payload["choices"][0]["message"]["content"])
+    assert parsed["entry_intent"] == "business_discovery_conversation"
+    assert parsed["current_stage"] == "engineer_agent"
+    assert parsed["implementation_status"] == "blocked_waiting_user"
+    assert "workflow_versions" in parsed
+    assert parsed["workflow_reference"]["id"] == "wf_contract_1"
+    assert parsed["workflow_persist_action"] == "updated"
+    assert "final_workflow_json" not in parsed

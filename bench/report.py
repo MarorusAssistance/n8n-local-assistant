@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from difflib import HtmlDiff
@@ -46,6 +47,39 @@ class LogSummaryRow:
     reasoning_second_iteration_rate: float
 
 
+@dataclass(frozen=True)
+class StageMetricsRow:
+    experiment: str
+    parseable_json_contract_rate: float
+    router_intent_accuracy: float
+    router_unknown_correctness: float
+    router_fix_over_edit_correctness: float
+    commercial_top_value_selection_correctness: float
+    commercial_no_tech_invention_rate: float
+    product_manager_required_nodes_evidence_precision: float
+    product_manager_actionable_plan_validity_rate: float
+
+
+_INTENT_TO_STAGE: Dict[str, Optional[str]] = {
+    "business_discovery_conversation": "commercial_agent",
+    "workflow_build_request": "product_manager_agent",
+    "workflow_edit_request": "engineer_agent",
+    "workflow_fix_request": "qa_agent",
+    "information_request": "consultant_agent",
+    "unknown": None,
+}
+_STAGE_CANONICAL_MAP = {
+    "router": "router",
+    "commercial": "commercial",
+    "product_manager": "product_manager",
+}
+
+_COMMERCIAL_TECHNICAL_RE = re.compile(
+    r"\b(n8n|node|credential|webhook|api[_\-\s]?key|oauth|json)\b",
+    re.IGNORECASE,
+)
+
+
 def generate_report(run_dir: Path) -> Dict[str, str]:
     run_dir = run_dir.resolve()
     runs = read_jsonl(run_dir / "runs.jsonl")
@@ -55,6 +89,13 @@ def generate_report(run_dir: Path) -> Dict[str, str]:
     summary_rows = _build_summary_rows(runs, experiment_order)
     summary_csv_path = run_dir / "summary.csv"
     _write_summary_csv(summary_csv_path, summary_rows)
+    stage_rows = _build_stage_metrics_rows(
+        run_dir=run_dir,
+        runs=runs,
+        experiment_order=experiment_order,
+    )
+    stage_csv_path = run_dir / "stage_metrics.csv"
+    _write_stage_metrics_csv(stage_csv_path, stage_rows)
 
     workflow_diff_index = _generate_workflow_diffs(run_dir, runs, experiment_order)
     log_outputs = _generate_log_artifacts(run_dir, runs, experiment_order, meta)
@@ -76,6 +117,7 @@ def generate_report(run_dir: Path) -> Dict[str, str]:
     report_html = _render_report_html(
         runs=merged_runs,
         summary_rows=summary_rows,
+        stage_rows=stage_rows,
         experiment_order=experiment_order,
         workflow_diff_index=workflow_diff_index,
         prompt_diff_index=prompt_diff_index,
@@ -93,6 +135,7 @@ def generate_report(run_dir: Path) -> Dict[str, str]:
 
     return {
         "summary_csv": str(summary_csv_path),
+        "stage_metrics_csv": str(stage_csv_path),
         "report_html": str(report_html_path),
         "logs_report_html": str(logs_report_path),
     }
@@ -118,6 +161,11 @@ def _discover_experiment_order(runs: Sequence[Mapping[str, Any]]) -> List[str]:
         seen.add(name)
         order.append(name)
     return order
+
+
+def _normalize_stage(value: Any) -> str:
+    key = str(value or "").strip()
+    return _STAGE_CANONICAL_MAP.get(key, key)
 
 
 def _build_summary_rows(
@@ -192,6 +240,231 @@ def _write_summary_csv(path: Path, rows: Sequence[SummaryRow]) -> None:
                     "compliance_p95": row.compliance_p95,
                 }
             )
+
+
+def _build_stage_metrics_rows(
+    *,
+    run_dir: Path,
+    runs: Sequence[Mapping[str, Any]],
+    experiment_order: Sequence[str],
+) -> List[StageMetricsRow]:
+    non_warmup = [row for row in runs if not bool(row.get("is_warmup", False))]
+    grouped: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for row in non_warmup:
+        grouped[str(row.get("experiment") or "")].append(row)
+
+    payload_cache: Dict[str, Any] = {}
+    rows: List[StageMetricsRow] = []
+    for experiment in list(experiment_order) or sorted(grouped.keys()):
+        exp_runs = grouped.get(experiment, [])
+        if not exp_runs:
+            rows.append(
+                StageMetricsRow(
+                    experiment=experiment,
+                    parseable_json_contract_rate=0.0,
+                    router_intent_accuracy=0.0,
+                    router_unknown_correctness=0.0,
+                    router_fix_over_edit_correctness=0.0,
+                    commercial_top_value_selection_correctness=0.0,
+                    commercial_no_tech_invention_rate=0.0,
+                    product_manager_required_nodes_evidence_precision=0.0,
+                    product_manager_actionable_plan_validity_rate=0.0,
+                )
+            )
+            continue
+
+        parse_ok_count = sum(1 for row in exp_runs if bool(row.get("parse_ok", False)))
+        parse_rate = parse_ok_count / max(1, len(exp_runs))
+
+        router_total = 0
+        router_ok = 0
+        router_unknown_total = 0
+        router_unknown_ok = 0
+        router_fix_edit_total = 0
+        router_fix_edit_ok = 0
+
+        commercial_top_total = 0
+        commercial_top_ok = 0
+        commercial_notech_total = 0
+        commercial_notech_ok = 0
+
+        pm_nodes_total = 0
+        pm_nodes_with_evidence = 0
+        pm_actionable_total = 0
+        pm_actionable_ok = 0
+
+        for run_row in exp_runs:
+            payload = _load_payload_for_run(run_dir, run_row, payload_cache)
+            if not isinstance(payload, Mapping):
+                continue
+
+            stage = _normalize_stage(run_row.get("stage"))
+            if stage == "router":
+                intent = str(payload.get("entry_intent") or "")
+                target_stage = payload.get("target_stage")
+                expected_stage = _INTENT_TO_STAGE.get(intent)
+                if intent:
+                    router_total += 1
+                    if target_stage == expected_stage and (intent != "unknown" or target_stage is None):
+                        router_ok += 1
+
+                if intent == "unknown":
+                    router_unknown_total += 1
+                    if target_stage is None:
+                        router_unknown_ok += 1
+
+                signals = payload.get("routing_signals")
+                if isinstance(signals, list) and "fix_signals_detected" in signals and "edit_signals_detected" in signals:
+                    router_fix_edit_total += 1
+                    if intent == "workflow_fix_request":
+                        router_fix_edit_ok += 1
+
+            if stage == "commercial":
+                selected = payload.get("selected_use_case")
+                alternatives = payload.get("alternative_use_cases")
+                discovered = payload.get("discovered_use_cases")
+                if isinstance(selected, Mapping) and isinstance(alternatives, list):
+                    selected_score = selected.get("priority_score")
+                    alt_scores = [
+                        item.get("priority_score")
+                        for item in alternatives
+                        if isinstance(item, Mapping)
+                    ]
+                    if isinstance(selected_score, (int, float)) and all(
+                        isinstance(score, (int, float)) for score in alt_scores
+                    ):
+                        commercial_top_total += 1
+                        if not alt_scores or float(selected_score) >= max(float(score) for score in alt_scores):
+                            commercial_top_ok += 1
+
+                text_fields: List[str] = []
+                if isinstance(discovered, list):
+                    for item in discovered:
+                        if not isinstance(item, Mapping):
+                            continue
+                        text_fields.extend(
+                            str(item.get(key) or "")
+                            for key in ("title", "business_problem", "desired_outcome")
+                        )
+                if isinstance(selected, Mapping):
+                    text_fields.extend(
+                        str(selected.get(key) or "")
+                        for key in ("title", "business_problem", "desired_outcome")
+                    )
+                if text_fields:
+                    commercial_notech_total += 1
+                    if not _COMMERCIAL_TECHNICAL_RE.search(" ".join(text_fields)):
+                        commercial_notech_ok += 1
+
+            if stage == "product_manager":
+                architecture_plan = payload.get("architecture_plan")
+                if isinstance(architecture_plan, Mapping):
+                    required_nodes = architecture_plan.get("required_nodes")
+                    if isinstance(required_nodes, list):
+                        for node in required_nodes:
+                            if not isinstance(node, Mapping):
+                                continue
+                            pm_nodes_total += 1
+                            chunk_ids = node.get("evidence_chunk_ids")
+                            refs = node.get("evidence_refs")
+                            if (
+                                isinstance(chunk_ids, list)
+                                and isinstance(refs, list)
+                                and bool(chunk_ids or refs)
+                            ):
+                                pm_nodes_with_evidence += 1
+
+                workflow_context = payload.get("workflow_context")
+                if isinstance(workflow_context, Mapping) and workflow_context.get("planning_ready") is True:
+                    pm_actionable_total += 1
+                    handoff_target = workflow_context.get("handoff_target")
+                    if (
+                        payload.get("target_stage") == "engineer_agent"
+                        and handoff_target == "engineer_agent"
+                        and isinstance(payload.get("architecture_plan"), Mapping)
+                    ):
+                        pm_actionable_ok += 1
+
+        rows.append(
+            StageMetricsRow(
+                experiment=experiment,
+                parseable_json_contract_rate=round(parse_rate, 6),
+                router_intent_accuracy=round(router_ok / max(1, router_total), 6),
+                router_unknown_correctness=round(router_unknown_ok / max(1, router_unknown_total), 6),
+                router_fix_over_edit_correctness=round(router_fix_edit_ok / max(1, router_fix_edit_total), 6),
+                commercial_top_value_selection_correctness=round(commercial_top_ok / max(1, commercial_top_total), 6),
+                commercial_no_tech_invention_rate=round(commercial_notech_ok / max(1, commercial_notech_total), 6),
+                product_manager_required_nodes_evidence_precision=round(
+                    pm_nodes_with_evidence / max(1, pm_nodes_total),
+                    6,
+                ),
+                product_manager_actionable_plan_validity_rate=round(
+                    pm_actionable_ok / max(1, pm_actionable_total),
+                    6,
+                ),
+            )
+        )
+    return rows
+
+
+def _write_stage_metrics_csv(path: Path, rows: Sequence[StageMetricsRow]) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "experiment",
+                "parseable_json_contract_rate",
+                "router_intent_accuracy",
+                "router_unknown_correctness",
+                "router_fix_over_edit_correctness",
+                "commercial_top_value_selection_correctness",
+                "commercial_no_tech_invention_rate",
+                "product_manager_required_nodes_evidence_precision",
+                "product_manager_actionable_plan_validity_rate",
+            ],
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "experiment": row.experiment,
+                    "parseable_json_contract_rate": row.parseable_json_contract_rate,
+                    "router_intent_accuracy": row.router_intent_accuracy,
+                    "router_unknown_correctness": row.router_unknown_correctness,
+                    "router_fix_over_edit_correctness": row.router_fix_over_edit_correctness,
+                    "commercial_top_value_selection_correctness": row.commercial_top_value_selection_correctness,
+                    "commercial_no_tech_invention_rate": row.commercial_no_tech_invention_rate,
+                    "product_manager_required_nodes_evidence_precision": row.product_manager_required_nodes_evidence_precision,
+                    "product_manager_actionable_plan_validity_rate": row.product_manager_actionable_plan_validity_rate,
+                }
+            )
+
+
+def _load_payload_for_run(
+    run_dir: Path,
+    run_row: Mapping[str, Any],
+    cache: Dict[str, Any],
+) -> Any:
+    artifacts = run_row.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        return None
+    workflow_rel = artifacts.get("workflow")
+    if not workflow_rel:
+        return None
+    key = str(workflow_rel)
+    if key in cache:
+        return cache[key]
+    path = run_dir / key
+    if not path.exists():
+        cache[key] = None
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = None
+    cache[key] = payload
+    return payload
 
 
 def _generate_workflow_diffs(
@@ -494,6 +767,7 @@ def _render_report_html(
     *,
     runs: Sequence[Mapping[str, Any]],
     summary_rows: Sequence[SummaryRow],
+    stage_rows: Sequence[StageMetricsRow],
     experiment_order: Sequence[str],
     workflow_diff_index: Mapping[Tuple[str, str], str],
     prompt_diff_index: Mapping[Tuple[str, str], str],
@@ -531,6 +805,7 @@ def _render_report_html(
     parts: List[str] = [head, "<h1>Phase 1 Quality Harness Report</h1>"]
     parts.append(f"<p class='muted'>Total runs (no warmup): {len(non_warmup)}</p>")
     parts.append("<p class='muted'><a href='logs/report.html'>Open logs comparison report</a></p>")
+    parts.append("<p class='muted'><a href='stage_metrics.csv'>Open functional metrics CSV</a></p>")
 
     parts.append("<h2>Summary by Experiment</h2>")
     parts.append("<table>")
@@ -551,6 +826,37 @@ def _render_report_html(
             f"<td>{row.latency_p95_ms:.3f}</td>"
             f"<td>{row.compliance_p50:.3f}</td>"
             f"<td>{row.compliance_p95:.3f}</td>"
+            "</tr>"
+        )
+    parts.append("</table>")
+
+    parts.append("<h2>Functional Metrics</h2>")
+    parts.append("<table>")
+    parts.append(
+        "<tr>"
+        "<th>experiment</th>"
+        "<th>parseable_json_contract_rate</th>"
+        "<th>router_intent_accuracy</th>"
+        "<th>router_unknown_correctness</th>"
+        "<th>router_fix_over_edit_correctness</th>"
+        "<th>commercial_top_value_selection_correctness</th>"
+        "<th>commercial_no_tech_invention_rate</th>"
+        "<th>product_manager_required_nodes_evidence_precision</th>"
+        "<th>product_manager_actionable_plan_validity_rate</th>"
+        "</tr>"
+    )
+    for row in stage_rows:
+        parts.append(
+            "<tr>"
+            f"<td><code>{html.escape(row.experiment)}</code></td>"
+            f"<td>{row.parseable_json_contract_rate:.3f}</td>"
+            f"<td>{row.router_intent_accuracy:.3f}</td>"
+            f"<td>{row.router_unknown_correctness:.3f}</td>"
+            f"<td>{row.router_fix_over_edit_correctness:.3f}</td>"
+            f"<td>{row.commercial_top_value_selection_correctness:.3f}</td>"
+            f"<td>{row.commercial_no_tech_invention_rate:.3f}</td>"
+            f"<td>{row.product_manager_required_nodes_evidence_precision:.3f}</td>"
+            f"<td>{row.product_manager_actionable_plan_validity_rate:.3f}</td>"
             "</tr>"
         )
     parts.append("</table>")

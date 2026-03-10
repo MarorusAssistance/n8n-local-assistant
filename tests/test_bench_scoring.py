@@ -7,19 +7,19 @@ def test_compute_compliance_score_is_stable() -> None:
     score, breakdown = compute_compliance_score(
         parse_ok=True,
         section_ratios={
-            "workflow_min_schema": 0.5,
-            "node_types_exist": 1.0,
-            "credentials_shape_and_existence": 1.0,
-            "credential_compatibility": 0.0,
-            "requirements_and_limits": 0.5,
+            "router_routing_graph": 0.5,
+            "commercial_selection": 1.0,
+            "product_manager_planning": 0.0,
+            "planning_safety_guardrails": 0.5,
+            "retrieval_trace_checks": 1.0,
         },
         section_failures={},
     )
 
-    assert score == 72.5
-    assert breakdown["json_parse_ok"]["score"] == 20.0
-    assert breakdown["workflow_min_schema"]["score"] == 10.0
-    assert breakdown["credential_compatibility"]["score"] == 0.0
+    assert score == 65.0
+    assert breakdown["json_parse_ok"]["score"] == 15.0
+    assert breakdown["router_routing_graph"]["score"] == 10.0
+    assert breakdown["product_manager_planning"]["score"] == 0.0
 
 
 def test_compute_compliance_score_short_circuits_when_parse_fails() -> None:
@@ -31,4 +31,4 @@ def test_compute_compliance_score_short_circuits_when_parse_fails() -> None:
 
     assert score == 0.0
     assert breakdown["json_parse_ok"]["passed"] is False
-    assert breakdown["workflow_min_schema"]["skipped_due_parse_failure"] is True
+    assert breakdown["router_routing_graph"]["skipped_due_parse_failure"] is True

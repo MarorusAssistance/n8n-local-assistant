@@ -3,25 +3,17 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .models import CaseSpec, RequirementSpec
 from .scoring import compute_compliance_score
-
-
-@dataclass(frozen=True)
-class Catalog:
-    node_types: Set[str]
-    required_credentials_by_node_type: Dict[str, Set[str]]
-    credential_types: Set[str]
-    supported_nodes_by_credential: Dict[str, Set[str]]
+from .trace import TraceEntry, extract_retrieval_views
 
 
 @dataclass(frozen=True)
 class ParseResult:
     ok: bool
-    workflow: Optional[Dict[str, Any]]
+    payload: Optional[Dict[str, Any]]
     extracted_text: str
     failures: List[str]
 
@@ -40,80 +32,33 @@ class CheckCounts:
 
 
 _FENCED_JSON_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
-_TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
-
-
-def load_catalog(nodes_path: Path, credentials_path: Path) -> Catalog:
-    nodes_raw = json.loads(nodes_path.read_text(encoding="utf-8"))
-    credentials_raw = json.loads(credentials_path.read_text(encoding="utf-8"))
-    if not isinstance(nodes_raw, list):
-        raise ValueError(f"Expected list in {nodes_path}")
-    if not isinstance(credentials_raw, list):
-        raise ValueError(f"Expected list in {credentials_path}")
-    return build_catalog_from_payload(nodes_raw, credentials_raw)
-
-
-def build_catalog_from_payload(
-    nodes_payload: Sequence[Mapping[str, Any]],
-    credentials_payload: Sequence[Mapping[str, Any]],
-) -> Catalog:
-    node_types: Set[str] = set()
-    required_credentials_by_node_type: Dict[str, Set[str]] = {}
-
-    for node in nodes_payload:
-        node_type = str(node.get("name") or "").strip()
-        if not node_type:
-            continue
-        node_types.add(node_type)
-        required: Set[str] = set()
-        raw_creds = node.get("credentials")
-        if isinstance(raw_creds, list):
-            for cred in raw_creds:
-                if not isinstance(cred, Mapping):
-                    continue
-                cred_name = str(cred.get("name") or "").strip()
-                if not cred_name:
-                    continue
-                if bool(cred.get("required")):
-                    required.add(cred_name)
-        required_credentials_by_node_type[node_type] = required
-
-    credential_types: Set[str] = set()
-    supported_nodes_by_credential: Dict[str, Set[str]] = {}
-    for credential in credentials_payload:
-        cred_type = str(credential.get("name") or "").strip()
-        if not cred_type:
-            continue
-        credential_types.add(cred_type)
-        supported = set()
-        raw_supported = credential.get("supportedNodes")
-        if isinstance(raw_supported, list):
-            for node_type in raw_supported:
-                text = str(node_type or "").strip()
-                if text:
-                    supported.add(text)
-        supported_nodes_by_credential[cred_type] = supported
-
-    return Catalog(
-        node_types=node_types,
-        required_credentials_by_node_type=required_credentials_by_node_type,
-        credential_types=credential_types,
-        supported_nodes_by_credential=supported_nodes_by_credential,
-    )
+_TECHNICAL_ARTIFACTS_RE = re.compile(
+    r"\b(n8n-nodes-|credential[s]?|api[_\-\s]?key|oauth|token\s*=)\b",
+    re.IGNORECASE,
+)
+_WORKFLOW_JSON_KEYS = {"nodes", "connections", "final_workflow_json"}
+_INTENT_TO_STAGE = {
+    "business_discovery_conversation": "commercial_agent",
+    "workflow_build_request": "product_manager_agent",
+    "workflow_edit_request": "engineer_agent",
+    "workflow_fix_request": "qa_agent",
+    "information_request": "consultant_agent",
+    "unknown": None,
+}
 
 
 def run_checks(
     response_text: str,
     *,
     case: CaseSpec,
-    catalog: Catalog,
+    trace_entries: Optional[Sequence[TraceEntry]] = None,
 ) -> Dict[str, Any]:
-    parse_result = parse_workflow_json(response_text)
+    parse_result = parse_json_object(response_text)
     section_failures: Dict[str, List[str]] = {
         "json_parse_ok": list(parse_result.failures),
     }
 
-    if not parse_result.ok or not parse_result.workflow:
+    if not parse_result.ok or not parse_result.payload:
         score, breakdown = compute_compliance_score(
             parse_ok=False,
             section_ratios={},
@@ -121,49 +66,78 @@ def run_checks(
         )
         return {
             "parse_ok": False,
-            "workflow": None,
+            "payload": None,
             "extracted_json": parse_result.extracted_text,
             "compliance_score": score,
             "breakdown": breakdown,
             "failures": parse_result.failures,
             "trace": {
-                "json_parse_ok": {
-                    "failures": parse_result.failures,
-                }
+                "json_parse_ok": {"failures": parse_result.failures},
             },
         }
 
-    workflow = parse_result.workflow
-    schema_counts, names_to_types, edges = _check_workflow_min_schema(workflow)
-    node_type_counts = _check_node_types_exist(workflow, catalog)
-    creds_shape_counts = _check_credentials_shape_and_existence(workflow, catalog)
-    creds_compat_counts = _check_credential_compatibility(workflow, catalog)
-    req_counts = _check_case_requirements(case.requirements, workflow, names_to_types, edges)
-    limits_counts = _check_case_limits(case, workflow)
+    payload = parse_result.payload
+    contract_counts = _check_multi_agent_contract_schema(payload)
+    router_counts = _check_router_routing_graph(payload)
+    commercial_counts = _check_commercial_selection(payload)
+    product_manager_counts = _check_product_manager_planning(payload)
+    safety_counts = _check_planning_safety(payload)
+    requirement_counts = _check_case_requirements(case.requirements, payload)
+    limits_counts = _check_case_limits(case, payload)
+    trace_counts = _check_retrieval_trace(
+        payload,
+        trace_entries or [],
+        case_stage=case.stage,
+    )
 
-    req_limits_total = req_counts.total + limits_counts.total
-    req_limits_passed = req_counts.passed + limits_counts.passed
-    req_limits_failures = [*req_counts.failures, *limits_counts.failures]
-    req_limits_counts = CheckCounts(
-        passed=req_limits_passed,
-        total=req_limits_total,
-        failures=req_limits_failures,
+    router_counts = _merge_counts(router_counts, contract_counts)
+    router_counts = _merge_counts(
+        router_counts,
+        _filter_requirement_counts(requirement_counts, section="router_routing_graph"),
+    )
+    commercial_counts = _merge_counts(
+        commercial_counts,
+        _filter_requirement_counts(requirement_counts, section="commercial_selection"),
+    )
+    product_manager_counts = _merge_counts(
+        product_manager_counts,
+        _filter_requirement_counts(requirement_counts, section="product_manager_planning"),
+    )
+    safety_counts = _merge_counts(
+        safety_counts,
+        _filter_requirement_counts(requirement_counts, section="planning_safety_guardrails"),
+    )
+    router_counts = _merge_counts(
+        router_counts,
+        _filter_limit_counts(limits_counts, section="router_routing_graph"),
+    )
+    commercial_counts = _merge_counts(
+        commercial_counts,
+        _filter_limit_counts(limits_counts, section="commercial_selection"),
+    )
+    product_manager_counts = _merge_counts(
+        product_manager_counts,
+        _filter_limit_counts(limits_counts, section="product_manager_planning"),
+    )
+    safety_counts = _merge_counts(
+        safety_counts,
+        _filter_limit_counts(limits_counts, section="planning_safety_guardrails"),
     )
 
     section_ratios = {
-        "workflow_min_schema": schema_counts.ratio,
-        "node_types_exist": node_type_counts.ratio,
-        "credentials_shape_and_existence": creds_shape_counts.ratio,
-        "credential_compatibility": creds_compat_counts.ratio,
-        "requirements_and_limits": req_limits_counts.ratio,
+        "router_routing_graph": router_counts.ratio,
+        "commercial_selection": commercial_counts.ratio,
+        "product_manager_planning": product_manager_counts.ratio,
+        "planning_safety_guardrails": safety_counts.ratio,
+        "retrieval_trace_checks": trace_counts.ratio,
     }
     section_failures.update(
         {
-            "workflow_min_schema": schema_counts.failures,
-            "node_types_exist": node_type_counts.failures,
-            "credentials_shape_and_existence": creds_shape_counts.failures,
-            "credential_compatibility": creds_compat_counts.failures,
-            "requirements_and_limits": req_limits_counts.failures,
+            "router_routing_graph": router_counts.failures,
+            "commercial_selection": commercial_counts.failures,
+            "product_manager_planning": product_manager_counts.failures,
+            "planning_safety_guardrails": safety_counts.failures,
+            "retrieval_trace_checks": trace_counts.failures,
         }
     )
 
@@ -172,39 +146,40 @@ def run_checks(
         section_ratios=section_ratios,
         section_failures=section_failures,
     )
-    failures = [
-        *schema_counts.failures,
-        *node_type_counts.failures,
-        *creds_shape_counts.failures,
-        *creds_compat_counts.failures,
-        *req_limits_counts.failures,
-    ]
+
+    failures = (
+        contract_counts.failures
+        + router_counts.failures
+        + commercial_counts.failures
+        + product_manager_counts.failures
+        + safety_counts.failures
+        + trace_counts.failures
+    )
     return {
         "parse_ok": True,
-        "workflow": workflow,
+        "payload": payload,
         "extracted_json": parse_result.extracted_text,
         "compliance_score": score,
         "breakdown": breakdown,
         "failures": failures,
         "trace": {
             "json_parse_ok": {"failures": []},
-            "workflow_min_schema": _counts_to_trace(schema_counts),
-            "node_types_exist": _counts_to_trace(node_type_counts),
-            "credentials_shape_and_existence": _counts_to_trace(creds_shape_counts),
-            "credential_compatibility": _counts_to_trace(creds_compat_counts),
-            "requirements": _counts_to_trace(req_counts),
-            "limits": _counts_to_trace(limits_counts),
-            "requirements_and_limits": _counts_to_trace(req_limits_counts),
+            "multi_agent_contract_schema": _counts_to_trace(contract_counts),
+            "router_routing_graph": _counts_to_trace(router_counts),
+            "commercial_selection": _counts_to_trace(commercial_counts),
+            "product_manager_planning": _counts_to_trace(product_manager_counts),
+            "planning_safety_guardrails": _counts_to_trace(safety_counts),
+            "retrieval_trace_checks": _counts_to_trace(trace_counts),
         },
     }
 
 
-def parse_workflow_json(response_text: str) -> ParseResult:
+def parse_json_object(response_text: str) -> ParseResult:
     text = (response_text or "").strip()
     if not text:
         return ParseResult(
             ok=False,
-            workflow=None,
+            payload=None,
             extracted_text="",
             failures=["assistant response is empty"],
         )
@@ -217,7 +192,7 @@ def parse_workflow_json(response_text: str) -> ParseResult:
     candidates.extend(_scan_braced_json_candidates(text))
 
     seen = set()
-    unique_candidates = []
+    unique_candidates: List[str] = []
     for candidate in candidates:
         if candidate in seen:
             continue
@@ -234,13 +209,13 @@ def parse_workflow_json(response_text: str) -> ParseResult:
         if not isinstance(payload, dict):
             parse_errors.append("parsed JSON is not an object")
             continue
-        return ParseResult(ok=True, workflow=payload, extracted_text=candidate, failures=[])
+        return ParseResult(ok=True, payload=payload, extracted_text=candidate, failures=[])
 
     if not parse_errors:
         parse_errors.append("no JSON object could be extracted from response")
     return ParseResult(
         ok=False,
-        workflow=None,
+        payload=None,
         extracted_text="",
         failures=parse_errors[:6],
     )
@@ -283,523 +258,653 @@ def _scan_braced_json_candidates(text: str) -> List[str]:
     return candidates
 
 
-def _check_workflow_min_schema(
-    workflow: Mapping[str, Any]
-) -> Tuple[CheckCounts, Dict[str, str], List[Tuple[str, str]]]:
+def _check_multi_agent_contract_schema(payload: Mapping[str, Any]) -> CheckCounts:
     failures: List[str] = []
     passed = 0
     total = 0
 
-    nodes_raw = workflow.get("nodes")
-    total += 1
-    if isinstance(nodes_raw, list):
-        passed += 1
-    else:
-        failures.append("workflow.nodes must be a list")
-        nodes_raw = []
-
-    connections_raw = workflow.get("connections")
-    total += 1
-    if isinstance(connections_raw, dict):
-        passed += 1
-    else:
-        failures.append("workflow.connections must be an object")
-        connections_raw = {}
-
-    node_names: Set[str] = set()
-    names_to_types: Dict[str, str] = {}
-    for idx, node in enumerate(nodes_raw):
-        if not isinstance(node, Mapping):
-            total += 1
-            failures.append(f"node[{idx}] must be an object")
-            continue
-        name = str(node.get("name") or "").strip()
-        node_type = str(node.get("type") or "").strip()
-
+    checks = [
+        ("entry_intent", lambda value: isinstance(value, str)),
+        ("target_stage", lambda value: isinstance(value, str) or value is None),
+        ("confidence", lambda value: isinstance(value, (int, float))),
+        ("routing_signals", lambda value: isinstance(value, list)),
+        ("current_stage", lambda value: isinstance(value, str) or value is None),
+        ("missing_user_inputs", lambda value: isinstance(value, list)),
+        ("status", lambda value: isinstance(value, str)),
+    ]
+    for key, validator in checks:
         total += 1
-        if name:
+        value = payload.get(key)
+        if validator(value):
             passed += 1
         else:
-            failures.append(f"node[{idx}] missing name")
+            failures.append(f"contract field '{key}' has invalid type")
 
-        total += 1
-        if node_type:
-            passed += 1
-        else:
-            failures.append(f"node[{idx}] missing type")
-
-        if name:
+    routing_signals = payload.get("routing_signals")
+    if isinstance(routing_signals, list):
+        for idx, item in enumerate(routing_signals):
             total += 1
-            if name in node_names:
-                failures.append(f"duplicated node name: {name}")
-            else:
-                passed += 1
-                node_names.add(name)
-                names_to_types[name] = node_type
-
-        if "position" in node:
-            total += 1
-            position = node.get("position")
-            if _valid_position(position):
+            if isinstance(item, str):
                 passed += 1
             else:
-                failures.append(f"node[{idx}] has invalid position")
+                failures.append(f"routing_signals[{idx}] must be string")
 
-    edges: List[Tuple[str, str]] = []
-    for source_name, outputs in connections_raw.items():
-        source_text = str(source_name)
-        total += 1
-        if source_text in node_names:
-            passed += 1
-        else:
-            failures.append(f"connection source node not found: {source_text}")
-
-        total += 1
-        if isinstance(outputs, Mapping):
-            passed += 1
-        else:
-            failures.append(f"connections[{source_text}] must be an object")
-            continue
-
-        for _, output_lists in outputs.items():
+    missing_inputs = payload.get("missing_user_inputs")
+    if isinstance(missing_inputs, list):
+        for idx, item in enumerate(missing_inputs):
             total += 1
-            if isinstance(output_lists, list):
+            if isinstance(item, str):
                 passed += 1
             else:
-                failures.append(f"connections[{source_text}] output must be a list")
-                continue
+                failures.append(f"missing_user_inputs[{idx}] must be string")
 
-            for output_list in output_lists:
-                total += 1
-                if isinstance(output_list, list):
-                    passed += 1
-                else:
-                    failures.append(f"connections[{source_text}] nested output must be a list")
-                    continue
-
-                for connection in output_list:
-                    total += 1
-                    if isinstance(connection, Mapping):
-                        passed += 1
-                    else:
-                        failures.append(
-                            f"connections[{source_text}] contains non-object connection"
-                        )
-                        continue
-                    target_name = str(connection.get("node") or "").strip()
-                    total += 1
-                    if target_name and target_name in node_names:
-                        passed += 1
-                        edges.append((source_text, target_name))
-                    else:
-                        failures.append(
-                            f"connection target node not found from {source_text}: {target_name or '<empty>'}"
-                        )
-
-    return CheckCounts(passed=passed, total=total, failures=failures), names_to_types, edges
+    return CheckCounts(passed=passed, total=max(1, total), failures=failures)
 
 
-def _check_node_types_exist(workflow: Mapping[str, Any], catalog: Catalog) -> CheckCounts:
+def _check_router_routing_graph(payload: Mapping[str, Any]) -> CheckCounts:
     failures: List[str] = []
     passed = 0
     total = 0
-    nodes = workflow.get("nodes")
-    if not isinstance(nodes, list) or not nodes:
-        return CheckCounts(
-            passed=0,
-            total=1,
-            failures=["cannot validate node types: workflow.nodes is empty or invalid"],
+
+    intent = str(payload.get("entry_intent") or "")
+    target_stage = payload.get("target_stage")
+    current_stage = payload.get("current_stage")
+    routing_signals = payload.get("routing_signals") if isinstance(payload.get("routing_signals"), list) else []
+
+    total += 1
+    expected_stage = _INTENT_TO_STAGE.get(intent)
+    if _routing_consistency_ok(
+        intent=intent,
+        current_stage=current_stage,
+        target_stage=target_stage,
+        expected_stage=expected_stage,
+    ):
+        passed += 1
+    else:
+        failures.append(
+            "intent/route mismatch: "
+            f"intent='{intent}' current_stage='{current_stage}' "
+            f"expected_entry_stage='{expected_stage}' target_stage='{target_stage}'"
         )
 
-    for idx, node in enumerate(nodes):
-        if not isinstance(node, Mapping):
-            continue
+    total += 1
+    if intent != "unknown" or target_stage is None:
+        passed += 1
+    else:
+        failures.append("unknown intent must not force target_stage")
+
+    if "fix_signals_detected" in routing_signals and "edit_signals_detected" in routing_signals:
         total += 1
-        node_type = str(node.get("type") or "").strip()
-        if not node_type:
-            failures.append(f"node[{idx}] missing type for catalog validation")
-            continue
-        if node_type in catalog.node_types:
+        if intent == "workflow_fix_request":
             passed += 1
         else:
-            failures.append(f"unknown node type: {node_type}")
+            failures.append("fix signals and edit signals present but intent is not workflow_fix_request")
 
-    if total == 0:
-        total = 1
-    return CheckCounts(passed=passed, total=total, failures=failures)
+    total += 1
+    if current_stage is None or isinstance(current_stage, str):
+        passed += 1
+    else:
+        failures.append("current_stage must be string or null")
+
+    return CheckCounts(passed=passed, total=max(1, total), failures=failures)
 
 
-def _check_credentials_shape_and_existence(
-    workflow: Mapping[str, Any], catalog: Catalog
+def _routing_consistency_ok(
+    *,
+    intent: str,
+    current_stage: Any,
+    target_stage: Any,
+    expected_stage: Any,
+) -> bool:
+    if intent == "unknown":
+        return target_stage is None
+
+    if intent in {"workflow_edit_request", "workflow_fix_request", "information_request"}:
+        return target_stage == expected_stage
+
+    if intent == "workflow_build_request":
+        if current_stage == "product_manager_agent" and target_stage in {
+            "product_manager_agent",
+            "engineer_agent",
+            None,
+        }:
+            return True
+        return target_stage == expected_stage
+
+    if intent == "business_discovery_conversation":
+        if current_stage == "commercial_agent":
+            return target_stage in {"commercial_agent", "product_manager_agent", None}
+        if current_stage == "product_manager_agent":
+            return target_stage in {"product_manager_agent", "engineer_agent", None}
+        return target_stage == expected_stage
+
+    return target_stage == expected_stage
+
+
+def _check_commercial_selection(payload: Mapping[str, Any]) -> CheckCounts:
+    failures: List[str] = []
+    passed = 0
+    total = 0
+
+    discovered = payload.get("discovered_use_cases")
+    selected = payload.get("selected_use_case")
+    alternatives = payload.get("alternative_use_cases")
+    selection_reason = payload.get("selection_reason")
+
+    if not isinstance(discovered, list):
+        discovered = []
+    if not isinstance(alternatives, list):
+        alternatives = []
+
+    if discovered:
+        total += 1
+        if isinstance(selected, Mapping):
+            passed += 1
+        else:
+            failures.append("discovered_use_cases present but selected_use_case is missing")
+
+    if isinstance(selected, Mapping):
+        selected_id = str(selected.get("id") or "")
+        alt_ids = {
+            str(item.get("id") or "")
+            for item in alternatives
+            if isinstance(item, Mapping)
+        }
+        total += 1
+        if selected_id and selected_id not in alt_ids:
+            passed += 1
+        else:
+            failures.append("selected_use_case must not appear in alternative_use_cases")
+
+        if alternatives:
+            selected_score = selected.get("priority_score")
+            alt_scores = [
+                item.get("priority_score")
+                for item in alternatives
+                if isinstance(item, Mapping)
+            ]
+            if isinstance(selected_score, (int, float)) and all(
+                isinstance(score, (int, float)) for score in alt_scores
+            ):
+                total += 1
+                if float(selected_score) >= max(float(score) for score in alt_scores):
+                    passed += 1
+                else:
+                    failures.append("selected_use_case priority_score is below alternatives")
+
+    if selected is None:
+        total += 1
+        if alternatives == [] and isinstance(selection_reason, str) and selection_reason.strip():
+            passed += 1
+        else:
+            failures.append("when selected_use_case is null, alternatives must be empty and selection_reason explicit")
+
+    text_fields: List[str] = []
+    for item in discovered:
+        if not isinstance(item, Mapping):
+            continue
+        text_fields.extend(
+            str(item.get(key) or "")
+            for key in ("title", "business_problem", "desired_outcome")
+        )
+    if isinstance(selected, Mapping):
+        text_fields.extend(
+            str(selected.get(key) or "")
+            for key in ("title", "business_problem", "desired_outcome")
+        )
+
+    if text_fields:
+        total += 1
+        combined = " ".join(text_fields)
+        if not _TECHNICAL_ARTIFACTS_RE.search(combined):
+            passed += 1
+        else:
+            failures.append("commercial output contains technical implementation artifacts")
+
+    return CheckCounts(passed=passed, total=max(1, total), failures=failures)
+
+
+def _check_product_manager_planning(payload: Mapping[str, Any]) -> CheckCounts:
+    failures: List[str] = []
+    passed = 0
+    total = 0
+
+    architecture_plan = payload.get("architecture_plan")
+    workflow_context = payload.get("workflow_context")
+    target_stage = payload.get("target_stage")
+
+    planning_ready = None
+    handoff_target = None
+    if isinstance(workflow_context, Mapping):
+        planning_ready = workflow_context.get("planning_ready")
+        handoff_target = workflow_context.get("handoff_target")
+
+    if isinstance(architecture_plan, Mapping):
+        required_nodes = architecture_plan.get("required_nodes")
+        total += 1
+        if isinstance(required_nodes, list):
+            passed += 1
+        else:
+            failures.append("architecture_plan.required_nodes must be a list")
+            required_nodes = []
+
+        for idx, node in enumerate(required_nodes):
+            if not isinstance(node, Mapping):
+                total += 1
+                failures.append(f"required_nodes[{idx}] must be object")
+                continue
+            total += 1
+            if isinstance(node.get("node_type"), str) and str(node.get("node_type")).strip():
+                passed += 1
+            else:
+                failures.append(f"required_nodes[{idx}] missing node_type")
+
+            total += 1
+            chunk_ids = node.get("evidence_chunk_ids")
+            refs = node.get("evidence_refs")
+            if (
+                isinstance(chunk_ids, list)
+                and isinstance(refs, list)
+                and bool(chunk_ids or refs)
+            ):
+                passed += 1
+            else:
+                failures.append(f"required_nodes[{idx}] missing evidence references")
+
+    if planning_ready is True:
+        total += 1
+        if target_stage == "engineer_agent":
+            passed += 1
+        else:
+            failures.append("planning_ready=true requires target_stage=engineer_agent")
+
+        total += 1
+        if handoff_target == "engineer_agent":
+            passed += 1
+        else:
+            failures.append("planning_ready=true requires workflow_context.handoff_target=engineer_agent")
+
+        total += 1
+        if isinstance(architecture_plan, Mapping):
+            passed += 1
+        else:
+            failures.append("planning_ready=true requires architecture_plan object")
+
+    if planning_ready is False:
+        total += 1
+        if target_stage in (None, "product_manager_agent", "commercial_agent"):
+            passed += 1
+        else:
+            failures.append("planning_ready=false should not handoff directly to engineer")
+
+    return CheckCounts(passed=passed, total=max(1, total), failures=failures)
+
+
+def _check_planning_safety(payload: Mapping[str, Any]) -> CheckCounts:
+    failures: List[str] = []
+    passed = 0
+    total = 0
+
+    for forbidden in sorted(_WORKFLOW_JSON_KEYS):
+        total += 1
+        if forbidden not in payload:
+            passed += 1
+        else:
+            failures.append(f"forbidden top-level workflow key found: {forbidden}")
+
+    architecture_plan = payload.get("architecture_plan")
+    if isinstance(architecture_plan, Mapping):
+        for forbidden in sorted(_WORKFLOW_JSON_KEYS):
+            total += 1
+            if forbidden not in architecture_plan:
+                passed += 1
+            else:
+                failures.append(f"forbidden architecture_plan key found: {forbidden}")
+
+    return CheckCounts(passed=passed, total=max(1, total), failures=failures)
+
+
+def _check_retrieval_trace(
+    payload: Mapping[str, Any],
+    entries: Sequence[TraceEntry],
+    *,
+    case_stage: str,
 ) -> CheckCounts:
     failures: List[str] = []
     passed = 0
     total = 0
 
-    nodes = workflow.get("nodes")
-    if not isinstance(nodes, list):
-        return CheckCounts(
-            passed=0,
-            total=1,
-            failures=["cannot validate credentials: workflow.nodes is invalid"],
-        )
+    if case_stage != "product_manager":
+        return CheckCounts(passed=1, total=1, failures=[])
 
-    for node in nodes:
-        if not isinstance(node, Mapping):
-            continue
-        node_name = str(node.get("name") or "<unknown>")
-        credentials = node.get("credentials")
-        if credentials is None:
-            continue
+    retrieval_events = [entry for entry in entries if entry.event_type == "retrieval_final"]
+    total += 1
+    if len(retrieval_events) == 1:
+        passed += 1
+    else:
+        failures.append(f"retrieval_final count expected=1 got={len(retrieval_events)}")
 
-        total += 1
-        if isinstance(credentials, Mapping):
-            passed += 1
+    views = extract_retrieval_views(entries)
+    pre_count = (
+        len(views.get("pre_docs", []))
+        + len(views.get("pre_linked_node", []))
+        + len(views.get("pre_linked_credential", []))
+    )
+    post_count = (
+        len(views.get("post_docs", []))
+        + len(views.get("post_linked_node", []))
+        + len(views.get("post_linked_credential", []))
+    )
+
+    total += 1
+    if pre_count > 0:
+        passed += 1
+    else:
+        failures.append("retrieval trace missing pre-rerank chunks")
+
+    total += 1
+    if post_count > 0:
+        passed += 1
+    else:
+        failures.append("retrieval trace missing post-rerank chunks")
+
+    architecture_plan = payload.get("architecture_plan")
+    if isinstance(architecture_plan, Mapping):
+        required_nodes = architecture_plan.get("required_nodes")
+        if isinstance(required_nodes, list) and required_nodes:
+            total += 1
+            if post_count > 0:
+                passed += 1
+            else:
+                failures.append(
+                    "required_nodes present but no retrieval evidence chunks in trace"
+                )
+
+    return CheckCounts(passed=passed, total=max(1, total), failures=failures)
+
+
+def _check_case_limits(
+    case: CaseSpec,
+    payload: Mapping[str, Any],
+) -> Dict[str, CheckCounts]:
+    counts: Dict[str, List[str]] = {
+        "router_routing_graph": [],
+        "commercial_selection": [],
+        "product_manager_planning": [],
+        "planning_safety_guardrails": [],
+    }
+    totals: Dict[str, int] = {key: 0 for key in counts.keys()}
+    passes: Dict[str, int] = {key: 0 for key in counts.keys()}
+
+    limits = case.limits
+    if limits and limits.max_missing_user_inputs is not None:
+        totals["product_manager_planning"] += 1
+        max_allowed = int(limits.max_missing_user_inputs)
+        missing_items = payload.get("missing_user_inputs")
+        actual = len(missing_items) if isinstance(missing_items, list) else 0
+        if actual <= max_allowed:
+            passes["product_manager_planning"] += 1
         else:
-            failures.append(f"node '{node_name}' credentials must be an object")
-            continue
+            counts["product_manager_planning"].append(
+                "max_missing_user_inputs exceeded: "
+                f"expected <= {max_allowed}, got {actual}"
+            )
 
-        for credential_type, credential_value in credentials.items():
-            credential_key = str(credential_type or "").strip()
-            total += 1
-            if credential_key:
-                passed += 1
-            else:
-                failures.append(f"node '{node_name}' has empty credential key")
-
-            total += 1
-            if credential_key in catalog.credential_types:
-                passed += 1
-            else:
-                failures.append(
-                    f"node '{node_name}' references unknown credential type: {credential_key or '<empty>'}"
-                )
-
-            total += 1
-            if isinstance(credential_value, Mapping):
-                passed += 1
-            else:
-                failures.append(
-                    f"node '{node_name}' credential '{credential_key}' must be an object"
-                )
-
-    if total == 0:
-        return CheckCounts(passed=1, total=1, failures=[])
-    return CheckCounts(passed=passed, total=total, failures=failures)
-
-
-def _check_credential_compatibility(workflow: Mapping[str, Any], catalog: Catalog) -> CheckCounts:
-    failures: List[str] = []
-    passed = 0
-    total = 0
-
-    nodes = workflow.get("nodes")
-    if not isinstance(nodes, list):
-        return CheckCounts(
-            passed=0,
-            total=1,
-            failures=["cannot validate credential compatibility: workflow.nodes is invalid"],
+    output: Dict[str, CheckCounts] = {}
+    for section in counts.keys():
+        output[section] = CheckCounts(
+            passed=passes[section],
+            total=max(0, totals[section]),
+            failures=counts[section],
         )
-
-    for node in nodes:
-        if not isinstance(node, Mapping):
-            continue
-        node_name = str(node.get("name") or "<unknown>")
-        node_type = str(node.get("type") or "").strip()
-        credentials = node.get("credentials")
-        credential_keys: Set[str] = set()
-        if isinstance(credentials, Mapping):
-            credential_keys = {
-                str(credential_type or "").strip()
-                for credential_type in credentials.keys()
-                if str(credential_type or "").strip()
-            }
-
-        required_credentials = catalog.required_credentials_by_node_type.get(node_type, set())
-        for required in sorted(required_credentials):
-            total += 1
-            if required in credential_keys:
-                passed += 1
-            else:
-                failures.append(
-                    f"node '{node_name}' ({node_type}) is missing required credential: {required}"
-                )
-
-        for credential_type in sorted(credential_keys):
-            supported_nodes = catalog.supported_nodes_by_credential.get(credential_type, set())
-            if not supported_nodes:
-                continue
-            total += 1
-            if node_type in supported_nodes:
-                passed += 1
-            else:
-                failures.append(
-                    f"credential '{credential_type}' is not compatible with node type '{node_type}'"
-                )
-
-    if total == 0:
-        return CheckCounts(passed=1, total=1, failures=[])
-    return CheckCounts(passed=passed, total=total, failures=failures)
+    return output
 
 
 def _check_case_requirements(
     requirements: Sequence[RequirementSpec],
-    workflow: Mapping[str, Any],
-    names_to_types: Mapping[str, str],
-    edges: Sequence[Tuple[str, str]],
-) -> CheckCounts:
-    if not requirements:
-        return CheckCounts(passed=1, total=1, failures=[])
+    payload: Mapping[str, Any],
+) -> Dict[str, CheckCounts]:
+    counts: Dict[str, List[str]] = {
+        "router_routing_graph": [],
+        "commercial_selection": [],
+        "product_manager_planning": [],
+        "planning_safety_guardrails": [],
+    }
+    totals: Dict[str, int] = {key: 0 for key in counts.keys()}
+    passes: Dict[str, int] = {key: 0 for key in counts.keys()}
 
-    failures: List[str] = []
-    passed = 0
-    total = 0
-    nodes = workflow.get("nodes")
-    nodes_list = nodes if isinstance(nodes, list) else []
-
-    for idx, requirement in enumerate(requirements, start=1):
-        total += 1
-        ok, message = _evaluate_requirement(
-            requirement=requirement,
-            nodes=nodes_list,
-            names_to_types=names_to_types,
-            edges=edges,
-        )
+    for requirement in requirements:
+        section = _section_for_requirement(requirement)
+        totals[section] += 1
+        ok, failure = _eval_requirement(requirement, payload)
         if ok:
-            passed += 1
-            continue
-        failures.append(f"requirement[{idx}] {requirement.type}: {message}")
+            passes[section] += 1
+        elif failure:
+            counts[section].append(failure)
 
-    return CheckCounts(passed=passed, total=total, failures=failures)
+    output: Dict[str, CheckCounts] = {}
+    for section in counts.keys():
+        output[section] = CheckCounts(
+            passed=passes[section],
+            total=max(0, totals[section]),
+            failures=counts[section],
+        )
+    return output
 
 
-def _evaluate_requirement(
-    *,
+def _eval_requirement(
     requirement: RequirementSpec,
-    nodes: Sequence[Any],
-    names_to_types: Mapping[str, str],
-    edges: Sequence[Tuple[str, str]],
-) -> Tuple[bool, str]:
-    if requirement.type == "must_include_node_type":
-        expected_type = str(requirement.value).strip()
-        for node in nodes:
-            if not isinstance(node, Mapping):
-                continue
-            if str(node.get("type") or "").strip() == expected_type:
-                return True, ""
-        return False, f"node type '{expected_type}' was not found"
+    payload: Mapping[str, Any],
+) -> tuple[bool, Optional[str]]:
+    req_type = requirement.type
+    value = requirement.value
 
-    if requirement.type == "must_include_keyword_in_node_params":
-        value = requirement.value if isinstance(requirement.value, Mapping) else {}
-        key = str(value.get("key") or "").strip()
-        expected_equals = value.get("equals", None)
-        expected_contains = value.get("contains", None)
-        found_values: List[Any] = []
-        for node in nodes:
-            if not isinstance(node, Mapping):
-                continue
-            params = node.get("parameters")
-            if isinstance(params, Mapping):
-                found_values.extend(_collect_values_for_key(params, key))
+    if req_type in {"must_equal_field", "must_not_equal_field"}:
+        path = str(value.get("path"))
+        expected = value.get("equals") if req_type == "must_equal_field" else value.get("not_equals")
+        resolved = _resolve_path(payload, path)
+        if req_type == "must_equal_field":
+            ok = resolved.exists and resolved.value == expected
+            if not ok:
+                return False, f"{req_type} failed for path '{path}': expected={expected!r} got={resolved.value!r}"
+            return True, None
+        ok = (not resolved.exists) or resolved.value != expected
+        if not ok:
+            return False, f"{req_type} failed for path '{path}': disallowed value {expected!r}"
+        return True, None
 
-        if not found_values:
-            return False, f"parameter key '{key}' was not found in any node parameters"
-        if "equals" in value:
-            if any(item == expected_equals for item in found_values):
-                return True, ""
-            return False, f"key '{key}' did not match equals={expected_equals!r}"
-        if "contains" in value:
-            expected_text = str(expected_contains)
-            if any(expected_text in str(item) for item in found_values):
-                return True, ""
-            return False, f"key '{key}' did not contain {expected_text!r}"
-        return True, ""
+    if req_type in {"must_be_null_field", "must_not_be_null_field"}:
+        path = str(value.get("path"))
+        resolved = _resolve_path(payload, path)
+        if req_type == "must_be_null_field":
+            ok = resolved.exists and resolved.value is None
+            if not ok:
+                return False, f"{req_type} failed for path '{path}'"
+            return True, None
+        ok = resolved.exists and resolved.value is not None
+        if not ok:
+            return False, f"{req_type} failed for path '{path}'"
+        return True, None
 
-    if requirement.type == "must_have_schedule_daily_at":
-        target_time = str(requirement.value)
-        if _has_daily_schedule_at(nodes, target_time):
-            return True, ""
-        return False, f"no schedule/cron node found with daily time {target_time}"
+    if req_type in {"must_include_routing_signal", "must_not_include_routing_signal"}:
+        signal = str(value)
+        signals = payload.get("routing_signals")
+        items = signals if isinstance(signals, list) else []
+        contains = signal in items
+        if req_type == "must_include_routing_signal":
+            if not contains:
+                return False, f"routing_signals missing expected value '{signal}'"
+            return True, None
+        if contains:
+            return False, f"routing_signals contains forbidden value '{signal}'"
+        return True, None
 
-    if requirement.type == "must_have_connection":
-        value = requirement.value if isinstance(requirement.value, Mapping) else {}
-        from_name = str(value.get("from") or "").strip()
-        to_name = str(value.get("to") or "").strip()
-        from_type = str(value.get("from_type") or "").strip()
-        to_type = str(value.get("to_type") or "").strip()
-        for source_name, target_name in edges:
-            source_type = names_to_types.get(source_name, "")
-            target_type = names_to_types.get(target_name, "")
-            if from_name and to_name:
-                if source_name == from_name and target_name == to_name:
-                    return True, ""
-            if from_type and to_type:
-                if source_type == from_type and target_type == to_type:
-                    return True, ""
-        if from_name and to_name:
-            return False, f"connection {from_name} -> {to_name} was not found"
-        return False, f"connection {from_type} -> {to_type} was not found"
+    if req_type == "must_have_required_nodes_min":
+        expected_min = int(value)
+        architecture_plan = payload.get("architecture_plan")
+        required_nodes = architecture_plan.get("required_nodes") if isinstance(architecture_plan, Mapping) else []
+        actual = len(required_nodes) if isinstance(required_nodes, list) else 0
+        if actual < expected_min:
+            return False, f"required_nodes count too low: expected >= {expected_min}, got {actual}"
+        return True, None
 
-    return False, "unsupported requirement type"
+    if req_type == "must_have_required_nodes_with_evidence":
+        expected_flag = bool(value)
+        architecture_plan = payload.get("architecture_plan")
+        required_nodes = architecture_plan.get("required_nodes") if isinstance(architecture_plan, Mapping) else []
+        has_evidence = True
+        if not isinstance(required_nodes, list) or not required_nodes:
+            has_evidence = False
+        else:
+            for node in required_nodes:
+                if not isinstance(node, Mapping):
+                    has_evidence = False
+                    break
+                evidence_chunk_ids = node.get("evidence_chunk_ids")
+                evidence_refs = node.get("evidence_refs")
+                if not isinstance(evidence_chunk_ids, list) or not isinstance(evidence_refs, list):
+                    has_evidence = False
+                    break
+                if not evidence_chunk_ids and not evidence_refs:
+                    has_evidence = False
+                    break
+        if has_evidence != expected_flag:
+            return False, f"must_have_required_nodes_with_evidence failed (expected {expected_flag})"
+        return True, None
+
+    if req_type == "must_not_include_workflow_json_keys":
+        forbidden = [str(item).strip() for item in value]
+        found = [key for key in forbidden if key in payload]
+        architecture_plan = payload.get("architecture_plan")
+        if isinstance(architecture_plan, Mapping):
+            found.extend(
+                f"architecture_plan.{key}"
+                for key in forbidden
+                if key in architecture_plan
+            )
+        if found:
+            return False, f"found forbidden workflow keys: {', '.join(found)}"
+        return True, None
+
+    if req_type == "must_have_planning_ready":
+        expected = bool(value)
+        context = payload.get("workflow_context")
+        got = context.get("planning_ready") if isinstance(context, Mapping) else None
+        if got is not expected:
+            return False, f"workflow_context.planning_ready expected {expected}, got {got!r}"
+        return True, None
+
+    if req_type == "must_have_handoff_target":
+        expected = value
+        context = payload.get("workflow_context")
+        got = context.get("handoff_target") if isinstance(context, Mapping) else None
+        if got != expected:
+            return False, f"workflow_context.handoff_target expected {expected!r}, got {got!r}"
+        return True, None
+
+    return False, f"unsupported requirement type: {req_type}"
 
 
-def _check_case_limits(case: CaseSpec, workflow: Mapping[str, Any]) -> CheckCounts:
-    limits = case.limits
-    if limits is None or limits.max_nodes is None:
-        return CheckCounts(passed=1, total=1, failures=[])
+def _section_for_requirement(requirement: RequirementSpec) -> str:
+    req_type = requirement.type
+    if req_type in {
+        "must_include_routing_signal",
+        "must_not_include_routing_signal",
+    }:
+        return "router_routing_graph"
+    if req_type in {
+        "must_have_required_nodes_min",
+        "must_have_required_nodes_with_evidence",
+        "must_have_planning_ready",
+        "must_have_handoff_target",
+    }:
+        return "product_manager_planning"
+    if req_type == "must_not_include_workflow_json_keys":
+        return "planning_safety_guardrails"
 
-    nodes = workflow.get("nodes")
-    node_count = len(nodes) if isinstance(nodes, list) else 0
-    if node_count <= limits.max_nodes:
-        return CheckCounts(passed=1, total=1, failures=[])
+    value = requirement.value
+    path = str(value.get("path") or "") if isinstance(value, Mapping) else ""
+    if path.startswith("architecture_plan.") or path.startswith("workflow_context."):
+        return "product_manager_planning"
+    if path.startswith("selected_use_case") or path.startswith("discovered_use_cases") or path.startswith("alternative_use_cases"):
+        return "commercial_selection"
+    return "router_routing_graph"
+
+
+@dataclass(frozen=True)
+class _PathResult:
+    exists: bool
+    value: Any
+
+
+def _resolve_path(payload: Mapping[str, Any], path: str) -> _PathResult:
+    current: Any = payload
+    tokens = _parse_path(path)
+    for token in tokens:
+        if isinstance(token, str):
+            if not isinstance(current, Mapping) or token not in current:
+                return _PathResult(False, None)
+            current = current[token]
+            continue
+        if not isinstance(token, int):
+            return _PathResult(False, None)
+        if not isinstance(current, list) or token < 0 or token >= len(current):
+            return _PathResult(False, None)
+        current = current[token]
+    return _PathResult(True, current)
+
+
+def _parse_path(path: str) -> List[Any]:
+    if not path:
+        return []
+    out: List[Any] = []
+    chunks = path.split(".")
+    for chunk in chunks:
+        match = re.match(r"^([A-Za-z0-9_-]+)(\[\d+\])*$", chunk)
+        if not match:
+            out.append(chunk)
+            continue
+        key = match.group(1)
+        out.append(key)
+        indexes = re.findall(r"\[(\d+)\]", chunk)
+        out.extend(int(index) for index in indexes)
+    return out
+
+
+def _merge_counts(base: CheckCounts, extra: CheckCounts) -> CheckCounts:
     return CheckCounts(
-        passed=0,
-        total=1,
-        failures=[f"max_nodes exceeded: {node_count} > {limits.max_nodes}"],
+        passed=base.passed + extra.passed,
+        total=base.total + extra.total,
+        failures=[*base.failures, *extra.failures],
     )
 
 
-def _collect_values_for_key(payload: Mapping[str, Any], key: str) -> List[Any]:
-    values: List[Any] = []
-
-    def _walk(item: Any) -> None:
-        if isinstance(item, Mapping):
-            for k, v in item.items():
-                if k == key:
-                    values.append(v)
-                _walk(v)
-            return
-        if isinstance(item, list):
-            for child in item:
-                _walk(child)
-
-    _walk(payload)
-    return values
+def _filter_requirement_counts(
+    all_counts: Mapping[str, CheckCounts],
+    *,
+    section: str,
+) -> CheckCounts:
+    counts = all_counts.get(section)
+    if counts is None:
+        return CheckCounts(passed=0, total=0, failures=[])
+    return counts
 
 
-def _has_daily_schedule_at(nodes: Sequence[Any], target_time: str) -> bool:
-    normalized_target = _normalize_time_text(target_time)
-    if not normalized_target:
-        return False
-
-    for node in nodes:
-        if not isinstance(node, Mapping):
-            continue
-        node_type = str(node.get("type") or "").lower()
-        if "schedule" not in node_type and "cron" not in node_type:
-            continue
-        params = node.get("parameters")
-        for candidate in _extract_time_candidates(params):
-            if candidate == normalized_target:
-                return True
-    return False
-
-
-def _extract_time_candidates(value: Any) -> Set[str]:
-    result: Set[str] = set()
-
-    def _walk(item: Any) -> None:
-        if isinstance(item, Mapping):
-            hour_candidates = _extract_hour_values(item)
-            minute_candidates = _extract_minute_values(item)
-            for hour in hour_candidates:
-                for minute in minute_candidates:
-                    text = _normalize_hour_minute(hour, minute)
-                    if text:
-                        result.add(text)
-
-            for key in ("cronExpression", "cron", "expression", "customCron"):
-                raw = item.get(key)
-                if isinstance(raw, str):
-                    for candidate in _times_from_text(raw):
-                        result.add(candidate)
-
-            for child in item.values():
-                _walk(child)
-            return
-
-        if isinstance(item, list):
-            for child in item:
-                _walk(child)
-            return
-
-        if isinstance(item, str):
-            for candidate in _times_from_text(item):
-                result.add(candidate)
-
-    _walk(value)
-    return result
-
-
-def _times_from_text(text: str) -> Set[str]:
-    result: Set[str] = set()
-    for match in _TIME_RE.finditer(text):
-        hour = int(match.group(1))
-        minute = int(match.group(2))
-        normalized = _normalize_hour_minute(hour, minute)
-        if normalized:
-            result.add(normalized)
-
-    cron_parts = [part for part in text.strip().split() if part]
-    if len(cron_parts) >= 5:
-        minute = cron_parts[0]
-        hour = cron_parts[1]
-        if minute.isdigit() and hour.isdigit():
-            normalized = _normalize_hour_minute(int(hour), int(minute))
-            if normalized:
-                result.add(normalized)
-    return result
-
-
-def _extract_hour_values(item: Mapping[str, Any]) -> List[Any]:
-    values: List[Any] = []
-    for key in ("hour", "hours", "triggerAtHour"):
-        if key in item:
-            values.append(item[key])
-    return values
-
-
-def _extract_minute_values(item: Mapping[str, Any]) -> List[Any]:
-    values: List[Any] = []
-    for key in ("minute", "minutes", "triggerAtMinute"):
-        if key in item:
-            values.append(item[key])
-    return values
-
-
-def _normalize_hour_minute(hour_value: Any, minute_value: Any) -> Optional[str]:
-    try:
-        hour = int(str(hour_value).strip())
-        minute = int(str(minute_value).strip())
-    except Exception:
-        return None
-    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
-        return None
-    return f"{hour:02d}:{minute:02d}"
-
-
-def _normalize_time_text(value: str) -> Optional[str]:
-    match = _TIME_RE.fullmatch(value.strip())
-    if not match:
-        return None
-    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
-
-
-def _valid_position(value: Any) -> bool:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        return False
-    try:
-        float(value[0])
-        float(value[1])
-        return True
-    except Exception:
-        return False
+def _filter_limit_counts(
+    all_counts: Mapping[str, CheckCounts],
+    *,
+    section: str,
+) -> CheckCounts:
+    counts = all_counts.get(section)
+    if counts is None:
+        return CheckCounts(passed=0, total=0, failures=[])
+    return counts
 
 
 def _counts_to_trace(counts: CheckCounts) -> Dict[str, Any]:
     return {
         "passed": counts.passed,
         "total": counts.total,
-        "ratio": round(counts.ratio, 6),
+        "ratio": counts.ratio,
         "failures": counts.failures,
     }

@@ -1,7 +1,7 @@
-# Multi-Agent Milestone 1
+# Multi-Agent Router Stage
 
 ## Scope
-Milestone 1 introduces a LangGraph entry runtime for multi-agent routing with no real business logic execution in subagents.
+This stage introduces a LangGraph entry runtime for multi-agent routing with no real business logic execution in subagents.
 
 Implemented scope:
 - Typed entry intent classification.
@@ -9,7 +9,7 @@ Implemented scope:
 - Stub nodes for `commercial`, `consultant`, `product_manager`, `engineer`, and `qa`.
 - Direct replacement of reasoning LangGraph runtime output with a routing envelope.
 
-Not implemented in this milestone:
+Not implemented in this stage:
 - Template retrieval/integration.
 - Notion or external indexing integration.
 - Internal PM/Engineer/QA replan loops.

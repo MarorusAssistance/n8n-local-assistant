@@ -4,12 +4,12 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 
 SECTION_WEIGHTS: Dict[str, float] = {
-    "json_parse_ok": 20.0,
-    "workflow_min_schema": 20.0,
-    "node_types_exist": 20.0,
-    "credentials_shape_and_existence": 15.0,
-    "credential_compatibility": 10.0,
-    "requirements_and_limits": 15.0,
+    "json_parse_ok": 15.0,
+    "router_routing_graph": 20.0,
+    "commercial_selection": 20.0,
+    "product_manager_planning": 20.0,
+    "planning_safety_guardrails": 10.0,
+    "retrieval_trace_checks": 15.0,
 }
 
 
