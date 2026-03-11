@@ -44,8 +44,9 @@ def test_retrieve_context_appends_linked_definition_chunks(monkeypatch) -> None:
         embedding: List[float],
         top_k: int | None = None,
         request_id: str | None = None,
+        source_filter: str | None = None,
     ) -> List[Dict[str, Any]]:
-        _ = embedding, top_k, request_id
+        _ = embedding, top_k, request_id, source_filter
         return [
             {
                 ROW_ID_KEY: "(0,1)",

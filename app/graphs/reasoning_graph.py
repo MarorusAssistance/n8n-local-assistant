@@ -9,6 +9,11 @@ from ..features.reasoning.multi_agent_contracts import (
     ArchitecturePlan,
     BlockedNode,
     BusinessContextSummary,
+    ConsultantQueryAnalysis,
+    ConsultantResponse,
+    ConsultantRetrievalResult,
+    ConsultantSource,
+    ConsultantToolUsage,
     EntryIntent,
     ImplementationQueueItem,
     ImplementationStatus,
@@ -31,10 +36,11 @@ from ..features.reasoning.multi_agent_contracts import (
 )
 from .multi_agent_state import MultiAgentGraphState
 from .nodes.commercial_agent import commercial_agent_node
+from .nodes.consultant_agent import consultant_agent_node
 from .nodes.engineer_agent import engineer_agent_node
 from .nodes.multi_agent_router import route_entry_intent
 from .nodes.product_manager_agent import product_manager_agent_node
-from .nodes.multi_agent_stubs import consultant_agent_node, qa_agent_node
+from .nodes.multi_agent_stubs import qa_agent_node
 
 try:  # Optional until langgraph dependency is installed.
     from langgraph.graph import END, START, StateGraph
@@ -159,6 +165,22 @@ def _model_list(values: Any, model_cls: Type[T]) -> List[T]:
         model = _model_or_none(value, model_cls)
         if model is not None:
             output.append(model)
+    return output
+
+
+def _enum_list(values: Any, enum_cls: Type[T]) -> List[T]:
+    if not isinstance(values, list):
+        return []
+    output: List[T] = []
+    for value in values:
+        if isinstance(value, enum_cls):
+            output.append(value)
+            continue
+        if isinstance(value, str):
+            try:
+                output.append(enum_cls(value))  # type: ignore[call-arg]
+            except Exception:
+                continue
     return output
 
 
@@ -369,6 +391,10 @@ class ReasoningGraphRuntime:
         workflow_context = _model_or_none(state.get("workflow_context"), WorkflowContext)
         implementation_status = _normalize_impl_status(state.get("implementation_status"))
         pm_status = _normalize_pm_status(state.get("pm_status"))
+        consultant_query_analysis = _model_or_none(
+            state.get("consultant_query_analysis"), ConsultantQueryAnalysis
+        )
+        consultant_response = _model_or_none(state.get("consultant_response"), ConsultantResponse)
         final_workflow_json = (
             dict(state.get("final_workflow_json"))
             if isinstance(state.get("final_workflow_json"), dict)
@@ -377,6 +403,8 @@ class ReasoningGraphRuntime:
 
         if current_stage == "commercial_agent" and selected_use_case is None:
             status = "unknown_terminal"
+        elif current_stage == "consultant_agent":
+            status = "stub_routed" if consultant_response and consultant_response.text else "unknown_terminal"
         elif current_stage == "product_manager_agent":
             planning_ready = bool(workflow_context and workflow_context.planning_ready)
             if not workflow_context:
@@ -408,6 +436,19 @@ class ReasoningGraphRuntime:
             routing_signals=list(state.get("routing_signals") or []),
             current_stage=current_stage,
             missing_user_inputs=list(state.get("missing_user_inputs") or []),
+            consultant_query_analysis=consultant_query_analysis,
+            consultant_selected_sources=_enum_list(
+                state.get("consultant_selected_sources"), ConsultantSource
+            ),
+            consultant_tools_used=_model_list(
+                state.get("consultant_tools_used"), ConsultantToolUsage
+            ),
+            consultant_used_retrieval=bool(state.get("consultant_used_retrieval", False)),
+            consultant_retrieval_results=_model_list(
+                state.get("consultant_retrieval_results"), ConsultantRetrievalResult
+            ),
+            consultant_response=consultant_response,
+            consultant_notes=list(state.get("consultant_notes") or []),
             business_context_summary=_model_or_none(
                 state.get("business_context_summary"), BusinessContextSummary
             ),
@@ -500,6 +541,8 @@ class ReasoningGraphRuntime:
         model: Optional[str],
         request_id: Optional[str],
         existing_workflow: Any,
+        conversation_context: Optional[List[Dict[str, str]]] = None,
+        active_workflow_context: Optional[Dict[str, Any]] = None,
         run_config: Optional[Dict[str, Any]] = None,
     ) -> MultiAgentGraphResult:
         existing_workflow_id, existing_workflow_name, existing_workflow_url = _resolve_existing_workflow_ref(
@@ -516,6 +559,8 @@ class ReasoningGraphRuntime:
                 "model": model,
                 "request_id": request_id,
                 "persist_to_n8n": True,
+                "conversation_context": conversation_context or [],
+                "active_workflow": active_workflow_context or {},
             }
             state["resume_requested"] = True
         else:
@@ -526,6 +571,13 @@ class ReasoningGraphRuntime:
                 "confidence": 0.0,
                 "routing_signals": [],
                 "current_stage": None,
+                "consultant_query_analysis": None,
+                "consultant_selected_sources": [],
+                "consultant_tools_used": [],
+                "consultant_used_retrieval": False,
+                "consultant_retrieval_results": [],
+                "consultant_response": None,
+                "consultant_notes": [],
                 "business_context_summary": None,
                 "discovered_use_cases": [],
                 "selected_use_case": None,
@@ -567,6 +619,8 @@ class ReasoningGraphRuntime:
                     "model": model,
                     "request_id": request_id,
                     "persist_to_n8n": True,
+                    "conversation_context": conversation_context or [],
+                    "active_workflow": active_workflow_context or {},
                 },
                 "resume_requested": False,
             }

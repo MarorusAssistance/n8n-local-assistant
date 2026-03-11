@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 from app.config import settings
@@ -10,6 +12,11 @@ from app.features.reasoning.multi_agent_contracts import (
     ArchitectureDataFlowItem,
     ArchitecturePlan,
     ArchitectureStage,
+    ConsultantQueryAnalysis,
+    ConsultantResponse,
+    ConsultantRetrievalResult,
+    ConsultantSource,
+    ConsultantToolUsage,
     ImplementationQueueItem,
     ImplementationStatus,
     ImplementedNode,
@@ -346,6 +353,66 @@ def _fake_engineer_reasoning_result() -> MultiAgentGraphResult:
     )
 
 
+def _fake_consultant_reasoning_result() -> MultiAgentGraphResult:
+    return MultiAgentGraphResult(
+        user_query="What is the difference between webhook and schedule?",
+        entry_intent=EntryIntent.information_request,
+        target_stage=AgentStage.consultant_agent,
+        confidence=0.9,
+        routing_signals=["entered_consultant_agent"],
+        current_stage="consultant_agent",
+        missing_user_inputs=[],
+        consultant_query_analysis=ConsultantQueryAnalysis(
+            request_type="comparison",
+            key_topics=["webhook", "schedule trigger"],
+            needs_active_workflow_context=False,
+            retrieval_needed=True,
+            conversation_history_sufficient=False,
+            source_limited=False,
+            selected_sources=[ConsultantSource.nodes_index, ConsultantSource.api_docs_index],
+            analysis_notes=["Need node/docs evidence."],
+        ),
+        consultant_selected_sources=[ConsultantSource.nodes_index, ConsultantSource.api_docs_index],
+        consultant_tools_used=[
+            ConsultantToolUsage(
+                tool_name="nodes_index_tool",
+                source=ConsultantSource.nodes_index,
+                call_order=1,
+                query="webhook schedule trigger",
+                result_count=3,
+            ),
+            ConsultantToolUsage(
+                tool_name="api_docs_index_tool",
+                source=ConsultantSource.api_docs_index,
+                call_order=2,
+                query="webhook schedule trigger docs",
+                result_count=2,
+            ),
+        ],
+        consultant_used_retrieval=True,
+        consultant_retrieval_results=[
+            ConsultantRetrievalResult(
+                source=ConsultantSource.nodes_index,
+                query="webhook schedule trigger",
+                result_count=3,
+                chunk_ids=["node-1"],
+                references=["Node: Webhook"],
+                snippets=["Webhook starts from incoming HTTP requests."],
+            )
+        ],
+        consultant_response=ConsultantResponse(
+            text="Webhook reacts to external events, while Schedule Trigger runs on a time schedule.",
+            directly_supported=["nodes_index: Node: Webhook"],
+            inferred_guidance=[],
+            uncertainties=[],
+        ),
+        consultant_notes=["consultant completed"],
+        qa_enabled=False,
+        needs_replan=False,
+        status="stub_routed",
+    )
+
+
 def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) -> None:
     client, service = _client_with_store()
     monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
@@ -482,3 +549,55 @@ def test_reasoning_payload_includes_engineer_fields_when_engineer_stage_runs(mon
     assert parsed["workflow_persisted"] is True
     assert parsed["workflow_reference"]["id"] == "wf_200"
     assert "final_workflow_json" not in parsed
+
+
+def test_reasoning_consultant_returns_plain_text_content(monkeypatch) -> None:
+    client, service = _client_with_store()
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", False, raising=False)
+    monkeypatch.setattr(
+        service._graph_runtime,
+        "run_reasoning",
+        lambda **kwargs: _fake_consultant_reasoning_result(),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local-model",
+            "messages": [{"role": "user", "content": "Explain webhook vs schedule."}],
+        },
+    )
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert isinstance(content, str)
+    assert content.startswith("Webhook reacts to external events")
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(content)
+
+
+def test_reasoning_consultant_streams_text_in_multiple_chunks(monkeypatch) -> None:
+    client, service = _client_with_store()
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", False, raising=False)
+    monkeypatch.setattr(
+        service._graph_runtime,
+        "run_reasoning",
+        lambda **kwargs: _fake_consultant_reasoning_result(),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "Explain webhook vs schedule."}],
+        },
+    )
+    assert response.status_code == 200
+    body = response.text
+    assert "data: " in body
+    assert body.count("chat.completion.chunk") > 2
+    assert "[DONE]" in body

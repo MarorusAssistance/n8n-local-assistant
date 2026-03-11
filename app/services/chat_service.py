@@ -199,6 +199,7 @@ class ChatService:
                 self._handle_reasoning_plan_only_langgraph(
                     request=chat_input.request,
                     user_message=str(chat_input.user_message or ""),
+                    messages_for_prompt=chat_input.messages_for_prompt,
                     existing_workflow=chat_input.active_workflow_id,
                     conversation_id=chat_input.conversation_id,
                     generated_conversation_id=chat_input.generated_conversation_id,
@@ -210,6 +211,7 @@ class ChatService:
                 else self._handle_reasoning_plan_only(
                     request=chat_input.request,
                     user_message=str(chat_input.user_message or ""),
+                    messages_for_prompt=chat_input.messages_for_prompt,
                     existing_workflow=chat_input.active_workflow_id,
                     conversation_id=chat_input.conversation_id,
                     generated_conversation_id=chat_input.generated_conversation_id,
@@ -310,6 +312,7 @@ class ChatService:
                 return self._handle_reasoning_plan_only_langgraph(
                     request=request,
                     user_message=user_message,
+                    messages_for_prompt=messages_for_prompt,
                     existing_workflow=None,
                     conversation_id=conversation_id,
                     generated_conversation_id=generated_conversation_id,
@@ -320,6 +323,7 @@ class ChatService:
             return self._handle_reasoning_plan_only(
                 request=request,
                 user_message=user_message,
+                messages_for_prompt=messages_for_prompt,
                 existing_workflow=None,
                 conversation_id=conversation_id,
                 generated_conversation_id=generated_conversation_id,
@@ -451,7 +455,8 @@ class ChatService:
         self,
         request: ChatCompletionRequest,
         user_message: str,
-        existing_workflow: Optional[str],
+        messages_for_prompt: List[Dict[str, str]],
+        existing_workflow: Any,
         conversation_id: Optional[str],
         generated_conversation_id: bool,
         http_response: Optional[Response],
@@ -459,6 +464,7 @@ class ChatService:
         request_id: str,
     ) -> Any:
         self._trace_logger.debug("reasoning pipeline start: id=%s conv=%s", request_id, conversation_id)
+        _ = messages_for_prompt
 
         try:
             result = run_reasoning_pipeline(
@@ -499,14 +505,27 @@ class ChatService:
             }
 
         payload = sanitize_for_json(payload)
-        assistant_text_raw, payload = safe_json_dumps(payload)
+        if consultant_text is None and payload.get("current_stage") == "consultant_agent":
+            consultant_payload = payload.get("consultant_response")
+            if isinstance(consultant_payload, dict):
+                candidate = consultant_payload.get("text")
+                if isinstance(candidate, str) and candidate.strip():
+                    consultant_text = candidate.strip()
+        if consultant_text is not None:
+            assistant_text_raw = consultant_text
+        else:
+            assistant_text_raw, payload = safe_json_dumps(payload)
         model = resolve_model(request.model)
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
 
         if request.stream:
+            if consultant_text is not None:
+                stream_iter = self._responses.stream_text_tokens(assistant_text_raw, model=model)
+            else:
+                stream_iter = self._responses.stream_simple_text(assistant_text_raw, model=model)
             return StreamingResponse(
-                self._responses.stream_simple_text(assistant_text_raw, model=model),
+                stream_iter,
                 headers=self._memory.conversation_headers(
                     conversation_id, generated_conversation_id
                 ),
@@ -524,7 +543,8 @@ class ChatService:
         self,
         request: ChatCompletionRequest,
         user_message: str,
-        existing_workflow: Optional[str],
+        messages_for_prompt: List[Dict[str, str]],
+        existing_workflow: Any,
         conversation_id: Optional[str],
         generated_conversation_id: bool,
         http_response: Optional[Response],
@@ -547,6 +567,10 @@ class ChatService:
                 model=request.model,
                 request_id=request_id,
                 existing_workflow=existing_workflow,
+                conversation_context=messages_for_prompt,
+                active_workflow_context=(
+                    existing_workflow if isinstance(existing_workflow, dict) else {}
+                ),
                 run_config=run_config,
             )
         except Exception as exc:
@@ -560,6 +584,7 @@ class ChatService:
             return self._handle_reasoning_plan_only(
                 request=request,
                 user_message=user_message,
+                messages_for_prompt=messages_for_prompt,
                 existing_workflow=existing_workflow,
                 conversation_id=conversation_id,
                 generated_conversation_id=generated_conversation_id,
@@ -569,6 +594,7 @@ class ChatService:
             )
 
         payload: Dict[str, Any]
+        consultant_text: Optional[str] = None
         if hasattr(result, "entry_intent"):
             entry_intent = getattr(result, "entry_intent", "unknown")
             target_stage = getattr(result, "target_stage", None)
@@ -604,13 +630,55 @@ class ChatService:
             workflow_persisted = bool(getattr(result, "workflow_persisted", False))
             workflow_persist_action = getattr(result, "workflow_persist_action", None)
             workflow_api_sync_result = getattr(result, "workflow_api_sync_result", {}) or {}
+            consultant_query_analysis = getattr(result, "consultant_query_analysis", None)
+            consultant_selected_sources = list(getattr(result, "consultant_selected_sources", []) or [])
+            consultant_tools_used = list(getattr(result, "consultant_tools_used", []) or [])
+            consultant_used_retrieval = bool(getattr(result, "consultant_used_retrieval", False))
+            consultant_retrieval_results = list(getattr(result, "consultant_retrieval_results", []) or [])
+            consultant_response = getattr(result, "consultant_response", None)
+            consultant_notes = list(getattr(result, "consultant_notes", []) or [])
+            current_stage = getattr(result, "current_stage", None)
+            if current_stage == "consultant_agent":
+                candidate = (
+                    consultant_response.text
+                    if hasattr(consultant_response, "text")
+                    else consultant_response.get("text")
+                    if isinstance(consultant_response, dict)
+                    else None
+                )
+                if isinstance(candidate, str) and candidate.strip():
+                    consultant_text = candidate.strip()
             payload = {
                 "entry_intent": entry_intent_value,
                 "target_stage": target_stage_value,
                 "confidence": float(getattr(result, "confidence", 0.0)),
                 "routing_signals": list(getattr(result, "routing_signals", []) or []),
-                "current_stage": getattr(result, "current_stage", None),
+                "current_stage": current_stage,
                 "missing_user_inputs": list(getattr(result, "missing_user_inputs", []) or []),
+                "consultant_query_analysis": (
+                    consultant_query_analysis.model_dump(exclude_none=True)
+                    if hasattr(consultant_query_analysis, "model_dump")
+                    else consultant_query_analysis
+                ),
+                "consultant_selected_sources": [
+                    item.value if hasattr(item, "value") else item
+                    for item in consultant_selected_sources
+                ],
+                "consultant_tools_used": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in consultant_tools_used
+                ],
+                "consultant_used_retrieval": consultant_used_retrieval,
+                "consultant_retrieval_results": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in consultant_retrieval_results
+                ],
+                "consultant_response": (
+                    consultant_response.model_dump(exclude_none=True)
+                    if hasattr(consultant_response, "model_dump")
+                    else consultant_response
+                ),
+                "consultant_notes": consultant_notes,
                 "business_context_summary": (
                     business_context_summary.model_dump(exclude_none=True)
                     if hasattr(business_context_summary, "model_dump")
@@ -752,14 +820,27 @@ class ChatService:
                 }
 
         payload = sanitize_for_json(payload)
-        assistant_text_raw, payload = safe_json_dumps(payload)
+        if consultant_text is None and payload.get("current_stage") == "consultant_agent":
+            consultant_payload = payload.get("consultant_response")
+            if isinstance(consultant_payload, dict):
+                candidate = consultant_payload.get("text")
+                if isinstance(candidate, str) and candidate.strip():
+                    consultant_text = candidate.strip()
+        if consultant_text is not None:
+            assistant_text_raw = consultant_text
+        else:
+            assistant_text_raw, payload = safe_json_dumps(payload)
         model = resolve_model(request.model)
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)
 
         if request.stream:
+            if consultant_text is not None:
+                stream_iter = self._responses.stream_text_tokens(assistant_text_raw, model=model)
+            else:
+                stream_iter = self._responses.stream_simple_text(assistant_text_raw, model=model)
             return StreamingResponse(
-                self._responses.stream_simple_text(assistant_text_raw, model=model),
+                stream_iter,
                 headers=self._memory.conversation_headers(
                     conversation_id, generated_conversation_id
                 ),

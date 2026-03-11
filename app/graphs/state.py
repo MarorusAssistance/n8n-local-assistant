@@ -19,6 +19,8 @@ class ReasoningGraphState(TypedDict, total=False):
     model: Optional[str]
     request_id: Optional[str]
     existing_workflow: Any
+    conversation_context: List[Dict[str, str]]
+    active_workflow_context: Dict[str, Any]
     router_output: Any
     context_pack: Any
     plan: Any

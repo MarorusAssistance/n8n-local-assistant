@@ -27,6 +27,8 @@ class ReasoningPort(Protocol):
         model: Optional[str],
         request_id: Optional[str],
         existing_workflow: Any,
+        conversation_context: Optional[List[Dict[str, str]]] = None,
+        active_workflow_context: Optional[Dict[str, Any]] = None,
         run_config: Optional[Dict[str, Any]] = None,
     ) -> Union[ReasoningPipelineResult, MultiAgentGraphResult]:
         ...

@@ -11,6 +11,9 @@ from app.features.reasoning.multi_agent_contracts import (
     ArchitectureDataFlowItem,
     ArchitecturePlan,
     ArchitectureStage,
+    ConsultantQueryAnalysis,
+    ConsultantResponse,
+    ConsultantSource,
     ImplementationStatus,
     BusinessContextSummary,
     EntryIntent,
@@ -282,3 +285,64 @@ def test_chat_completion_contract_accepts_additive_engineer_fields(monkeypatch) 
     assert parsed["workflow_reference"]["id"] == "wf_contract_1"
     assert parsed["workflow_persist_action"] == "updated"
     assert "final_workflow_json" not in parsed
+
+
+def test_chat_completion_contract_consultant_content_is_text(monkeypatch) -> None:
+    client, _store = _client_with_store()
+    monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
+
+    consultant_result = MultiAgentGraphResult(
+        user_query="Explain webhook vs schedule",
+        entry_intent=EntryIntent.information_request,
+        target_stage=AgentStage.consultant_agent,
+        confidence=0.91,
+        routing_signals=["entered_consultant_agent"],
+        current_stage="consultant_agent",
+        missing_user_inputs=[],
+        consultant_query_analysis=ConsultantQueryAnalysis(
+            request_type="comparison",
+            key_topics=["webhook", "schedule"],
+            needs_active_workflow_context=False,
+            retrieval_needed=False,
+            conversation_history_sufficient=True,
+            source_limited=False,
+            selected_sources=[ConsultantSource.conversation_history],
+            analysis_notes=[],
+        ),
+        consultant_selected_sources=[ConsultantSource.conversation_history],
+        consultant_tools_used=[],
+        consultant_used_retrieval=False,
+        consultant_retrieval_results=[],
+        consultant_response=ConsultantResponse(
+            text="Webhook is event-driven. Schedule Trigger is time-driven.",
+            directly_supported=[],
+            inferred_guidance=[],
+            uncertainties=[],
+        ),
+        consultant_notes=[],
+        qa_enabled=False,
+        needs_replan=False,
+        status="stub_routed",
+    )
+    monkeypatch.setattr(
+        routes.chat_service._graph_runtime,  # noqa: SLF001
+        "run_reasoning",
+        lambda **kwargs: consultant_result,
+    )
+    monkeypatch.setattr("app.services.chat_service.resolve_model", lambda *_: "local-model")
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local-model",
+            "messages": [{"role": "user", "content": "Explain webhook vs schedule"}],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["object"] == "chat.completion"
+    content = payload["choices"][0]["message"]["content"]
+    assert isinstance(content, str)
+    assert "Webhook is event-driven" in content

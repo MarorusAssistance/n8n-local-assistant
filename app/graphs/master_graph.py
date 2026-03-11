@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .reasoning_graph import ReasoningGraphRuntime
 from .state import MasterGraphState
@@ -60,6 +60,16 @@ class MasterGraphRuntime:
             model=input_state.get("model"),
             request_id=input_state.get("request_id"),
             existing_workflow=input_state.get("existing_workflow"),
+            conversation_context=(
+                input_state.get("conversation_context")
+                if isinstance(input_state.get("conversation_context"), list)
+                else None
+            ),
+            active_workflow_context=(
+                input_state.get("active_workflow_context")
+                if isinstance(input_state.get("active_workflow_context"), dict)
+                else None
+            ),
             run_config=run_config,
         )
         return {"reasoning_result": result}
@@ -100,6 +110,8 @@ class MasterGraphRuntime:
         model: Optional[str],
         request_id: Optional[str],
         existing_workflow: Any,
+        conversation_context: Optional[List[Dict[str, str]]] = None,
+        active_workflow_context: Optional[Dict[str, Any]] = None,
         run_config: Optional[Dict[str, Any]] = None,
     ) -> Any:
         output = self.run(
@@ -110,6 +122,8 @@ class MasterGraphRuntime:
                     "model": model,
                     "request_id": request_id,
                     "existing_workflow": existing_workflow,
+                    "conversation_context": conversation_context or [],
+                    "active_workflow_context": active_workflow_context or {},
                 },
                 "run_config": run_config,
             }

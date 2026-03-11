@@ -268,11 +268,17 @@ def _build_select_items() -> Tuple[List[sql.SQL], List[str]]:
     return select_items, select_preview
 
 
-def _source_filter_condition() -> Tuple[Optional[sql.SQL], List[Any], str, str]:
-    if not settings.DOCS_SOURCE_FILTER:
+def _source_filter_condition(
+    source_filter: Optional[str] = None,
+) -> Tuple[Optional[sql.SQL], List[Any], str, str]:
+    effective_source = source_filter
+    if effective_source is None:
+        effective_source = settings.DOCS_SOURCE_FILTER
+
+    if not effective_source:
         return None, [], "", "-"
 
-    source_value = str(settings.DOCS_SOURCE_FILTER)
+    source_value = str(effective_source)
     if settings.SOURCE_JSON_PATH:
         display_path = _display_json_path(settings.SOURCE_JSON_PATH) or settings.SOURCE_JSON_PATH
         metadata_col = settings.METADATA_COLUMN or "metadata"
@@ -280,14 +286,14 @@ def _source_filter_condition() -> Tuple[Optional[sql.SQL], List[Any], str, str]:
         condition = sql.SQL("{source_expr} = %s").format(
             source_expr=_json_path_expr(settings.SOURCE_JSON_PATH)
         )
-        return condition, [settings.DOCS_SOURCE_FILTER], preview, source_value
+        return condition, [effective_source], preview, source_value
 
     if settings.SOURCE_COLUMN:
         preview = f"{settings.SOURCE_COLUMN} = :source"
         condition = sql.SQL("{source_col} = %s").format(
             source_col=sql.Identifier(settings.SOURCE_COLUMN)
         )
-        return condition, [settings.DOCS_SOURCE_FILTER], preview, source_value
+        return condition, [effective_source], preview, source_value
 
     raise ValueError("DOCS_SOURCE_FILTER set but no SOURCE_COLUMN or SOURCE_JSON_PATH")
 
@@ -389,13 +395,16 @@ def query_similar(
     embedding: List[float],
     top_k: Optional[int] = None,
     request_id: Optional[str] = None,
+    source_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     top_k = top_k or settings.TOP_K
     if top_k <= 0:
         top_k = settings.TOP_K
 
     select_items, select_preview = _build_select_items()
-    source_condition, source_params, source_preview, filter_value = _source_filter_condition()
+    source_condition, source_params, source_preview, filter_value = _source_filter_condition(
+        source_filter=source_filter
+    )
 
     conditions: List[sql.SQL] = []
     if source_condition is not None:
@@ -541,6 +550,7 @@ def query_fts(
     query_text: str,
     top_k: Optional[int] = None,
     request_id: Optional[str] = None,
+    source_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     text = (query_text or "").strip()
     if not text:
@@ -557,7 +567,9 @@ def query_fts(
     if not strict_query:
         return []
 
-    source_condition, source_params, source_preview, filter_value = _source_filter_condition()
+    source_condition, source_params, source_preview, filter_value = _source_filter_condition(
+        source_filter=source_filter
+    )
     if trace_logger.isEnabledFor(logging.INFO):
         trace_logger.info(
             "TRACE DB FTS PREP id=%s terms=%d strict_len=%d relaxed=%s",

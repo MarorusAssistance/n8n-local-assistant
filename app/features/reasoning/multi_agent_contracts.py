@@ -23,6 +23,15 @@ class AgentStage(str, Enum):
     qa_agent = "qa_agent"
 
 
+class ConsultantSource(str, Enum):
+    conversation_history = "conversation_history"
+    nodes_index = "nodes_index"
+    credentials_index = "credentials_index"
+    api_docs_index = "api_docs_index"
+    templates_index = "templates_index"
+    active_workflow = "active_workflow"
+
+
 class UseCase(BaseModel):
     id: str
     title: str
@@ -58,6 +67,51 @@ class EntryRouterDecision(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     routing_signals: List[str] = Field(default_factory=list)
     missing_user_inputs: List[str] = Field(default_factory=list)
+
+
+class ConsultantQueryAnalysis(BaseModel):
+    request_type: Literal[
+        "explanation",
+        "comparison",
+        "recommendation",
+        "workflow_context",
+        "general_information",
+        "unknown",
+    ] = "general_information"
+    key_topics: List[str] = Field(default_factory=list)
+    needs_active_workflow_context: bool = False
+    retrieval_needed: bool = False
+    conversation_history_sufficient: bool = True
+    source_limited: bool = False
+    selected_sources: List[ConsultantSource] = Field(default_factory=list)
+    analysis_notes: List[str] = Field(default_factory=list)
+
+
+class ConsultantToolUsage(BaseModel):
+    tool_name: str
+    source: ConsultantSource
+    call_order: int = Field(ge=1)
+    query: str
+    result_count: int = Field(default=0, ge=0)
+    status: Literal["ok", "unavailable", "error"] = "ok"
+    notes: Optional[str] = None
+
+
+class ConsultantRetrievalResult(BaseModel):
+    source: ConsultantSource
+    query: str
+    result_count: int = Field(default=0, ge=0)
+    chunk_ids: List[str] = Field(default_factory=list)
+    references: List[str] = Field(default_factory=list)
+    snippets: List[str] = Field(default_factory=list)
+    unavailable_reason: Optional[str] = None
+
+
+class ConsultantResponse(BaseModel):
+    text: str
+    directly_supported: List[str] = Field(default_factory=list)
+    inferred_guidance: List[str] = Field(default_factory=list)
+    uncertainties: List[str] = Field(default_factory=list)
 
 
 class NodeRequirement(BaseModel):
@@ -335,6 +389,13 @@ class MultiAgentGraphResult(BaseModel):
     routing_signals: List[str] = Field(default_factory=list)
     current_stage: Optional[str] = None
     missing_user_inputs: List[str] = Field(default_factory=list)
+    consultant_query_analysis: Optional[ConsultantQueryAnalysis] = None
+    consultant_selected_sources: List[ConsultantSource] = Field(default_factory=list)
+    consultant_tools_used: List[ConsultantToolUsage] = Field(default_factory=list)
+    consultant_used_retrieval: bool = False
+    consultant_retrieval_results: List[ConsultantRetrievalResult] = Field(default_factory=list)
+    consultant_response: Optional[ConsultantResponse] = None
+    consultant_notes: List[str] = Field(default_factory=list)
     business_context_summary: Optional[BusinessContextSummary] = None
     discovered_use_cases: List[UseCase] = Field(default_factory=list)
     selected_use_case: Optional[UseCase] = None

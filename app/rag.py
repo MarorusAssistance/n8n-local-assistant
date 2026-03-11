@@ -174,6 +174,7 @@ def retrieve_context(
     question: str,
     top_k: Optional[int] = None,
     request_id: Optional[str] = None,
+    source_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     final_top_k = _resolve_top_k(top_k)
     rerank_pool_size = _resolve_pool_size(final_top_k)
@@ -193,7 +194,12 @@ def retrieve_context(
     embed_ms = (time.perf_counter() - embed_start) * 1000
 
     vector_start = time.perf_counter()
-    vector_rows = query_similar(embedding, top_k=vector_limit, request_id=request_id)
+    vector_rows = query_similar(
+        embedding,
+        top_k=vector_limit,
+        request_id=request_id,
+        source_filter=source_filter,
+    )
     vector_ms = (time.perf_counter() - vector_start) * 1000
     vector_list = [_row_to_candidate(row) for row in vector_rows]
 
@@ -204,7 +210,12 @@ def retrieve_context(
     if settings.ENABLE_HYBRID:
         try:
             fts_start = time.perf_counter()
-            fts_rows = query_fts(question, top_k=fts_limit, request_id=request_id)
+            fts_rows = query_fts(
+                question,
+                top_k=fts_limit,
+                request_id=request_id,
+                source_filter=source_filter,
+            )
             fts_ms = (time.perf_counter() - fts_start) * 1000
             fts_list = [_row_to_candidate(row) for row in fts_rows]
             if trace_logger.isEnabledFor(logging.DEBUG):
@@ -267,7 +278,7 @@ def retrieve_context(
         docs_results,
         max_docs=settings.LINKED_DEFS_TOP_DOCS,
     )
-    if settings.LINKED_DEFS_ENABLED and page_keys:
+    if settings.LINKED_DEFS_ENABLED and page_keys and not source_filter:
         try:
             linked_defs = query_related_definition_chunks(page_keys, request_id=request_id)
         except Exception as exc:
@@ -288,7 +299,8 @@ def retrieve_context(
             "embed_ms={embed_ms:.1f} vector_ms={vector_ms:.1f} model={model} "
             "rerank={rerank} rerank_model={rerank_model} "
             "hybrid={hybrid} n_vec={n_vec} n_fts={n_fts} rrf_top_m={rrf_top_m} "
-            "rows_vec={rows_vec} rows_fts={rows_fts} rows_docs={rows_docs} rows_linked_defs={rows_linked_defs}"
+            "rows_vec={rows_vec} rows_fts={rows_fts} rows_docs={rows_docs} rows_linked_defs={rows_linked_defs} "
+            "source_filter={source_filter}"
         ).format(
             q_len=len(question),
             top_k=final_top_k,
@@ -308,6 +320,7 @@ def retrieve_context(
             rows_fts=len(fts_list),
             rows_docs=len(docs_results),
             rows_linked_defs=linked_defs_count,
+            source_filter=source_filter or settings.DOCS_SOURCE_FILTER or "-",
         )
         query_text = _trace_truncate(question, settings.TRACE_MAX_TEXT_CHARS)
         query_block = "\n  ".join(query_text.splitlines()) if query_text else "(vacio)"
@@ -354,6 +367,7 @@ def retrieve_context(
             "results_count": len(results),
             "docs_results_count": len(docs_results),
             "linked_defs_count": linked_defs_count,
+            "source_filter": source_filter or settings.DOCS_SOURCE_FILTER or None,
             "rerank_enabled": settings.ENABLE_RERANK,
             "hybrid_enabled": settings.ENABLE_HYBRID,
             "pre_rerank_chunks": _trace_chunk_payload(list(pre_rerank)),

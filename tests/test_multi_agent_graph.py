@@ -42,6 +42,20 @@ def test_graph_routes_start_to_expected_stub(
 ) -> None:
     runtime = ReasoningGraphRuntime()
     monkeypatch.setattr("app.graphs.reasoning_graph.route_entry_intent", lambda **kwargs: _decision(intent, stage))
+    if stage == AgentStage.consultant_agent:
+        monkeypatch.setattr(
+            "app.graphs.reasoning_graph.consultant_agent_node",
+            lambda state: {
+                "current_stage": "consultant_agent",
+                "routing_signals": list(state.get("routing_signals") or []) + ["entered_consultant_agent"],
+                "consultant_response": {"text": "Informational answer."},
+                "consultant_selected_sources": ["conversation_history"],
+                "consultant_tools_used": [],
+                "consultant_retrieval_results": [],
+                "consultant_used_retrieval": False,
+                "consultant_notes": ["test_stub"],
+            },
+        )
 
     result = runtime.run(
         user_prompt="route me",

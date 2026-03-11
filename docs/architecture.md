@@ -24,7 +24,14 @@ The backend uses a modular vertical-slice architecture:
     - hybrid acceptance gate,
     - clarification pause/resume support,
     - legacy bridge output for Engineer (`architecture_plan`, `required_nodes`, `proposed_nodes`)
-  - stub stages: `consultant_agent`, `engineer_agent`, `qa_agent`
+  - `consultant_agent` (informational path):
+    - conversation-first analysis,
+    - optional tool-calling over `nodes`, `credentials`, `api_docs`, `active_workflow`,
+    - graceful `templates_index` unavailable boundary,
+    - direct text response for `information_request`,
+    - token-by-token streaming on consultant responses.
+  - `engineer_agent` implemented runtime path.
+  - stub stage: `qa_agent`
   - terminal `unknown` route without forced stage.
 - Legacy reasoning fallback remains only for emergency mode when
   `LANGGRAPH_EMERGENCY_LEGACY_FALLBACK=true`.

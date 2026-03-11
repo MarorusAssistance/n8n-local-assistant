@@ -9,6 +9,11 @@ from ..features.reasoning.multi_agent_contracts import (
     ArchitecturePlan,
     BlockedNode,
     BusinessContextSummary,
+    ConsultantQueryAnalysis,
+    ConsultantResponse,
+    ConsultantRetrievalResult,
+    ConsultantSource,
+    ConsultantToolUsage,
     EntryIntent,
     ImplementationQueueItem,
     ImplementationStatus,
@@ -37,6 +42,13 @@ class MultiAgentGraphState(TypedDict, total=False):
     confidence: float
     routing_signals: List[str]
     current_stage: Optional[str]
+    consultant_query_analysis: Optional[ConsultantQueryAnalysis | Dict[str, Any]]
+    consultant_selected_sources: List[ConsultantSource | str]
+    consultant_tools_used: List[ConsultantToolUsage | Dict[str, Any]]
+    consultant_used_retrieval: bool
+    consultant_retrieval_results: List[ConsultantRetrievalResult | Dict[str, Any]]
+    consultant_response: Optional[ConsultantResponse | Dict[str, Any]]
+    consultant_notes: List[str]
     business_context_summary: Optional[BusinessContextSummary]
     discovered_use_cases: List[UseCase]
     selected_use_case: Optional[UseCase]

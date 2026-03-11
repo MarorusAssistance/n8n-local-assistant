@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -47,6 +48,47 @@ class ChatResponseBuilder:
             ],
         }
         yield ChatResponseBuilder._format_sse(first_chunk)
+
+        final_chunk = {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": now,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        yield ChatResponseBuilder._format_sse(final_chunk)
+        yield "data: [DONE]\n\n"
+
+    @staticmethod
+    def stream_text_tokens(text: str, model: str) -> Iterable[str]:
+        """Yield SSE chunks splitting text into token-like pieces for incremental UX."""
+        now = int(time.time())
+        chunk_id = f"chatcmpl-{now}"
+        token_parts = re.findall(r"\S+\s*|\s+", text or "")
+        if not token_parts:
+            token_parts = [text or ""]
+
+        for token in token_parts:
+            chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": now,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": token},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield ChatResponseBuilder._format_sse(chunk)
 
         final_chunk = {
             "id": chunk_id,
