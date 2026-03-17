@@ -19,6 +19,7 @@ class AgentStage(str, Enum):
     commercial_agent = "commercial_agent"
     consultant_agent = "consultant_agent"
     product_manager_agent = "product_manager_agent"
+    architect_agent = "architect_agent"
     engineer_agent = "engineer_agent"
     qa_agent = "qa_agent"
 
@@ -151,6 +152,7 @@ class ArchitectureStage(BaseModel):
     expected_inputs: List[str] = Field(default_factory=list)
     expected_outputs: List[str] = Field(default_factory=list)
     dependencies: List[str] = Field(default_factory=list)
+    success_criteria: List[str] = Field(default_factory=list)
     notes: Optional[str] = None
 
 

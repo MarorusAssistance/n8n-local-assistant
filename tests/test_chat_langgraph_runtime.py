@@ -58,9 +58,9 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un workflow",
         entry_intent=EntryIntent.business_discovery_conversation,
-        target_stage=AgentStage.engineer_agent,
+        target_stage=None,
         confidence=0.83,
-        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_engineer"],
+        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_architect"],
         current_stage="product_manager_agent",
         missing_user_inputs=[],
         business_context_summary=BusinessContextSummary(
@@ -105,20 +105,22 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
                     name="Intake",
                     purpose="Capture and normalize support ticket events.",
                     required_capabilities=["Capture support events", "Normalize payload"],
-                    expected_inputs=["Incoming support event"],
-                    expected_outputs=["Normalized ticket payload"],
-                    dependencies=[],
-                ),
-                ArchitectureStage(
-                    id="stage_escalation",
-                    name="Escalation Logic",
-                    purpose="Apply business escalation rules to classify urgency and route actions.",
-                    required_capabilities=["Evaluate SLA thresholds", "Route escalation path"],
-                    expected_inputs=["Normalized ticket payload"],
-                    expected_outputs=["Escalation command"],
-                    dependencies=["stage_intake"],
-                ),
-            ],
+                expected_inputs=["Incoming support event"],
+                expected_outputs=["Normalized ticket payload"],
+                dependencies=[],
+                success_criteria=["The support event is normalized for downstream stages."],
+            ),
+            ArchitectureStage(
+                id="stage_escalation",
+                name="Escalation Logic",
+                purpose="Apply business escalation rules to classify urgency and route actions.",
+                required_capabilities=["Evaluate SLA thresholds", "Route escalation path"],
+                expected_inputs=["Normalized ticket payload"],
+                expected_outputs=["Escalation command"],
+                dependencies=["stage_intake"],
+                success_criteria=["A single escalation outcome is produced."],
+            ),
+        ],
             data_flow=[
                 ArchitectureDataFlowItem(
                     source_stage_id="stage_intake",
@@ -128,28 +130,20 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
             ],
             assumptions=["Ticket priority metadata is reliable."],
             missing_information=[],
-            implementation_notes_for_engineer=["Configure node parameters and credentials in engineering phase."],
-            required_nodes=[
-                NodeRequirement(
-                    node_type="n8n-nodes-base.webhook",
-                    why_required="Evidence-backed trigger node from API docs retrieval.",
-                    evidence_chunk_ids=["linked:node:n8n-nodes-base.webhook"],
-                    evidence_refs=["Node: Webhook"],
-                    evidence_confidence=0.87,
-                    rerank_confidence=0.74,
-                    blended_confidence=0.84,
-                )
+            implementation_notes_for_engineer=[
+                "Architect agent should preserve the abstract stage order and business intent."
             ],
+            required_nodes=[],
         ),
         workflow_context=WorkflowContext(
             use_case_id="uc_1",
             planning_ready=True,
-            handoff_target=AgentStage.engineer_agent,
-            required_node_types=["n8n-nodes-base.webhook"],
+            handoff_target=AgentStage.architect_agent,
+            required_node_types=[],
             unresolved_inputs=[],
-            notes=["required_nodes=1"],
+            notes=["abstract_plan_only", "handoff_target=architect_agent"],
         ),
-        planning_summary="Architecture plan is ready for engineer handoff with evidence-backed required nodes.",
+        planning_summary="Abstract architecture plan is ready for architect handoff.",
         pm_status=PMStatus.pm_completed,
         pm_stage_plan=[
             PMStagePlan(
@@ -162,38 +156,13 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
                 dependencies=[],
             )
         ],
-        pm_stage_selections=[
-            PMStageSelection(
-                stage_id="stage_intake",
-                selected_node_types=["n8n-nodes-base.webhook"],
-                selected_nodes=[
-                    PMNodeCandidate(
-                        node_type="n8n-nodes-base.webhook",
-                        capability_summary="Capture inbound events.",
-                        limitations=[],
-                        usage_mode="action_only",
-                        evidence_chunk_ids=["chunk-1"],
-                        evidence_refs=["ref-1"],
-                        rerank_confidence=0.74,
-                        pm_fit_score=0.85,
-                    )
-                ],
-                rationale="Best fit for stage objective.",
-                pm_fit_score=0.85,
-                rerank_confidence=0.74,
-                top_margin=0.12,
-                gate_passed=True,
-                passes_used=1,
-                missing_information=[],
-                search_history=[],
-            )
-        ],
+        pm_stage_selections=[],
         pm_stage_progress=PMProgressState(
             total_stages=1,
-            current_stage_id="stage_intake",
+            current_stage_id=None,
             completed_stage_ids=["stage_intake"],
             blocked_stage_ids=[],
-            passes_by_stage={"stage_intake": 1},
+            passes_by_stage={},
         ),
         pm_clarification_state=PMClarificationState(
             attempts_used=0,
@@ -442,15 +411,18 @@ def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) ->
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
     assert parsed["entry_intent"] == "business_discovery_conversation"
-    assert parsed["target_stage"] == "engineer_agent"
+    assert parsed["target_stage"] is None
     assert parsed["current_stage"] == "product_manager_agent"
     assert parsed["selected_use_case"]["id"] == "uc_1"
     assert parsed["alternative_use_cases"] == []
-    assert parsed["architecture_plan"]["required_nodes"][0]["node_type"] == "n8n-nodes-base.webhook"
+    assert parsed["workflow_context"]["handoff_target"] == "architect_agent"
     assert parsed["workflow_context"]["planning_ready"] is True
     assert parsed["pm_status"] == "pm_completed"
     assert parsed["pm_stage_plan"][0]["id"] == "stage_intake"
-    assert parsed["pm_stage_selections"][0]["selected_node_types"] == ["n8n-nodes-base.webhook"]
+    assert "pm_stage_selections" not in parsed
+    assert "required_nodes" not in parsed["architecture_plan"]
+    assert "required_node_types" not in parsed["workflow_context"]
+    assert "proposed_nodes" not in parsed
     assert "selection_reason" in parsed
 
 
@@ -482,23 +454,16 @@ def test_workflow_uses_langgraph_runtime_when_enabled(monkeypatch) -> None:
     assert "Necesito el nodo exacto" in content
 
 
-def test_reasoning_payload_sanitizes_malformed_reference_spillover(monkeypatch) -> None:
+def test_reasoning_payload_hides_pm_legacy_node_fields(monkeypatch) -> None:
     client, service = _client_with_store()
     monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
     monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
     monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", False, raising=False)
 
-    bad = _fake_reasoning_result()
-    bad.architecture_plan.required_nodes[0].evidence_refs = [
-        (
-            "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.sendemail/"
-            '&quot;], "confidence": 0.66}, {"node_type":"n8n-nodes-base.code"}'
-        )
-    ]
     monkeypatch.setattr(
         service._graph_runtime,
         "run_reasoning",
-        lambda **kwargs: bad,
+        lambda **kwargs: _fake_reasoning_result(),
     )
 
     response = client.post(
@@ -513,8 +478,10 @@ def test_reasoning_payload_sanitizes_malformed_reference_spillover(monkeypatch) 
     payload = response.json()
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
-    ref = parsed["architecture_plan"]["required_nodes"][0]["evidence_refs"][0]
-    assert ref == "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.sendemail/"
+    assert "required_nodes" not in parsed["architecture_plan"]
+    assert "pm_stage_selections" not in parsed
+    assert "proposed_nodes" not in parsed
+    assert "required_credentials" not in parsed
 
 
 def test_reasoning_payload_includes_engineer_fields_when_engineer_stage_runs(monkeypatch) -> None:

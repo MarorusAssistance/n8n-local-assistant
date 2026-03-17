@@ -226,9 +226,6 @@ def _route_after_commercial(state: MultiAgentGraphState) -> str:
 
 
 def _route_after_product_manager(state: MultiAgentGraphState) -> str:
-    target = _stage_value(state.get("target_stage"))
-    if target == "engineer_agent":
-        return "engineer_agent"
     return "end"
 
 
@@ -277,7 +274,6 @@ class ReasoningGraphRuntime:
             "product_manager_agent",
             _route_after_product_manager,
             {
-                "engineer_agent": "engineer_agent",
                 "end": END,
             },
         )
@@ -360,14 +356,10 @@ class ReasoningGraphRuntime:
             current.update(self._commercial_node(current))
             if _route_after_commercial(current) == "product_manager_agent":
                 current.update(self._product_manager_node(current))
-                if _route_after_product_manager(current) == "engineer_agent":
-                    current.update(self._engineer_node(current))
         elif route == "consultant_agent":
             current.update(self._consultant_node(current))
         elif route == "product_manager_agent":
             current.update(self._product_manager_node(current))
-            if _route_after_product_manager(current) == "engineer_agent":
-                current.update(self._engineer_node(current))
         elif route == "engineer_agent":
             current.update(self._engineer_node(current))
         elif route == "qa_agent":
@@ -408,9 +400,7 @@ class ReasoningGraphRuntime:
         elif current_stage == "product_manager_agent":
             planning_ready = bool(workflow_context and workflow_context.planning_ready)
             if not workflow_context:
-                planning_ready = bool(
-                    architecture_plan is not None and target_stage_enum == AgentStage.engineer_agent
-                )
+                planning_ready = architecture_plan is not None
             if pm_status in (PMStatus.pm_blocked_waiting_user, PMStatus.pm_failed_no_solution):
                 status = "unknown_terminal"
             else:

@@ -6,11 +6,10 @@ import pytest
 
 from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
+    ArchitectureDataFlowItem,
+    ArchitectureStage,
     EntryIntent,
     PMClarificationState,
-    PMNodeCandidate,
-    PMStagePlan,
-    PMStageSelection,
     PMStatus,
     UseCase,
 )
@@ -20,10 +19,10 @@ from app.graphs.nodes import product_manager_agent as pm
 def _use_case(
     *,
     use_case_id: str = "uc_1",
-    title: str = "Webhook to Sheets",
-    business_problem: str = "Operations team manually copies incoming submissions into a spreadsheet.",
-    desired_outcome: str = "Automatically capture submissions and store them in Google Sheets.",
-    expected_value: str = "Reduce manual work and data-entry errors.",
+    title: str = "Urgent Email Classification",
+    business_problem: str = "The team manually reviews incoming emails and decides urgency.",
+    desired_outcome: str = "Classify each incoming email by urgency and persist the result.",
+    expected_value: str = "Reduce manual triage time and improve response speed.",
 ) -> UseCase:
     return UseCase(
         id=use_case_id,
@@ -41,7 +40,7 @@ def _state(
     *,
     selected_use_case: UseCase | Dict[str, Any] | None,
     entry_intent: EntryIntent = EntryIntent.business_discovery_conversation,
-    user_query: str = "Build a workflow for inbound forms",
+    user_query: str = "Build a workflow that classifies urgency",
     extra: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
@@ -57,113 +56,124 @@ def _state(
     return payload
 
 
-def _stage_plan() -> List[PMStagePlan]:
-    return [
-        PMStagePlan(
-            id="stage_intake",
-            name="Intake",
-            objective="Capture incoming payload.",
-            expected_inputs=["incoming event"],
-            expected_outputs=["normalized payload"],
-            success_criteria=["event captured"],
-            dependencies=[],
-        ),
-        PMStagePlan(
-            id="stage_delivery",
-            name="Delivery",
-            objective="Persist normalized payload to destination.",
-            expected_inputs=["normalized payload"],
-            expected_outputs=["delivery result"],
-            success_criteria=["payload persisted"],
-            dependencies=["stage_intake"],
-        ),
-    ]
-
-
-def _selection(stage_id: str, node_type: str, *, gate_passed: bool = True) -> PMStageSelection:
-    return PMStageSelection(
-        stage_id=stage_id,
-        selected_node_types=[node_type] if gate_passed else [],
-        selected_nodes=(
-            [
-                PMNodeCandidate(
-                    node_type=node_type,
-                    capability_summary=f"Use {node_type} for {stage_id}.",
-                    limitations=[],
-                    usage_mode="action_only",
-                    evidence_chunk_ids=[f"chunk-{stage_id}"],
-                    evidence_refs=[f"ref-{stage_id}"],
-                    rerank_confidence=0.72,
-                    pm_fit_score=0.84,
-                )
-            ]
-            if gate_passed
-            else []
-        ),
-        rationale=f"Selected node for {stage_id}." if gate_passed else "Insufficient evidence.",
-        pm_fit_score=0.84 if gate_passed else 0.42,
-        rerank_confidence=0.72 if gate_passed else 0.30,
-        top_margin=0.12 if gate_passed else 0.02,
-        gate_passed=gate_passed,
-        passes_used=1,
-        missing_information=[] if gate_passed else ["Need more integration details."],
-        search_history=[],
+def _abstract_plan(
+    *,
+    planning_ready: bool = True,
+    missing_information: List[str] | None = None,
+) -> pm._AbstractPlanningOutput:
+    return pm._AbstractPlanningOutput(
+        workflow_summary="Abstract workflow plan with intake, classification, and persistence.",
+        stages=[
+            ArchitectureStage(
+                id="stage_intake",
+                name="Intake",
+                purpose="Receive each incoming email and normalize the working payload.",
+                required_capabilities=["Capture inbound item", "Normalize payload"],
+                expected_inputs=["Incoming email"],
+                expected_outputs=["Normalized email payload"],
+                dependencies=[],
+                success_criteria=["Each relevant email enters the workflow once."],
+            ),
+            ArchitectureStage(
+                id="stage_classification",
+                name="Classification",
+                purpose="Determine the urgency level from the subject and content.",
+                required_capabilities=["Interpret content", "Apply urgency logic"],
+                expected_inputs=["Normalized email payload"],
+                expected_outputs=["Urgency decision"],
+                dependencies=["stage_intake"],
+                success_criteria=["A single urgency outcome is produced for each email."],
+            ),
+            ArchitectureStage(
+                id="stage_persistence",
+                name="Persistence",
+                purpose="Store or communicate the assigned urgency result.",
+                required_capabilities=["Persist result", "Make outcome available downstream"],
+                expected_inputs=["Urgency decision"],
+                expected_outputs=["Stored urgency record"],
+                dependencies=["stage_classification"],
+                success_criteria=["The urgency result is stored or forwarded."],
+            ),
+        ],
+        data_flow=[
+            ArchitectureDataFlowItem(
+                source_stage_id="stage_intake",
+                target_stage_id="stage_classification",
+                data_items=["normalized email payload"],
+            ),
+            ArchitectureDataFlowItem(
+                source_stage_id="stage_classification",
+                target_stage_id="stage_persistence",
+                data_items=["urgency decision"],
+            ),
+        ],
+        assumptions=["The triggering source of the emails will be grounded later by architect_agent."],
+        missing_information=missing_information or [],
+        handoff_notes=[
+            "Architect agent must preserve this three-stage flow and choose nodes that fit the full workflow."
+        ],
+        planning_ready=planning_ready,
     )
 
 
-def test_pm_completes_stage_first_and_builds_legacy_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
-    selected = _use_case(use_case_id="uc_stage_bridge")
-    monkeypatch.setattr(pm, "_plan_stages_with_structured_output", lambda **_: _stage_plan())
+def test_pm_completes_abstract_plan_for_architect_handoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected = _use_case(use_case_id="uc_pm_ready")
     monkeypatch.setattr(
         pm,
-        "_run_stage_selection_passes",
-        lambda **kwargs: _selection(kwargs["stage"].id, "n8n-nodes-base.webhook")
-        if kwargs["stage"].id == "stage_intake"
-        else _selection(kwargs["stage"].id, "n8n-nodes-base.googleSheets"),
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: _abstract_plan(),
     )
 
     updates = pm.product_manager_agent_node(_state(selected_use_case=selected))
 
     assert updates["pm_status"] == PMStatus.pm_completed
-    assert updates["target_stage"] == AgentStage.engineer_agent
-    assert updates["architecture_plan"] is not None
-    assert len(updates["pm_stage_plan"]) == 2
-    assert len(updates["pm_stage_selections"]) == 2
+    assert updates["target_stage"] is None
     assert updates["workflow_context"].planning_ready is True
-    assert updates["architecture_plan"].required_nodes[0].node_type == "n8n-nodes-base.webhook"
-    assert updates["proposed_nodes"][0].purpose
+    assert updates["workflow_context"].handoff_target == AgentStage.architect_agent
+    assert updates["architecture_plan"] is not None
+    assert updates["architecture_plan"].required_nodes == []
+    assert updates["proposed_nodes"] == []
+    assert updates["required_credentials"] == []
+    assert updates["pm_stage_plan"][0].id == "stage_intake"
+    assert updates["pm_stage_selections"] == []
+    assert "handoff_ready_architect" in updates["routing_signals"]
 
 
 def test_pm_accepts_direct_build_request_without_selected_use_case(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(pm, "_plan_stages_with_structured_output", lambda **_: _stage_plan())
     monkeypatch.setattr(
         pm,
-        "_run_stage_selection_passes",
-        lambda **kwargs: _selection(kwargs["stage"].id, "n8n-nodes-base.webhook"),
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: _abstract_plan(),
     )
 
     updates = pm.product_manager_agent_node(
         _state(
             selected_use_case=None,
             entry_intent=EntryIntent.workflow_build_request,
-            user_query="Create a webhook workflow that writes data to Google Sheets.",
+            user_query="Create a workflow that triages incoming emails by urgency.",
         )
     )
 
     assert updates["pm_status"] == PMStatus.pm_completed
-    assert updates["target_stage"] == AgentStage.engineer_agent
+    assert updates["target_stage"] is None
     assert "pm_use_case_derived_from_direct_build_request" in updates["routing_signals"]
+    assert updates["workflow_context"].handoff_target == AgentStage.architect_agent
 
 
-def test_pm_blocks_and_requests_clarification_when_stage_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    selected = _use_case(use_case_id="uc_blocked")
-    monkeypatch.setattr(pm, "_plan_stages_with_structured_output", lambda **_: _stage_plan())
+def test_pm_blocks_when_abstract_plan_needs_more_information(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected = _use_case(use_case_id="uc_pm_blocked")
     monkeypatch.setattr(
         pm,
-        "_run_stage_selection_passes",
-        lambda **kwargs: _selection(kwargs["stage"].id, "n8n-nodes-base.webhook", gate_passed=False),
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: _abstract_plan(
+            planning_ready=False,
+            missing_information=[
+                "What source should provide the incoming emails?",
+                "Where should the urgency classification be stored?",
+            ],
+        ),
     )
 
     updates = pm.product_manager_agent_node(_state(selected_use_case=selected))
@@ -171,18 +181,21 @@ def test_pm_blocks_and_requests_clarification_when_stage_fails(monkeypatch: pyte
     assert updates["pm_status"] == PMStatus.pm_blocked_waiting_user
     assert updates["target_stage"] is None
     assert updates["workflow_context"].planning_ready is False
+    assert updates["workflow_context"].handoff_target is None
     assert updates["pm_clarification_state"].attempts_used == 1
     assert updates["pm_clarification_state"].pending_questions
     assert "pm_blocked_waiting_user" in updates["routing_signals"]
 
 
 def test_pm_fails_after_max_clarification_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
-    selected = _use_case(use_case_id="uc_failed")
-    monkeypatch.setattr(pm, "_plan_stages_with_structured_output", lambda **_: _stage_plan())
+    selected = _use_case(use_case_id="uc_pm_failed")
     monkeypatch.setattr(
         pm,
-        "_run_stage_selection_passes",
-        lambda **kwargs: _selection(kwargs["stage"].id, "n8n-nodes-base.webhook", gate_passed=False),
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: _abstract_plan(
+            planning_ready=False,
+            missing_information=["Which business rule defines urgency?"],
+        ),
     )
 
     updates = pm.product_manager_agent_node(
@@ -190,11 +203,10 @@ def test_pm_fails_after_max_clarification_rounds(monkeypatch: pytest.MonkeyPatch
             selected_use_case=selected,
             extra={
                 "pm_status": PMStatus.pm_blocked_waiting_user,
-                "pm_stage_plan": _stage_plan(),
                 "pm_clarification_state": PMClarificationState(
                     attempts_used=2,
                     max_attempts=2,
-                    pending_questions=["Need integration details."],
+                    pending_questions=["Which business rule defines urgency?"],
                     turns=[],
                 ),
             },
@@ -207,28 +219,30 @@ def test_pm_fails_after_max_clarification_rounds(monkeypatch: pytest.MonkeyPatch
     assert "pm_failed_no_solution" in updates["routing_signals"]
 
 
-def test_pm_resume_consumes_user_answer_and_continues(monkeypatch: pytest.MonkeyPatch) -> None:
-    selected = _use_case(use_case_id="uc_resume")
-    monkeypatch.setattr(pm, "_plan_stages_with_structured_output", lambda **_: _stage_plan())
+def test_pm_resume_consumes_user_answer_and_completes(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected = _use_case(use_case_id="uc_pm_resume")
     monkeypatch.setattr(
         pm,
-        "_run_stage_selection_passes",
-        lambda **kwargs: _selection(kwargs["stage"].id, "n8n-nodes-base.webhook"),
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: _abstract_plan(),
     )
 
     updates = pm.product_manager_agent_node(
         _state(
             selected_use_case=selected,
-            user_query="Use Gmail inbound trigger and persist rows to Sheets.",
+            user_query="Use the email inbox as source and persist urgency in our ticket record.",
             extra={
                 "pm_status": PMStatus.pm_blocked_waiting_user,
-                "pm_stage_plan": _stage_plan(),
                 "pm_clarification_state": PMClarificationState(
                     attempts_used=1,
                     max_attempts=2,
-                    pending_questions=["Need trigger and destination details."],
+                    pending_questions=["What source should provide the incoming emails?"],
                     turns=[
-                        {"stage_id": "stage_intake", "question": "Need trigger and destination details.", "answer": None}
+                        {
+                            "stage_id": None,
+                            "question": "What source should provide the incoming emails?",
+                            "answer": None,
+                        }
                     ],
                 ),
             },
@@ -239,151 +253,29 @@ def test_pm_resume_consumes_user_answer_and_continues(monkeypatch: pytest.Monkey
     assert updates["pm_clarification_state"].pending_questions == []
     assert updates["pm_clarification_state"].turns[-1].answer is not None
     assert "pm_clarification_answer_received" in updates["routing_signals"]
+    assert updates["workflow_context"].handoff_target == AgentStage.architect_agent
 
 
-def test_extract_required_nodes_uses_strict_explicit_evidence_only() -> None:
-    docs = [
-        {
-            "doc_id": "doc-with-node-line-only",
-            "title": "Guide",
-            "url": "https://docs.n8n.io/guides",
-            "text": "Node Type: n8n-nodes-base.webhook",
-            "metadata": {"kind": "DOCS_PAGE"},
-        },
-        {
-            "doc_id": "linked:node:n8n-nodes-base.webhook",
-            "context_kind": "linked_def",
-            "linked_def_type": "node",
-            "linked_entity_id": "n8n-nodes-base.webhook",
-            "metadata": {"kind": "NODE_OVERVIEW", "nodeType": "n8n-nodes-base.webhook"},
-            "text": "Kind: NODE_OVERVIEW\nNode Type: n8n-nodes-base.webhook\nSupports webhook trigger.",
-            "link_confidence": 0.91,
-        },
-    ]
-    required = pm.extract_required_nodes_from_docs(docs)
-    assert [item.node_type for item in required] == ["n8n-nodes-base.webhook"]
-
-
-def test_rerank_confidence_comes_from_docs_rerank_not_link_confidence() -> None:
-    docs = [
-        {
-            "doc_id": "linked:node:webhook",
-            "context_kind": "linked_def",
-            "linked_def_type": "node",
-            "linked_entity_id": "n8n-nodes-base.webhook",
-            "link_doc_page_key": "page-webhook",
-            "metadata": {"kind": "NODE_OVERVIEW", "nodeType": "n8n-nodes-base.webhook"},
-            "text": "Kind: NODE_OVERVIEW\nNode Type: n8n-nodes-base.webhook\nCan receive events.",
-            "link_confidence": 0.95,
-        },
-        {
-            "doc_id": "docs:webhook",
-            "url": "https://docs.n8n.io/webhook",
-            "metadata": {"kind": "DOCS_PAGE", "page_id": "page-webhook"},
-            "text": "Webhook node docs page.",
-            "rerank_score": 0.81,
-        },
-        {
-            "doc_id": "linked:node:code",
-            "context_kind": "linked_def",
-            "linked_def_type": "node",
-            "linked_entity_id": "n8n-nodes-base.code",
-            "metadata": {"kind": "NODE_OVERVIEW", "nodeType": "n8n-nodes-base.code"},
-            "text": "Kind: NODE_OVERVIEW\nNode Type: n8n-nodes-base.code",
-            "link_confidence": 0.93,
-        },
-    ]
-    required = pm.extract_required_nodes_from_docs(docs)
-    by_type = {item.node_type: item for item in required}
-    assert by_type["n8n-nodes-base.webhook"].rerank_confidence is not None
-    assert by_type["n8n-nodes-base.code"].rerank_confidence is None
-
-
-def test_filter_tool_only_nodes_depends_on_use_case_mode() -> None:
-    non_agentic = _use_case(use_case_id="uc_non_agentic", title="Standard sync workflow")
-    agentic = _use_case(use_case_id="uc_agentic", title="AI agent tool calling workflow")
-
-    tool_only = pm.NodeRequirement(
-        node_type="n8n-nodes-base.emailReadImapTool",
-        why_required="Tool node",
-        evidence_chunk_ids=[],
-        evidence_refs=[],
-        evidence_confidence=0.7,
-        usage_mode="tool_only",
+def test_pm_does_not_call_retrieval_or_select_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    selected = _use_case(use_case_id="uc_no_retrieval")
+    monkeypatch.setattr(
+        pm,
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: _abstract_plan(),
     )
-    action_node = pm.NodeRequirement(
-        node_type="n8n-nodes-base.emailReadImap",
-        why_required="Action node",
-        evidence_chunk_ids=[],
-        evidence_refs=[],
-        evidence_confidence=0.7,
-        usage_mode="action_only",
+    monkeypatch.setattr(
+        "app.graphs.nodes.product_manager_agent.get_langchain_chat_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not expected in this test")),
     )
 
-    kept_non_agentic, dropped_non_agentic = pm._filter_required_nodes_for_usage(  # noqa: SLF001
-        use_case=non_agentic,
-        required_nodes=[tool_only, action_node],
-    )
-    kept_agentic, dropped_agentic = pm._filter_required_nodes_for_usage(  # noqa: SLF001
-        use_case=agentic,
-        required_nodes=[tool_only, action_node],
+    updates = pm.product_manager_agent_node(
+        _state(
+            selected_use_case=selected,
+            extra={"workflow_context": {"model": None, "request_id": "req-no-model"}},
+        )
     )
 
-    assert [item.node_type for item in kept_non_agentic] == ["n8n-nodes-base.emailReadImap"]
-    assert [item.node_type for item in dropped_non_agentic] == ["n8n-nodes-base.emailReadImapTool"]
-    assert len(kept_agentic) == 2
-    assert dropped_agentic == []
-
-
-def test_stage_selection_respects_max_passes(monkeypatch: pytest.MonkeyPatch) -> None:
-    use_case = _use_case(use_case_id="uc_passes")
-    stage = _stage_plan()[0]
-    calls = {"retrieve": 0}
-
-    def _retrieve_docs(_query: str, request_id: str | None = None) -> List[Dict[str, Any]]:
-        calls["retrieve"] += 1
-        return []
-
-    monkeypatch.setattr(pm.settings, "PM_MAX_STAGE_RETRIEVAL_PASSES", 3, raising=False)
-    monkeypatch.setattr(pm, "retrieve_docs", _retrieve_docs)
-
-    selection = pm._run_stage_selection_passes(  # noqa: SLF001
-        use_case=use_case,
-        stage=stage,
-        model=None,
-        request_id="req-pass-limit",
-        clarification_state=PMClarificationState(attempts_used=0, max_attempts=2, pending_questions=[], turns=[]),
-        trace_events=[],
-    )
-
-    assert calls["retrieve"] == 3
-    assert selection.passes_used == 3
-    assert selection.gate_passed is False
-
-
-def test_hybrid_gate_policy_thresholds() -> None:
-    assert pm._stage_gate_pass(pm_fit_score=0.72, rerank_confidence=0.56, top_margin=0.01) is True  # noqa: SLF001
-    assert pm._stage_gate_pass(pm_fit_score=0.72, rerank_confidence=None, top_margin=0.11) is True  # noqa: SLF001
-    assert pm._stage_gate_pass(pm_fit_score=0.69, rerank_confidence=0.90, top_margin=0.50) is False  # noqa: SLF001
-    assert pm._stage_gate_pass(pm_fit_score=0.72, rerank_confidence=0.40, top_margin=0.05) is False  # noqa: SLF001
-
-
-def test_extract_required_nodes_sanitizes_reference_spillover() -> None:
-    docs = [
-        {
-            "doc_id": "linked:node:n8n-nodes-base.emailSend",
-            "context_kind": "linked_def",
-            "linked_def_type": "node",
-            "linked_entity_id": "n8n-nodes-base.emailSend",
-            "metadata": {"kind": "NODE_OVERVIEW", "nodeType": "n8n-nodes-base.emailSend"},
-            "url": (
-                "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.sendemail/"
-                '&quot;], "confidence": 0.66}, {"node_type":"n8n-nodes-base.code"}'
-            ),
-            "text": "Kind: NODE_OVERVIEW\nNode Type: n8n-nodes-base.emailSend",
-        }
-    ]
-    required = pm.extract_required_nodes_from_docs(docs)
-    assert required[0].evidence_refs == [
-        "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.sendemail/"
-    ]
+    assert updates["architecture_plan"].required_nodes == []
+    assert updates["pm_stage_selections"] == []
+    assert updates["proposed_nodes"] == []
+    assert updates["required_credentials"] == []

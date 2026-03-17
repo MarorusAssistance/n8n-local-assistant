@@ -79,13 +79,13 @@ def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytes
         "app.graphs.reasoning_graph.product_manager_agent_node",
         lambda state: {
             "current_stage": "product_manager_agent",
-            "target_stage": AgentStage.engineer_agent,
-            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+            "target_stage": None,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_architect"],
             "workflow_context": WorkflowContext(
                 use_case_id="uc_build",
                 planning_ready=True,
-                handoff_target=AgentStage.engineer_agent,
-                required_node_types=["n8n-nodes-base.webhook"],
+                handoff_target=AgentStage.architect_agent,
+                required_node_types=[],
                 unresolved_inputs=[],
                 notes=["test"],
             ),
@@ -104,32 +104,15 @@ def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytes
                         expected_inputs=["user request"],
                         expected_outputs=["normalized payload"],
                         dependencies=[],
+                        success_criteria=["Input is captured and normalized."],
                     )
                 ],
                 data_flow=[],
                 assumptions=[],
                 missing_information=[],
                 implementation_notes_for_engineer=[],
-                required_nodes=[
-                    NodeRequirement(
-                        node_type="n8n-nodes-base.webhook",
-                        why_required="Required trigger",
-                        evidence_chunk_ids=["chunk-1"],
-                        evidence_refs=["ref-1"],
-                        evidence_confidence=0.8,
-                    )
-                ],
+                required_nodes=[],
             ),
-        },
-    )
-    monkeypatch.setattr(
-        "app.graphs.reasoning_graph.engineer_agent_node",
-        lambda state: {
-            "current_stage": "engineer_agent",
-            "target_stage": AgentStage.qa_agent,
-            "implementation_status": ImplementationStatus.completed,
-            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
-            "final_workflow_json": {"nodes": [{"id": "n1"}], "connections": {}},
         },
     )
 
@@ -139,8 +122,10 @@ def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytes
         request_id="req-build-1",
         existing_workflow=None,
     )
-    assert result.current_stage == "engineer_agent"
-    assert result.target_stage == AgentStage.qa_agent
+    assert result.current_stage == "product_manager_agent"
+    assert result.target_stage is None
+    assert result.workflow_context is not None
+    assert result.workflow_context.handoff_target == AgentStage.architect_agent
     assert result.status == "stub_routed"
 
 
@@ -212,8 +197,8 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
         "app.graphs.reasoning_graph.product_manager_agent_node",
         lambda state: {
             "current_stage": "product_manager_agent",
-            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
-            "target_stage": AgentStage.engineer_agent,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_architect"],
+            "target_stage": None,
             "architecture_plan": ArchitecturePlan(
                 use_case_id="uc_1",
                 title="Invoice approval reminders",
@@ -229,6 +214,7 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
                         expected_inputs=["Approval event"],
                         expected_outputs=["Normalized payload"],
                         dependencies=[],
+                        success_criteria=["The approval event is normalized for downstream stages."],
                     )
                 ],
                 data_flow=[
@@ -240,38 +226,18 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
                 ],
                 assumptions=["Approval source is stable"],
                 missing_information=[],
-                implementation_notes_for_engineer=["Configure node parameters in engineering phase."],
-                required_nodes=[
-                    NodeRequirement(
-                        node_type="n8n-nodes-base.webhook",
-                        why_required="Evidence-backed node for intake",
-                        evidence_chunk_ids=["linked:node:n8n-nodes-base.webhook"],
-                        evidence_refs=["Node: Webhook"],
-                        evidence_confidence=0.86,
-                        rerank_confidence=0.71,
-                        blended_confidence=0.82,
-                    )
-                ],
+                implementation_notes_for_engineer=["Architect agent should preserve this stage intent."],
+                required_nodes=[],
             ),
             "workflow_context": WorkflowContext(
                 use_case_id="uc_1",
                 planning_ready=True,
-                handoff_target=AgentStage.engineer_agent,
-                required_node_types=["n8n-nodes-base.webhook"],
+                handoff_target=AgentStage.architect_agent,
+                required_node_types=[],
                 unresolved_inputs=[],
-                notes=["required_nodes=1"],
+                notes=["abstract_plan_only"],
             ),
-            "planning_summary": "Handoff ready for engineer with evidence-backed nodes.",
-        },
-    )
-    monkeypatch.setattr(
-        "app.graphs.reasoning_graph.engineer_agent_node",
-        lambda state: {
-            "current_stage": "engineer_agent",
-            "target_stage": AgentStage.qa_agent,
-            "implementation_status": ImplementationStatus.completed,
-            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
-            "final_workflow_json": {"nodes": [{"id": "n1"}], "connections": {}},
+            "planning_summary": "Handoff ready for architect with abstract stages.",
         },
     )
     runtime = ReasoningGraphRuntime()
@@ -286,14 +252,14 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
         request_id="req-commercial-1",
         existing_workflow=None,
     )
-    assert result.current_stage == "engineer_agent"
+    assert result.current_stage == "product_manager_agent"
     assert result.selected_use_case is not None
-    assert result.target_stage == AgentStage.qa_agent
+    assert result.target_stage is None
     assert "handoff_ready_product_manager" in result.routing_signals
-    assert "handoff_ready_engineer" in result.routing_signals
-    assert "handoff_ready_qa" in result.routing_signals
+    assert "handoff_ready_architect" in result.routing_signals
     assert result.architecture_plan is not None
     assert result.workflow_context is not None
+    assert result.workflow_context.handoff_target == AgentStage.architect_agent
     assert result.status == "stub_routed"
 
 
@@ -394,82 +360,35 @@ def test_runtime_resumes_blocked_engineer_state_on_same_thread(
 ) -> None:
     runtime = ReasoningGraphRuntime()
     monkeypatch.setattr(
-        "app.graphs.nodes.engineer_agent.N8NClient.create_workflow",
-        lambda self, payload: {"id": "wf_resume_1", "name": payload.get("name"), "url": "http://localhost:5678/workflow/wf_resume_1"},
+        "app.graphs.reasoning_graph.route_entry_intent",
+        lambda **kwargs: _decision(EntryIntent.workflow_edit_request, AgentStage.engineer_agent),
     )
 
-    monkeypatch.setattr(
-        "app.graphs.reasoning_graph.route_entry_intent",
-        lambda **kwargs: _decision(EntryIntent.workflow_build_request, AgentStage.product_manager_agent),
-    )
-    monkeypatch.setattr(
-        "app.graphs.reasoning_graph.product_manager_agent_node",
-        lambda state: {
-            "current_stage": "product_manager_agent",
-            "target_stage": AgentStage.engineer_agent,
-            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
-            "architecture_plan": ArchitecturePlan(
-                use_case_id="uc_resume",
-                title="HTTP integration flow",
-                business_objective="Push events to external API",
-                desired_outcome="Create API call per incoming event",
-                workflow_summary="Two stages",
-                stages=[
-                    ArchitectureStage(
-                        id="s1",
-                        name="Trigger",
-                        purpose="Receive event",
-                        required_capabilities=["Receive"],
-                        expected_inputs=["event"],
-                        expected_outputs=["payload"],
-                        dependencies=[],
-                    ),
-                    ArchitectureStage(
-                        id="s2",
-                        name="Call API",
-                        purpose="Send HTTP request",
-                        required_capabilities=["HTTP call"],
-                        expected_inputs=["payload"],
-                        expected_outputs=["api_response"],
-                        dependencies=["s1"],
-                    ),
-                ],
-                data_flow=[
-                    ArchitectureDataFlowItem(
-                        source_stage_id="s1",
-                        target_stage_id="s2",
-                        data_items=["payload"],
-                    )
-                ],
-                assumptions=[],
-                missing_information=[],
-                implementation_notes_for_engineer=[],
-                required_nodes=[
-                    NodeRequirement(
-                        node_type="n8n-nodes-base.httpRequest",
-                        why_required="Required outbound API call",
-                        evidence_chunk_ids=["chunk-http"],
-                        evidence_refs=["ref-http"],
-                        evidence_confidence=0.8,
-                    )
-                ],
-            ),
-            "workflow_context": WorkflowContext(
-                use_case_id="uc_resume",
-                planning_ready=True,
-                handoff_target=AgentStage.engineer_agent,
-                required_node_types=["n8n-nodes-base.httpRequest"],
-                unresolved_inputs=[],
-                notes=[],
-            ),
-            "proposed_nodes": [],
-            "required_credentials": [],
-        },
-    )
+    call_state = {"count": 0}
+
+    def _engineer_node(state):
+        call_state["count"] += 1
+        if call_state["count"] == 1:
+            return {
+                "current_stage": "engineer_agent",
+                "target_stage": None,
+                "implementation_status": ImplementationStatus.blocked_waiting_user,
+                "routing_signals": list(state.get("routing_signals") or []),
+                "final_workflow_json": {},
+            }
+        return {
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.completed,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
+            "final_workflow_json": {"nodes": [{"id": "n1"}], "connections": {}},
+        }
+
+    monkeypatch.setattr("app.graphs.reasoning_graph.engineer_agent_node", _engineer_node)
 
     run_config = {"configurable": {"thread_id": "conv-resume-1"}}
     first = runtime.run(
-        user_prompt="Build an API sync workflow",
+        user_prompt="Update this workflow to call an API.",
         model=None,
         request_id="req-resume-1",
         existing_workflow=None,
@@ -524,38 +443,13 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
                         "dependencies": [],
                     }
                 ],
-                "pm_stage_selections": [
-                    {
-                        "stage_id": "stage_1",
-                        "selected_node_types": ["n8n-nodes-base.webhook"],
-                        "selected_nodes": [
-                            {
-                                "node_type": "n8n-nodes-base.webhook",
-                                "capability_summary": "Capture event",
-                                "limitations": [],
-                                "usage_mode": "action_only",
-                                "evidence_chunk_ids": ["chunk-1"],
-                                "evidence_refs": ["ref-1"],
-                                "rerank_confidence": 0.7,
-                                "pm_fit_score": 0.85,
-                            }
-                        ],
-                        "rationale": "Match stage objective",
-                        "pm_fit_score": 0.85,
-                        "rerank_confidence": 0.7,
-                        "top_margin": 0.15,
-                        "gate_passed": True,
-                        "passes_used": 1,
-                        "missing_information": [],
-                        "search_history": [],
-                    }
-                ],
+                "pm_stage_selections": [],
                 "pm_stage_progress": {
                     "total_stages": 1,
-                    "current_stage_id": "stage_1",
+                    "current_stage_id": None,
                     "completed_stage_ids": ["stage_1"],
                     "blocked_stage_ids": [],
-                    "passes_by_stage": {"stage_1": 1},
+                    "passes_by_stage": {},
                 },
                 "pm_clarification_state": {
                     "attempts_used": 1,
@@ -569,16 +463,16 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
                         }
                     ],
                 },
-                "target_stage": AgentStage.engineer_agent,
+                "target_stage": None,
                 "workflow_context": WorkflowContext(
                     use_case_id="uc_pm_resume",
                     planning_ready=True,
-                    handoff_target=AgentStage.engineer_agent,
-                    required_node_types=["n8n-nodes-base.webhook"],
+                    handoff_target=AgentStage.architect_agent,
+                    required_node_types=[],
                     unresolved_inputs=[],
                     notes=["pm-resumed"],
                 ),
-                "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+                "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_architect"],
             }
         return {
             "current_stage": "product_manager_agent",
@@ -603,15 +497,6 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
         }
 
     monkeypatch.setattr("app.graphs.reasoning_graph.product_manager_agent_node", _pm_node)
-    monkeypatch.setattr(
-        "app.graphs.reasoning_graph.engineer_agent_node",
-        lambda state: {
-            "current_stage": "engineer_agent",
-            "target_stage": AgentStage.qa_agent,
-            "implementation_status": ImplementationStatus.blocked_waiting_user,
-            "routing_signals": list(state.get("routing_signals") or []),
-        },
-    )
 
     run_config = {"configurable": {"thread_id": "thread-pm-resume-1"}}
     first = runtime.run(
@@ -632,6 +517,9 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
         run_config=run_config,
     )
     assert route_calls["count"] == 1
-    assert second.current_stage == "engineer_agent"
+    assert second.current_stage == "product_manager_agent"
     assert second.pm_status == "pm_completed"
+    assert second.target_stage is None
+    assert second.workflow_context is not None
+    assert second.workflow_context.handoff_target == AgentStage.architect_agent
     assert "resume_pm_from_checkpoint" in second.routing_signals

@@ -504,6 +504,7 @@ class ChatService:
                 "checker": result.checker.model_dump(exclude_none=True),
             }
 
+        consultant_text: Optional[str] = None
         payload = sanitize_for_json(payload)
         if consultant_text is None and payload.get("current_stage") == "consultant_agent":
             consultant_payload = payload.get("consultant_response")
@@ -786,6 +787,16 @@ class ChatService:
                 },
                 "status": str(getattr(result, "status", "unknown_terminal")),
             }
+            if current_stage == "product_manager_agent":
+                architecture_payload = payload.get("architecture_plan")
+                if isinstance(architecture_payload, dict):
+                    architecture_payload.pop("required_nodes", None)
+                workflow_context_payload = payload.get("workflow_context")
+                if isinstance(workflow_context_payload, dict):
+                    workflow_context_payload.pop("required_node_types", None)
+                payload.pop("pm_stage_selections", None)
+                payload.pop("proposed_nodes", None)
+                payload.pop("required_credentials", None)
             self._trace_logger.info(
                 "reasoning graph result: id=%s intent=%s stage=%s confidence=%.2f status=%s signals=%d",
                 request_id,

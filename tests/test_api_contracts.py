@@ -38,9 +38,9 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un flujo",
         entry_intent=EntryIntent.business_discovery_conversation,
-        target_stage=AgentStage.engineer_agent,
+        target_stage=None,
         confidence=0.84,
-        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_engineer"],
+        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_architect"],
         current_stage="product_manager_agent",
         missing_user_inputs=[],
         business_context_summary=BusinessContextSummary(
@@ -85,11 +85,12 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
                     name="Intake",
                     purpose="Capture approval events",
                     required_capabilities=["Capture events"],
-                    expected_inputs=["Approval event"],
-                    expected_outputs=["Normalized payload"],
-                    dependencies=[],
-                )
-            ],
+                expected_inputs=["Approval event"],
+                expected_outputs=["Normalized payload"],
+                dependencies=[],
+                success_criteria=["The approval event is captured once and normalized."],
+            )
+        ],
             data_flow=[
                 ArchitectureDataFlowItem(
                     source_stage_id="stage_intake",
@@ -99,28 +100,18 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
             ],
             assumptions=["Approval source emits stable events."],
             missing_information=[],
-            implementation_notes_for_engineer=["Configure exact node parameters in engineering phase."],
-            required_nodes=[
-                NodeRequirement(
-                    node_type="n8n-nodes-base.webhook",
-                    why_required="Evidence-backed trigger node from retrieved docs.",
-                    evidence_chunk_ids=["linked:node:n8n-nodes-base.webhook"],
-                    evidence_refs=["Node: Webhook"],
-                    evidence_confidence=0.88,
-                    rerank_confidence=0.76,
-                    blended_confidence=0.85,
-                )
-            ],
+            implementation_notes_for_engineer=["Architect agent should preserve the abstract stage order."],
+            required_nodes=[],
         ),
         workflow_context=WorkflowContext(
             use_case_id="uc_1",
             planning_ready=True,
-            handoff_target=AgentStage.engineer_agent,
-            required_node_types=["n8n-nodes-base.webhook"],
+            handoff_target=AgentStage.architect_agent,
+            required_node_types=[],
             unresolved_inputs=[],
-            notes=["required_nodes=1"],
+            notes=["abstract_plan_only", "handoff_target=architect_agent"],
         ),
-        planning_summary="Architecture plan prepared with evidence-backed required nodes.",
+        planning_summary="Abstract architecture plan prepared for architect handoff.",
         qa_enabled=True,
         needs_replan=False,
         status="stub_routed",
@@ -185,9 +176,11 @@ def test_chat_completion_contract_non_stream(monkeypatch) -> None:
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
     assert parsed["entry_intent"] == "business_discovery_conversation"
-    assert parsed["target_stage"] == "engineer_agent"
+    assert parsed["target_stage"] is None
     assert parsed["selected_use_case"]["id"] == "uc_1"
-    assert parsed["architecture_plan"]["required_nodes"][0]["node_type"] == "n8n-nodes-base.webhook"
+    assert parsed["workflow_context"]["handoff_target"] == "architect_agent"
+    assert "required_nodes" not in parsed["architecture_plan"]
+    assert "required_node_types" not in parsed["workflow_context"]
 
 
 def test_chat_completion_contract_stream(monkeypatch) -> None:
