@@ -18,6 +18,10 @@ from ..features.reasoning.multi_agent_contracts import (
     ImplementationQueueItem,
     ImplementationStatus,
     ImplementedNode,
+    ArchitectClarificationState,
+    ArchitectStageSearchState,
+    ArchitectStageSelection,
+    ArchitectStatus,
     PMClarificationState,
     PMProgressState,
     PMStagePlan,
@@ -62,6 +66,11 @@ class MultiAgentGraphState(TypedDict, total=False):
     pm_stage_selections: List[PMStageSelection | Dict[str, Any]]
     pm_stage_progress: Optional[PMProgressState | Dict[str, Any]]
     pm_clarification_state: Optional[PMClarificationState | Dict[str, Any]]
+    architect_status: Optional[ArchitectStatus | str]
+    architect_stage_search_history: List[ArchitectStageSearchState | Dict[str, Any]]
+    architect_stage_selections: List[ArchitectStageSelection | Dict[str, Any]]
+    architect_clarification_state: Optional[ArchitectClarificationState | Dict[str, Any]]
+    architect_notes: List[str]
     pm_stage_search_history: List[PMStageSearchState | Dict[str, Any]]
     pm_reasoning_trace_full: List[Dict[str, Any]]
     proposed_nodes: List[ProposedNode | Dict[str, Any]]

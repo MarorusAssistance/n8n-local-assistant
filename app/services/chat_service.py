@@ -614,6 +614,11 @@ class ChatService:
             pm_stage_selections = list(getattr(result, "pm_stage_selections", []) or [])
             pm_stage_progress = getattr(result, "pm_stage_progress", None)
             pm_clarification_state = getattr(result, "pm_clarification_state", None)
+            architect_status = getattr(result, "architect_status", None)
+            architect_stage_search_history = list(getattr(result, "architect_stage_search_history", []) or [])
+            architect_stage_selections = list(getattr(result, "architect_stage_selections", []) or [])
+            architect_clarification_state = getattr(result, "architect_clarification_state", None)
+            architect_notes = list(getattr(result, "architect_notes", []) or [])
             proposed_nodes = list(getattr(result, "proposed_nodes", []) or [])
             required_credentials = list(getattr(result, "required_credentials", []) or [])
             workflow_draft = getattr(result, "workflow_draft", None)
@@ -729,6 +734,23 @@ class ChatService:
                     if hasattr(pm_clarification_state, "model_dump")
                     else pm_clarification_state
                 ),
+                "architect_status": (
+                    architect_status.value if hasattr(architect_status, "value") else architect_status
+                ),
+                "architect_stage_search_history": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in architect_stage_search_history
+                ],
+                "architect_stage_selections": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in architect_stage_selections
+                ],
+                "architect_clarification_state": (
+                    architect_clarification_state.model_dump(exclude_none=True)
+                    if hasattr(architect_clarification_state, "model_dump")
+                    else architect_clarification_state
+                ),
+                "architect_notes": architect_notes,
                 "proposed_nodes": [
                     item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
                     for item in proposed_nodes
@@ -797,6 +819,9 @@ class ChatService:
                 payload.pop("pm_stage_selections", None)
                 payload.pop("proposed_nodes", None)
                 payload.pop("required_credentials", None)
+            if current_stage == "architect_agent":
+                payload.pop("architect_stage_search_history", None)
+                payload.pop("workflow_versions", None)
             self._trace_logger.info(
                 "reasoning graph result: id=%s intent=%s stage=%s confidence=%.2f status=%s signals=%d",
                 request_id,

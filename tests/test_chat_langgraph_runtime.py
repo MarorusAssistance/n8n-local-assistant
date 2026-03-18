@@ -9,6 +9,10 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
+    ArchitectClarificationState,
+    ArchitectStageSearchState,
+    ArchitectStageSelection,
+    ArchitectStatus,
     ArchitectureDataFlowItem,
     ArchitecturePlan,
     ArchitectureStage,
@@ -58,10 +62,16 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un workflow",
         entry_intent=EntryIntent.business_discovery_conversation,
-        target_stage=None,
+        target_stage=AgentStage.engineer_agent,
         confidence=0.83,
-        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_architect"],
-        current_stage="product_manager_agent",
+        routing_signals=[
+            "entered_commercial_agent",
+            "handoff_ready_product_manager",
+            "handoff_ready_architect",
+            "entered_architect_agent",
+            "handoff_ready_engineer",
+        ],
+        current_stage="architect_agent",
         missing_user_inputs=[],
         business_context_summary=BusinessContextSummary(
             process_scope="Customer support operations",
@@ -138,10 +148,10 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
         workflow_context=WorkflowContext(
             use_case_id="uc_1",
             planning_ready=True,
-            handoff_target=AgentStage.architect_agent,
-            required_node_types=[],
+            handoff_target=AgentStage.engineer_agent,
+            required_node_types=["n8n-nodes-base.webhook", "n8n-nodes-base.code"],
             unresolved_inputs=[],
-            notes=["abstract_plan_only", "handoff_target=architect_agent"],
+            notes=["abstract_plan_only", "architect_complete", "handoff_target=engineer_agent"],
         ),
         planning_summary="Abstract architecture plan is ready for architect handoff.",
         pm_status=PMStatus.pm_completed,
@@ -170,8 +180,178 @@ def _fake_reasoning_result() -> MultiAgentGraphResult:
             pending_questions=[],
             turns=[],
         ),
+        architect_status=ArchitectStatus.architect_completed,
+        architect_stage_search_history=[
+            ArchitectStageSearchState(
+                stage_id="stage_intake",
+                pass_index=1,
+                query="support escalation intake node",
+                doc_chunk_ids=["doc-1"],
+                candidate_node_types=["n8n-nodes-base.webhook"],
+                result_count=1,
+                top_rerank_confidence=0.81,
+                notes=[],
+            )
+        ],
+        architect_stage_selections=[
+            ArchitectStageSelection(
+                stage_id="stage_intake",
+                selected_node_types=["n8n-nodes-base.webhook"],
+                selected_nodes=[],
+                rationale="Webhook best matches inbound ticket capture.",
+                passes_used=1,
+                blocked=False,
+                missing_information=[],
+            )
+        ],
+        architect_clarification_state=ArchitectClarificationState(
+            attempts_used=0,
+            max_attempts=3,
+            pending_questions=[],
+            turns=[],
+        ),
+        architect_notes=["Architect grounded the abstract plan into standard workflow nodes."],
+        proposed_nodes=[
+            ProposedNode(
+                node_id="an_1",
+                node_type="n8n-nodes-base.webhook",
+                stage_id="stage_intake",
+                purpose="Capture inbound ticket event",
+                expected_inputs=["ticket event"],
+                expected_outputs=["normalized payload"],
+            ),
+            ProposedNode(
+                node_id="an_2",
+                node_type="n8n-nodes-base.code",
+                stage_id="stage_escalation",
+                purpose="Classify urgency for escalation",
+                depends_on=["an_1"],
+                expected_inputs=["normalized payload"],
+                expected_outputs=["escalation command"],
+            ),
+        ],
+        workflow_draft=WorkflowDraft(
+            name="Support escalation automation",
+            use_case_id="uc_1",
+            summary="Architect draft",
+            nodes=[
+                WorkflowDraftNode(
+                    node_id="an_1",
+                    name="webhook_1",
+                    node_type="n8n-nodes-base.webhook",
+                    type_version=1,
+                    purpose="Capture inbound ticket event",
+                    stage_id="stage_intake",
+                    expected_inputs=["ticket event"],
+                    expected_outputs=["normalized payload"],
+                    position=[260, 300],
+                ),
+                WorkflowDraftNode(
+                    node_id="an_2",
+                    name="code_2",
+                    node_type="n8n-nodes-base.code",
+                    type_version=2,
+                    purpose="Classify urgency",
+                    stage_id="stage_escalation",
+                    expected_inputs=["normalized payload"],
+                    expected_outputs=["escalation command"],
+                    dependencies=["an_1"],
+                    position=[540, 300],
+                ),
+            ],
+            connections=[
+                WorkflowDraftConnection(
+                    source_node_id="an_1",
+                    target_node_id="an_2",
+                )
+            ],
+            metadata={},
+        ),
+        workflow_versions=[
+            WorkflowVersion(
+                version=1,
+                reason="initialized architect workflow draft",
+                workflow_draft=WorkflowDraft(
+                    name="Support escalation automation",
+                    use_case_id="uc_1",
+                    summary="Architect draft",
+                    nodes=[],
+                    connections=[],
+                    metadata={},
+                ),
+                implemented_node_count=0,
+            )
+        ],
+        final_workflow_json={
+            "name": "Support escalation automation",
+            "nodes": [{"id": "an_1"}, {"id": "an_2"}],
+            "connections": {"webhook_1": {"main": [[{"node": "code_2", "type": "main", "index": 0}]]}},
+        },
+        active_workflow_id="wf_architect_1",
+        active_workflow_name="Support escalation automation",
+        active_workflow_url="http://localhost:5678/workflow/wf_architect_1",
+        workflow_persisted=True,
+        workflow_persist_action="created",
+        workflow_api_sync_result={"ok": True, "action": "created", "id": "wf_architect_1"},
         qa_enabled=True,
         needs_replan=False,
+        status="stub_routed",
+    )
+
+
+def _fake_pm_reasoning_result() -> MultiAgentGraphResult:
+    return MultiAgentGraphResult(
+        user_query="Crea un workflow",
+        entry_intent=EntryIntent.business_discovery_conversation,
+        target_stage=None,
+        confidence=0.83,
+        routing_signals=["entered_commercial_agent", "handoff_ready_product_manager", "handoff_ready_architect"],
+        current_stage="product_manager_agent",
+        missing_user_inputs=[],
+        business_context_summary=BusinessContextSummary(
+            process_scope="Customer support operations",
+            pain_points=["manual escalations"],
+            desired_outcomes=["faster response times"],
+            constraints=[],
+        ),
+        discovered_use_cases=[],
+        architecture_plan=ArchitecturePlan(
+            use_case_id="uc_1",
+            title="Support escalation automation",
+            business_objective="Prevent late escalations for high-priority support tickets.",
+            desired_outcome="Escalate priority tickets before SLA breach and track delivery outcomes.",
+            workflow_summary="Three-stage plan from event intake to escalation delivery and logging.",
+            stages=[],
+            data_flow=[],
+            assumptions=[],
+            missing_information=[],
+            implementation_notes_for_engineer=[],
+            required_nodes=[],
+        ),
+        workflow_context=WorkflowContext(
+            use_case_id="uc_1",
+            planning_ready=True,
+            handoff_target=AgentStage.architect_agent,
+            required_node_types=[],
+            unresolved_inputs=[],
+            notes=["abstract_plan_only", "handoff_target=architect_agent"],
+        ),
+        pm_status=PMStatus.pm_completed,
+        pm_stage_plan=[],
+        pm_stage_selections=[],
+        pm_stage_progress=PMProgressState(
+            total_stages=1,
+            current_stage_id=None,
+            completed_stage_ids=[],
+            blocked_stage_ids=[],
+            passes_by_stage={},
+        ),
+        pm_clarification_state=PMClarificationState(
+            attempts_used=0,
+            max_attempts=2,
+            pending_questions=[],
+            turns=[],
+        ),
         status="stub_routed",
     )
 
@@ -411,18 +591,20 @@ def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) ->
     content = payload["choices"][0]["message"]["content"]
     parsed = json.loads(content)
     assert parsed["entry_intent"] == "business_discovery_conversation"
-    assert parsed["target_stage"] is None
-    assert parsed["current_stage"] == "product_manager_agent"
+    assert parsed["target_stage"] == "engineer_agent"
+    assert parsed["current_stage"] == "architect_agent"
     assert parsed["selected_use_case"]["id"] == "uc_1"
     assert parsed["alternative_use_cases"] == []
-    assert parsed["workflow_context"]["handoff_target"] == "architect_agent"
+    assert parsed["workflow_context"]["handoff_target"] == "engineer_agent"
     assert parsed["workflow_context"]["planning_ready"] is True
     assert parsed["pm_status"] == "pm_completed"
-    assert parsed["pm_stage_plan"][0]["id"] == "stage_intake"
-    assert "pm_stage_selections" not in parsed
-    assert "required_nodes" not in parsed["architecture_plan"]
-    assert "required_node_types" not in parsed["workflow_context"]
-    assert "proposed_nodes" not in parsed
+    assert parsed["architect_status"] == "architect_completed"
+    assert parsed["proposed_nodes"][0]["node_type"] == "n8n-nodes-base.webhook"
+    assert parsed["workflow_draft"]["nodes"][0]["node_type"] == "n8n-nodes-base.webhook"
+    assert parsed["workflow_reference"]["id"] == "wf_architect_1"
+    assert "architect_stage_search_history" not in parsed
+    assert "workflow_versions" not in parsed
+    assert "final_workflow_json" not in parsed
     assert "selection_reason" in parsed
 
 
@@ -463,7 +645,7 @@ def test_reasoning_payload_hides_pm_legacy_node_fields(monkeypatch) -> None:
     monkeypatch.setattr(
         service._graph_runtime,
         "run_reasoning",
-        lambda **kwargs: _fake_reasoning_result(),
+        lambda **kwargs: _fake_pm_reasoning_result(),
     )
 
     response = client.post(

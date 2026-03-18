@@ -496,7 +496,7 @@ def _draft_to_final_workflow_json(draft: WorkflowDraft) -> Dict[str, Any]:
             "id": node.node_id,
             "name": node.name,
             "type": node.node_type,
-            "typeVersion": 1,
+            "typeVersion": max(1, int(getattr(node, "type_version", 1) or 1)),
             "position": node.position or [240 * idx, 300],
             "parameters": parameters,
         }

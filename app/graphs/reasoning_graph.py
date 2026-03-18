@@ -6,6 +6,10 @@ from typing import Any, Dict, List, Optional, Type, TypeVar
 from ..core.json_sanitize import sanitize_for_json
 from ..features.reasoning.multi_agent_contracts import (
     AgentStage,
+    ArchitectClarificationState,
+    ArchitectStageSearchState,
+    ArchitectStageSelection,
+    ArchitectStatus,
     ArchitecturePlan,
     BlockedNode,
     BusinessContextSummary,
@@ -37,6 +41,7 @@ from ..features.reasoning.multi_agent_contracts import (
 from .multi_agent_state import MultiAgentGraphState
 from .nodes.commercial_agent import commercial_agent_node
 from .nodes.consultant_agent import consultant_agent_node
+from .nodes.architect_agent import architect_agent_node
 from .nodes.engineer_agent import engineer_agent_node
 from .nodes.multi_agent_router import route_entry_intent
 from .nodes.product_manager_agent import product_manager_agent_node
@@ -146,6 +151,17 @@ def _normalize_pm_status(value: Any) -> Optional[PMStatus]:
     return None
 
 
+def _normalize_architect_status(value: Any) -> Optional[ArchitectStatus]:
+    if isinstance(value, ArchitectStatus):
+        return value
+    if isinstance(value, str):
+        try:
+            return ArchitectStatus(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _model_or_none(value: Any, model_cls: Type[T]) -> Optional[T]:
     if isinstance(value, model_cls):
         return value
@@ -202,6 +218,15 @@ def _is_pm_blocked_state(state: Optional[MultiAgentGraphState]) -> bool:
     return status == PMStatus.pm_blocked_waiting_user
 
 
+def _is_architect_blocked_state(state: Optional[MultiAgentGraphState]) -> bool:
+    if not isinstance(state, dict):
+        return False
+    if state.get("current_stage") != "architect_agent":
+        return False
+    status = _normalize_architect_status(state.get("architect_status"))
+    return status == ArchitectStatus.architect_blocked_waiting_user
+
+
 def _route_after_entry(state: MultiAgentGraphState) -> str:
     target = _stage_value(state.get("target_stage"))
     if target == "commercial_agent":
@@ -210,6 +235,8 @@ def _route_after_entry(state: MultiAgentGraphState) -> str:
         return "consultant_agent"
     if target == "product_manager_agent":
         return "product_manager_agent"
+    if target == "architect_agent":
+        return "architect_agent"
     if target == "engineer_agent":
         return "engineer_agent"
     if target == "qa_agent":
@@ -226,6 +253,15 @@ def _route_after_commercial(state: MultiAgentGraphState) -> str:
 
 
 def _route_after_product_manager(state: MultiAgentGraphState) -> str:
+    pm_status = _normalize_pm_status(state.get("pm_status"))
+    workflow_context = _model_or_none(state.get("workflow_context"), WorkflowContext)
+    if (
+        pm_status == PMStatus.pm_completed
+        and workflow_context is not None
+        and workflow_context.planning_ready
+        and workflow_context.handoff_target == AgentStage.architect_agent
+    ):
+        return "architect_agent"
     return "end"
 
 
@@ -246,6 +282,7 @@ class ReasoningGraphRuntime:
         graph.add_node("commercial_agent", self._commercial_node)
         graph.add_node("consultant_agent", self._consultant_node)
         graph.add_node("product_manager_agent", self._product_manager_node)
+        graph.add_node("architect_agent", self._architect_node)
         graph.add_node("engineer_agent", self._engineer_node)
         graph.add_node("qa_agent", self._qa_node)
 
@@ -257,6 +294,7 @@ class ReasoningGraphRuntime:
                 "commercial_agent": "commercial_agent",
                 "consultant_agent": "consultant_agent",
                 "product_manager_agent": "product_manager_agent",
+                "architect_agent": "architect_agent",
                 "engineer_agent": "engineer_agent",
                 "qa_agent": "qa_agent",
                 "unknown": END,
@@ -274,9 +312,11 @@ class ReasoningGraphRuntime:
             "product_manager_agent",
             _route_after_product_manager,
             {
+                "architect_agent": "architect_agent",
                 "end": END,
             },
         )
+        graph.add_edge("architect_agent", END)
         graph.add_edge("consultant_agent", END)
         graph.add_edge("engineer_agent", END)
         graph.add_edge("qa_agent", END)
@@ -313,6 +353,19 @@ class ReasoningGraphRuntime:
                     "current_stage": None,
                 }
             )
+        if bool(state.get("resume_requested")) and _is_architect_blocked_state(state):
+            signals = list(state.get("routing_signals") or [])
+            if "resume_architect_from_checkpoint" not in signals:
+                signals.append("resume_architect_from_checkpoint")
+            return _sanitize_updates(
+                {
+                    "entry_intent": state.get("entry_intent") or EntryIntent.workflow_build_request,
+                    "target_stage": AgentStage.architect_agent,
+                    "confidence": float(state.get("confidence", 0.0) or 0.0),
+                    "routing_signals": signals,
+                    "current_stage": None,
+                }
+            )
 
         runtime_context = _runtime_context(state)
         model = runtime_context.get("model")
@@ -342,6 +395,9 @@ class ReasoningGraphRuntime:
     def _product_manager_node(self, state: MultiAgentGraphState) -> Dict[str, Any]:
         return _sanitize_updates(product_manager_agent_node(state))
 
+    def _architect_node(self, state: MultiAgentGraphState) -> Dict[str, Any]:
+        return _sanitize_updates(architect_agent_node(state))
+
     def _engineer_node(self, state: MultiAgentGraphState) -> Dict[str, Any]:
         return _sanitize_updates(engineer_agent_node(state))
 
@@ -356,10 +412,16 @@ class ReasoningGraphRuntime:
             current.update(self._commercial_node(current))
             if _route_after_commercial(current) == "product_manager_agent":
                 current.update(self._product_manager_node(current))
+                if _route_after_product_manager(current) == "architect_agent":
+                    current.update(self._architect_node(current))
         elif route == "consultant_agent":
             current.update(self._consultant_node(current))
         elif route == "product_manager_agent":
             current.update(self._product_manager_node(current))
+            if _route_after_product_manager(current) == "architect_agent":
+                current.update(self._architect_node(current))
+        elif route == "architect_agent":
+            current.update(self._architect_node(current))
         elif route == "engineer_agent":
             current.update(self._engineer_node(current))
         elif route == "qa_agent":
@@ -383,6 +445,7 @@ class ReasoningGraphRuntime:
         workflow_context = _model_or_none(state.get("workflow_context"), WorkflowContext)
         implementation_status = _normalize_impl_status(state.get("implementation_status"))
         pm_status = _normalize_pm_status(state.get("pm_status"))
+        architect_status = _normalize_architect_status(state.get("architect_status"))
         consultant_query_analysis = _model_or_none(
             state.get("consultant_query_analysis"), ConsultantQueryAnalysis
         )
@@ -405,6 +468,16 @@ class ReasoningGraphRuntime:
                 status = "unknown_terminal"
             else:
                 status = "stub_routed" if planning_ready else "unknown_terminal"
+        elif current_stage == "architect_agent":
+            if architect_status in (
+                ArchitectStatus.architect_blocked_waiting_user,
+                ArchitectStatus.architect_failed_no_solution,
+            ):
+                status = "unknown_terminal"
+            elif final_workflow_json:
+                status = "stub_routed"
+            else:
+                status = "stub_routed" if target_stage_enum is not None else "unknown_terminal"
         elif current_stage == "engineer_agent":
             if implementation_status == ImplementationStatus.completed and final_workflow_json:
                 status = "stub_routed"
@@ -456,6 +529,17 @@ class ReasoningGraphRuntime:
             pm_clarification_state=_model_or_none(
                 state.get("pm_clarification_state"), PMClarificationState
             ),
+            architect_status=architect_status,
+            architect_stage_search_history=_model_list(
+                state.get("architect_stage_search_history"), ArchitectStageSearchState
+            ),
+            architect_stage_selections=_model_list(
+                state.get("architect_stage_selections"), ArchitectStageSelection
+            ),
+            architect_clarification_state=_model_or_none(
+                state.get("architect_clarification_state"), ArchitectClarificationState
+            ),
+            architect_notes=list(state.get("architect_notes") or []),
             proposed_nodes=_model_list(state.get("proposed_nodes"), ProposedNode),
             required_credentials=_model_list(state.get("required_credentials"), RequiredCredential),
             workflow_draft=_model_or_none(state.get("workflow_draft"), WorkflowDraft),
@@ -540,7 +624,11 @@ class ReasoningGraphRuntime:
         )
         thread_id = _thread_id_from_run_config(run_config)
         previous_state = self._load_previous_state(thread_id)
-        resume_from_blocked = _is_engineer_blocked_state(previous_state) or _is_pm_blocked_state(previous_state)
+        resume_from_blocked = (
+            _is_engineer_blocked_state(previous_state)
+            or _is_pm_blocked_state(previous_state)
+            or _is_architect_blocked_state(previous_state)
+        )
 
         if resume_from_blocked and isinstance(previous_state, dict):
             state: MultiAgentGraphState = dict(previous_state)
@@ -581,6 +669,11 @@ class ReasoningGraphRuntime:
                 "pm_stage_selections": [],
                 "pm_stage_progress": None,
                 "pm_clarification_state": None,
+                "architect_status": None,
+                "architect_stage_search_history": [],
+                "architect_stage_selections": [],
+                "architect_clarification_state": None,
+                "architect_notes": [],
                 "pm_stage_search_history": [],
                 "pm_reasoning_trace_full": [],
                 "proposed_nodes": [],

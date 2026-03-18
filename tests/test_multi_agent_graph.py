@@ -4,6 +4,7 @@ import pytest
 
 from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
+    ArchitectStatus,
     ArchitectureDataFlowItem,
     ArchitecturePlan,
     ArchitectureStage,
@@ -69,7 +70,7 @@ def test_graph_routes_start_to_expected_stub(
     assert result.status == "stub_routed"
 
 
-def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_graph_routes_direct_build_request_to_architect_via_product_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = ReasoningGraphRuntime()
     monkeypatch.setattr(
         "app.graphs.reasoning_graph.route_entry_intent",
@@ -79,8 +80,8 @@ def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytes
         "app.graphs.reasoning_graph.product_manager_agent_node",
         lambda state: {
             "current_stage": "product_manager_agent",
-            "target_stage": None,
             "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_architect"],
+            "pm_status": "pm_completed",
             "workflow_context": WorkflowContext(
                 use_case_id="uc_build",
                 planning_ready=True,
@@ -115,6 +116,29 @@ def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytes
             ),
         },
     )
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.architect_agent_node",
+        lambda state: {
+            "current_stage": "architect_agent",
+            "target_stage": AgentStage.engineer_agent,
+            "architect_status": ArchitectStatus.architect_completed,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+            "workflow_context": WorkflowContext(
+                use_case_id="uc_build",
+                planning_ready=True,
+                handoff_target=AgentStage.engineer_agent,
+                required_node_types=["n8n-nodes-base.manualTrigger"],
+                unresolved_inputs=[],
+                notes=["architect_complete"],
+            ),
+            "workflow_draft": {
+                "name": "Build flow",
+                "nodes": [{"node_id": "an_1", "name": "manual_trigger_1", "node_type": "n8n-nodes-base.manualTrigger"}],
+                "connections": [],
+            },
+            "final_workflow_json": {"name": "Build flow", "nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
 
     result = runtime.run(
         user_prompt="Build a new workflow from scratch.",
@@ -122,10 +146,10 @@ def test_graph_routes_direct_build_request_to_product_manager(monkeypatch: pytes
         request_id="req-build-1",
         existing_workflow=None,
     )
-    assert result.current_stage == "product_manager_agent"
-    assert result.target_stage is None
+    assert result.current_stage == "architect_agent"
+    assert result.target_stage == AgentStage.engineer_agent
     assert result.workflow_context is not None
-    assert result.workflow_context.handoff_target == AgentStage.architect_agent
+    assert result.workflow_context.handoff_target == AgentStage.engineer_agent
     assert result.status == "stub_routed"
 
 
@@ -198,7 +222,7 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
         lambda state: {
             "current_stage": "product_manager_agent",
             "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_architect"],
-            "target_stage": None,
+            "pm_status": "pm_completed",
             "architecture_plan": ArchitecturePlan(
                 use_case_id="uc_1",
                 title="Invoice approval reminders",
@@ -240,6 +264,29 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
             "planning_summary": "Handoff ready for architect with abstract stages.",
         },
     )
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.architect_agent_node",
+        lambda state: {
+            "current_stage": "architect_agent",
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+            "target_stage": AgentStage.engineer_agent,
+            "architect_status": ArchitectStatus.architect_completed,
+            "workflow_context": WorkflowContext(
+                use_case_id="uc_1",
+                planning_ready=True,
+                handoff_target=AgentStage.engineer_agent,
+                required_node_types=["n8n-nodes-base.webhook"],
+                unresolved_inputs=[],
+                notes=["architect_complete"],
+            ),
+            "workflow_draft": {
+                "name": "Invoice approval reminders",
+                "nodes": [{"node_id": "an_1", "node_type": "n8n-nodes-base.webhook"}],
+                "connections": [],
+            },
+            "final_workflow_json": {"nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
     runtime = ReasoningGraphRuntime()
     monkeypatch.setattr(
         "app.graphs.reasoning_graph.route_entry_intent",
@@ -252,14 +299,15 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
         request_id="req-commercial-1",
         existing_workflow=None,
     )
-    assert result.current_stage == "product_manager_agent"
+    assert result.current_stage == "architect_agent"
     assert result.selected_use_case is not None
-    assert result.target_stage is None
+    assert result.target_stage == AgentStage.engineer_agent
     assert "handoff_ready_product_manager" in result.routing_signals
     assert "handoff_ready_architect" in result.routing_signals
+    assert "handoff_ready_engineer" in result.routing_signals
     assert result.architecture_plan is not None
     assert result.workflow_context is not None
-    assert result.workflow_context.handoff_target == AgentStage.architect_agent
+    assert result.workflow_context.handoff_target == AgentStage.engineer_agent
     assert result.status == "stub_routed"
 
 
@@ -497,6 +545,29 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
         }
 
     monkeypatch.setattr("app.graphs.reasoning_graph.product_manager_agent_node", _pm_node)
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.architect_agent_node",
+        lambda state: {
+            "current_stage": "architect_agent",
+            "architect_status": ArchitectStatus.architect_completed,
+            "target_stage": AgentStage.engineer_agent,
+            "workflow_context": WorkflowContext(
+                use_case_id="uc_pm_resume",
+                planning_ready=True,
+                handoff_target=AgentStage.engineer_agent,
+                required_node_types=["n8n-nodes-base.webhook"],
+                unresolved_inputs=[],
+                notes=["architect_complete"],
+            ),
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+            "workflow_draft": {
+                "name": "PM Resume",
+                "nodes": [{"node_id": "an_1", "node_type": "n8n-nodes-base.webhook"}],
+                "connections": [],
+            },
+            "final_workflow_json": {"name": "PM Resume", "nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
 
     run_config = {"configurable": {"thread_id": "thread-pm-resume-1"}}
     first = runtime.run(
@@ -517,9 +588,128 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
         run_config=run_config,
     )
     assert route_calls["count"] == 1
-    assert second.current_stage == "product_manager_agent"
+    assert second.current_stage == "architect_agent"
     assert second.pm_status == "pm_completed"
-    assert second.target_stage is None
+    assert second.target_stage == AgentStage.engineer_agent
     assert second.workflow_context is not None
-    assert second.workflow_context.handoff_target == AgentStage.architect_agent
+    assert second.workflow_context.handoff_target == AgentStage.engineer_agent
     assert "resume_pm_from_checkpoint" in second.routing_signals
+    assert "handoff_ready_engineer" in second.routing_signals
+
+
+def test_runtime_resumes_blocked_architect_state_on_same_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ReasoningGraphRuntime()
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.route_entry_intent",
+        lambda **kwargs: _decision(EntryIntent.workflow_build_request, AgentStage.product_manager_agent),
+    )
+
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.product_manager_agent_node",
+        lambda state: {
+            "current_stage": "product_manager_agent",
+            "pm_status": "pm_completed",
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_architect"],
+            "workflow_context": WorkflowContext(
+                use_case_id="uc_arch",
+                planning_ready=True,
+                handoff_target=AgentStage.architect_agent,
+                required_node_types=[],
+                unresolved_inputs=[],
+                notes=["pm_complete"],
+            ),
+            "architecture_plan": ArchitecturePlan(
+                use_case_id="uc_arch",
+                title="Build flow",
+                business_objective="Build a flow",
+                desired_outcome="Produce workflow draft",
+                workflow_summary="summary",
+                stages=[
+                    ArchitectureStage(
+                        id="stage_1",
+                        name="Trigger",
+                        purpose="Receive input",
+                        required_capabilities=["Receive input"],
+                        expected_inputs=["event"],
+                        expected_outputs=["payload"],
+                        dependencies=[],
+                        success_criteria=["captured"],
+                    )
+                ],
+                data_flow=[],
+                assumptions=[],
+                missing_information=[],
+                implementation_notes_for_engineer=[],
+                required_nodes=[],
+            ),
+        },
+    )
+
+    calls = {"count": 0}
+
+    def _architect_node(state):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "current_stage": "architect_agent",
+                "architect_status": ArchitectStatus.architect_blocked_waiting_user,
+                "target_stage": None,
+                "routing_signals": list(state.get("routing_signals") or []),
+                "missing_user_inputs": ["Which trigger should start the workflow?"],
+                "architect_clarification_state": {
+                    "attempts_used": 1,
+                    "max_attempts": 3,
+                    "pending_questions": ["Which trigger should start the workflow?"],
+                    "turns": [{"stage_id": "stage_1", "question": "Which trigger should start the workflow?", "answer": None}],
+                },
+                "workflow_context": WorkflowContext(
+                    use_case_id="uc_arch",
+                    planning_ready=False,
+                    handoff_target=None,
+                    required_node_types=[],
+                    unresolved_inputs=["Which trigger should start the workflow?"],
+                    notes=["architect_blocked"],
+                ),
+            }
+        return {
+            "current_stage": "architect_agent",
+            "architect_status": ArchitectStatus.architect_completed,
+            "target_stage": AgentStage.engineer_agent,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_engineer"],
+            "workflow_context": WorkflowContext(
+                use_case_id="uc_arch",
+                planning_ready=True,
+                handoff_target=AgentStage.engineer_agent,
+                required_node_types=["n8n-nodes-base.webhook"],
+                unresolved_inputs=[],
+                notes=["architect_complete"],
+            ),
+            "final_workflow_json": {"nodes": [{"id": "an_1"}], "connections": {}},
+        }
+
+    monkeypatch.setattr("app.graphs.reasoning_graph.architect_agent_node", _architect_node)
+
+    run_config = {"configurable": {"thread_id": "thread-architect-resume-1"}}
+    first = runtime.run(
+        user_prompt="Build a workflow to receive leads.",
+        model=None,
+        request_id="req-architect-1",
+        existing_workflow=None,
+        run_config=run_config,
+    )
+    assert first.current_stage == "architect_agent"
+    assert first.architect_status == ArchitectStatus.architect_blocked_waiting_user
+
+    second = runtime.run(
+        user_prompt="Use a webhook trigger.",
+        model=None,
+        request_id="req-architect-2",
+        existing_workflow=None,
+        run_config=run_config,
+    )
+    assert second.current_stage == "architect_agent"
+    assert second.architect_status == ArchitectStatus.architect_completed
+    assert second.target_stage == AgentStage.engineer_agent
+    assert "resume_architect_from_checkpoint" in second.routing_signals

@@ -261,6 +261,65 @@ class PMClarificationState(BaseModel):
     turns: List[PMClarificationTurn] = Field(default_factory=list)
 
 
+class ArchitectStatus(str, Enum):
+    architect_in_progress = "architect_in_progress"
+    architect_blocked_waiting_user = "architect_blocked_waiting_user"
+    architect_completed = "architect_completed"
+    architect_failed_no_solution = "architect_failed_no_solution"
+
+
+class ArchitectNodeCandidate(BaseModel):
+    node_type: str
+    display_name: Optional[str] = None
+    stage_id: Optional[str] = None
+    capability_summary: str = ""
+    limitations: List[str] = Field(default_factory=list)
+    rationale: str = ""
+    usage_mode: Literal["action_only", "tool_only", "both", "unknown"] = "unknown"
+    usable_as_tool: Optional[bool] = None
+    has_main_input: Optional[bool] = None
+    input_connection_types: List[str] = Field(default_factory=list)
+    evidence_chunk_ids: List[str] = Field(default_factory=list)
+    evidence_refs: List[str] = Field(default_factory=list)
+    rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    link_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    type_version: int = Field(default=1, ge=1)
+
+
+class ArchitectStageSearchState(BaseModel):
+    stage_id: str
+    pass_index: int = Field(default=1, ge=1)
+    query: str
+    doc_chunk_ids: List[str] = Field(default_factory=list)
+    candidate_node_types: List[str] = Field(default_factory=list)
+    result_count: int = Field(default=0, ge=0)
+    top_rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    notes: List[str] = Field(default_factory=list)
+
+
+class ArchitectStageSelection(BaseModel):
+    stage_id: str
+    selected_node_types: List[str] = Field(default_factory=list)
+    selected_nodes: List[ArchitectNodeCandidate] = Field(default_factory=list)
+    rationale: str = ""
+    passes_used: int = Field(default=0, ge=0)
+    blocked: bool = False
+    missing_information: List[str] = Field(default_factory=list)
+
+
+class ArchitectClarificationTurn(BaseModel):
+    stage_id: Optional[str] = None
+    question: str
+    answer: Optional[str] = None
+
+
+class ArchitectClarificationState(BaseModel):
+    attempts_used: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=3, ge=1)
+    pending_questions: List[str] = Field(default_factory=list)
+    turns: List[ArchitectClarificationTurn] = Field(default_factory=list)
+
+
 class ImplementationStatus(str, Enum):
     ready = "ready"
     in_progress = "in_progress"
@@ -295,6 +354,7 @@ class WorkflowDraftNode(BaseModel):
     node_id: str
     name: str
     node_type: str
+    type_version: int = Field(default=1, ge=1)
     purpose: str = ""
     stage_id: Optional[str] = None
     parameters_known: Dict[str, Any] = Field(default_factory=dict)
@@ -411,6 +471,11 @@ class MultiAgentGraphResult(BaseModel):
     pm_stage_selections: List[PMStageSelection] = Field(default_factory=list)
     pm_stage_progress: Optional[PMProgressState] = None
     pm_clarification_state: Optional[PMClarificationState] = None
+    architect_status: Optional[ArchitectStatus] = None
+    architect_stage_search_history: List[ArchitectStageSearchState] = Field(default_factory=list)
+    architect_stage_selections: List[ArchitectStageSelection] = Field(default_factory=list)
+    architect_clarification_state: Optional[ArchitectClarificationState] = None
+    architect_notes: List[str] = Field(default_factory=list)
     proposed_nodes: List[ProposedNode] = Field(default_factory=list)
     required_credentials: List[RequiredCredential] = Field(default_factory=list)
     workflow_draft: Optional[WorkflowDraft] = None
