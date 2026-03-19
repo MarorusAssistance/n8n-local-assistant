@@ -279,3 +279,31 @@ def test_pm_does_not_call_retrieval_or_select_nodes(monkeypatch: pytest.MonkeyPa
     assert updates["pm_stage_selections"] == []
     assert updates["proposed_nodes"] == []
     assert updates["required_credentials"] == []
+
+
+def test_pm_prompt_preserves_exact_trigger_processing_and_outcome_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: Dict[str, Any] = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _abstract_plan()
+
+    monkeypatch.setattr(pm, "_invoke_structured_output", _capture)
+
+    pm._plan_abstract_workflow_with_structured_output(
+        use_case=_use_case(),
+        user_query=(
+            "Clasifica correos entrantes por urgencia con heuristicas y guarda el resultado; "
+            "no envies emails ni agregues revision manual."
+        ),
+        clarification_state=PMClarificationState(),
+        model="fake-model",
+        request_id="req-pm-prompt",
+    )
+
+    prompt = str(captured["user_prompt"])
+    assert "Preserve the exact source system, trigger style, processing mode, and final outcome named by the user." in prompt
+    assert "Distinguish receiving email from sending email; they are not interchangeable." in prompt
+    assert "Do not invent validation, feedback, manual review, refinement, or approval stages unless the user explicitly asked for them." in prompt

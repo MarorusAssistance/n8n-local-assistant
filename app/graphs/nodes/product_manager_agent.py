@@ -231,6 +231,18 @@ def _invoke_structured_output(
 
 
 def _heuristic_abstract_plan(use_case: UseCase) -> _AbstractPlanningOutput:
+    combined_context = " ".join(
+        [
+            _sanitize_text(use_case.title),
+            _sanitize_text(use_case.business_problem),
+            _sanitize_text(use_case.desired_outcome),
+        ]
+    ).lower()
+    processing_label = "Decisioning"
+    processing_purpose = "Apply the core business logic to classify, decide, or transform the payload."
+    if any(token in combined_context for token in ("heuristic", "rule-based", "rule based", "deterministic")):
+        processing_label = "Rule-Based Decisioning"
+        processing_purpose = "Apply the explicit heuristic or rule-based business logic requested by the user."
     stages = [
         ArchitectureStage(
             id="stage_intake",
@@ -244,8 +256,8 @@ def _heuristic_abstract_plan(use_case: UseCase) -> _AbstractPlanningOutput:
         ),
         ArchitectureStage(
             id="stage_processing",
-            name="Decisioning",
-            purpose="Apply the core business logic to classify, decide, or transform the payload.",
+            name=processing_label,
+            purpose=processing_purpose,
             required_capabilities=["Interpret the payload", "Apply workflow business rules"],
             expected_inputs=["Normalized workflow payload"],
             expected_outputs=["Decision result or enriched payload"],
@@ -309,7 +321,8 @@ def _plan_abstract_workflow_with_structured_output(
         "Design how the workflow should behave stage by stage, but do not select node types, "
         "do not mention n8n nodes, do not mention credentials, do not mention parameter names, "
         "do not mention API endpoints, and do not generate workflow JSON. "
-        "You are preparing a clean handoff for a future architect_agent that will later ground the plan into nodes."
+        "You are preparing a clean handoff for a future architect_agent that will later ground the plan into nodes. "
+        "Preserve the user's exact semantics instead of broadening the request."
     )
     user_prompt = (
         "Create an abstract workflow plan from this request context.\n\n"
@@ -319,6 +332,10 @@ def _plan_abstract_workflow_with_structured_output(
         "- Use 2 to 6 stages when possible.\n"
         "- Each stage must define purpose, required_capabilities, expected_inputs, expected_outputs, dependencies, and success_criteria.\n"
         "- Stages must describe behavior, not implementation details.\n"
+        "- Preserve the exact source system, trigger style, processing mode, and final outcome named by the user.\n"
+        "- If the user said heuristic, rule-based, deterministic, manual, inbound, outgoing, receive, or send, keep that distinction explicit in the plan.\n"
+        "- Distinguish receiving email from sending email; they are not interchangeable.\n"
+        "- Do not invent validation, feedback, manual review, refinement, or approval stages unless the user explicitly asked for them.\n"
         "- Never output concrete node types or workflow JSON.\n"
         "- If the user explicitly named systems like Gmail, Slack, or Google Sheets, treat them as business/system context, not node choices.\n"
         "- Set planning_ready=true only if the abstract workflow plan is coherent enough to hand off to architect_agent.\n"

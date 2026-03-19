@@ -22,6 +22,8 @@ from app.graphs.nodes.architect_agent import (
     _WorkflowConnectionBlueprint,
     _WorkflowBlueprintOutput,
     _WorkflowNodeBlueprint,
+    _candidate_rejection_reasons,
+    _is_trigger_candidate,
     _build_candidates,
     _normalize_confidence,
     _select_stage_nodes_with_structured_output,
@@ -131,6 +133,8 @@ def _candidate(
     usable_as_tool: bool | None = False,
     capability_summary: str = "",
     type_version: int = 1,
+    input_connection_types: List[str] | None = None,
+    output_connection_types: List[str] | None = None,
 ) -> ArchitectNodeCandidate:
     return ArchitectNodeCandidate(
         node_type=node_type,
@@ -142,7 +146,12 @@ def _candidate(
         usage_mode=usage_mode,  # type: ignore[arg-type]
         usable_as_tool=usable_as_tool,
         has_main_input=has_main_input,
-        input_connection_types=["main"] if has_main_input else [],
+        input_connection_types=(
+            input_connection_types
+            if input_connection_types is not None
+            else (["main"] if has_main_input else [])
+        ),
+        output_connection_types=output_connection_types if output_connection_types is not None else ["main"],
         evidence_chunk_ids=[f"chunk:{stage_id}:{node_type}"],
         evidence_refs=[f"ref:{node_type}"],
         rerank_confidence=0.8,
@@ -220,6 +229,80 @@ def test_architect_stage_selection_returns_structured_output(monkeypatch: pytest
 
     assert output is not None
     assert output.selected_node_types == ["n8n-nodes-base.webhook"]
+
+
+def test_architect_parses_malformed_connector_fragments_into_clean_connector_types() -> None:
+    page_key, _, _ = derive_doc_page_key(
+        {},
+        row_url="https://docs.n8n.io/integrations/builtin/cluster-nodes/root-nodes/n8n-nodes-langchain.textclassifier/",
+    )
+    candidates = _build_candidates(
+        stage_id="stage_2",
+        docs_chunks=[],
+        linked_chunks=[
+            {
+                "doc_id": "linked-connector-1",
+                "linked_def_type": "node",
+                "linked_entity_id": "@n8n/n8n-nodes-langchain.textClassifier",
+                "link_doc_page_key": page_key,
+                "metadata": {"displayName": "Text Classifier", "version": 1},
+                "text": (
+                    "Display Name: Text Classifier\n"
+                    "Description: Classify text using an AI model.\n"
+                    "Inputs: \"{'displayName': ''\", \"'type': 'main'}\", \"'type': 'ai_languageModel'\"\n"
+                    "Outputs: \"'type': 'main'\"\n"
+                    "Usable As Tool: false\n"
+                ),
+                "url": "https://docs.n8n.io/integrations/builtin/cluster-nodes/root-nodes/n8n-nodes-langchain.textclassifier/",
+            }
+        ],
+    )
+
+    assert candidates[0].input_connection_types == ["main", "ai_languagemodel"]
+    assert candidates[0].output_connection_types == ["main"]
+
+
+def test_architect_rejects_outbound_send_node_as_trigger_candidate() -> None:
+    candidate = _candidate(
+        "n8n-nodes-base.emailSend",
+        stage_id="stage_1",
+        has_main_input=False,
+        capability_summary="Send outgoing emails to recipients.",
+    )
+
+    assert _is_trigger_candidate(candidate) is False
+
+
+def test_architect_rejects_non_main_ai_connectors_for_v1_rule_based_stage() -> None:
+    plan = _plan().model_copy(
+        update={
+            "workflow_summary": "Receive incoming emails and classify them with heuristics only.",
+            "business_objective": "Apply rule-based urgency heuristics to incoming emails.",
+        }
+    )
+    stage = plan.stages[1].model_copy(
+        update={
+            "purpose": "Classify urgency using heuristic and rule-based logic.",
+            "required_capabilities": ["Apply heuristic rules"],
+        }
+    )
+    candidate = _candidate(
+        "@n8n/n8n-nodes-langchain.textClassifier",
+        stage_id=stage.id,
+        has_main_input=True,
+        capability_summary="AI text classifier for categorization.",
+        input_connection_types=["main", "ai_languageModel"],
+    )
+
+    reasons = _candidate_rejection_reasons(
+        candidate=candidate,
+        stage=stage,
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+
+    assert "requires_non_main_input_connectors" in reasons
+    assert "rule_based_stage_rejects_ai_candidate" in reasons
 
 
 def test_architect_builds_and_persists_new_workflow(monkeypatch: pytest.MonkeyPatch) -> None:

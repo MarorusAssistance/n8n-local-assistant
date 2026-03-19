@@ -279,6 +279,7 @@ class ArchitectNodeCandidate(BaseModel):
     usable_as_tool: Optional[bool] = None
     has_main_input: Optional[bool] = None
     input_connection_types: List[str] = Field(default_factory=list)
+    output_connection_types: List[str] = Field(default_factory=list)
     evidence_chunk_ids: List[str] = Field(default_factory=list)
     evidence_refs: List[str] = Field(default_factory=list)
     rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
@@ -340,6 +341,7 @@ class ProposedNode(BaseModel):
     usable_as_tool: Optional[bool] = None
     has_main_input: Optional[bool] = None
     input_connection_types: List[str] = Field(default_factory=list)
+    output_connection_types: List[str] = Field(default_factory=list)
 
 
 class RequiredCredential(BaseModel):

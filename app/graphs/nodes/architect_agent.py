@@ -45,6 +45,8 @@ _MAX_USER_CLARIFICATIONS = 3
 _DEFAULT_TOP_K = 8
 
 _LINE_VALUE_RE = re.compile(r"^\s*([^:]+):\s*(.*)$")
+_CONNECTOR_TYPE_RE = re.compile(r"""type['"]?\s*:\s*['"]([^'"]+)['"]""", re.IGNORECASE)
+_CANONICAL_CONNECTOR_RE = re.compile(r"^(main|ai_[a-z0-9_]+|[a-z][a-z0-9_]*)$", re.IGNORECASE)
 
 
 class _StageSelectionOutput(BaseModel):
@@ -251,9 +253,48 @@ def _parse_list(value: str) -> List[str]:
     raw = str(value or "").strip()
     if not raw or raw in {"-", "(none)", "none"}:
         return []
+    connector_types = _extract_connector_types(raw)
+    if connector_types:
+        return connector_types
     normalized = raw.strip("[]")
     parts = [item.strip() for item in normalized.split(",")]
     return [item for item in parts if item and item not in {"-"}]
+
+
+def _normalize_connector_type(value: Any) -> str:
+    token = str(value or "").strip().strip("'\"{}[]()")
+    token = token.replace("-", "_").replace(" ", "")
+    return token.lower()
+
+
+def _extract_connector_types(text: Any) -> List[str]:
+    raw = _sanitize_text(text)
+    if not raw:
+        return []
+
+    seen = set()
+    output: List[str] = []
+
+    def _append(token: Any) -> None:
+        normalized = _normalize_connector_type(token)
+        if not normalized or normalized in {"type", "displayname", "display_name"}:
+            return
+        if not _CANONICAL_CONNECTOR_RE.match(normalized):
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        output.append(normalized)
+
+    for match in _CONNECTOR_TYPE_RE.finditer(raw):
+        _append(match.group(1))
+
+    if output:
+        return output
+
+    for fragment in raw.strip("[]").split(","):
+        _append(fragment)
+    return output
 
 
 def _parse_int(value: Any, default: int = 1) -> int:
@@ -315,10 +356,14 @@ def _build_stage_query(
     ]
     pass_hint = ""
     if pass_index == 2:
-        pass_hint = "Prefer standard trigger/action nodes and avoid AI-tool-only nodes."
+        pass_hint = (
+            "Prefer exact inbound trigger or main-path action nodes that match the user wording. "
+            "Reject send/respond nodes for intake and reject nodes with auxiliary AI connectors."
+        )
     elif pass_index >= 3:
         pass_hint = (
-            "Be strict about standard workflow compatibility and focus on the exact system/action named by the user."
+            "Treat workflow compatibility as a hard constraint. Preserve the exact source system, trigger style, "
+            "processing mode, and final outcome named by the user instead of forcing a near match."
         )
     return (
         f"User request: {_compact(user_query, max_chars=420)}\n"
@@ -357,11 +402,11 @@ def _usage_mode_from_connectors(
     outputs: Sequence[str],
     usable_as_tool: Optional[bool],
 ) -> str:
-    normalized_inputs = [str(item or "").strip().lower() for item in inputs if str(item or "").strip()]
-    normalized_outputs = [str(item or "").strip().lower() for item in outputs if str(item or "").strip()]
+    normalized_inputs = [_normalize_connector_type(item) for item in inputs if _normalize_connector_type(item)]
+    normalized_outputs = [_normalize_connector_type(item) for item in outputs if _normalize_connector_type(item)]
     has_main_input = "main" in normalized_inputs
     has_main_output = "main" in normalized_outputs
-    has_ai_connectors = any(item.startswith("ai") for item in normalized_inputs + normalized_outputs)
+    has_ai_connectors = any(item.startswith("ai_") for item in normalized_inputs + normalized_outputs)
 
     if has_main_input and usable_as_tool:
         return "both"
@@ -381,9 +426,153 @@ def _is_trigger_candidate(candidate: ArchitectNodeCandidate) -> bool:
             candidate.node_type,
         ]
     ).lower()
-    if any(token in rationale for token in ("trigger", "webhook", "schedule")):
+    positive_tokens = (
+        "trigger",
+        "webhook",
+        "listener",
+        "listen",
+        "poll",
+        "polling",
+        "watch",
+        "receive",
+        "incoming",
+        "inbound",
+        "new email",
+        "new message",
+    )
+    negative_tokens = (
+        "send",
+        "sending",
+        "reply",
+        "respond",
+        "response",
+        "post ",
+        "post-",
+        "dispatch",
+        "outbound",
+        "outgoing",
+    )
+    if any(token in rationale for token in negative_tokens):
+        return False
+    if any(token in rationale for token in positive_tokens):
+        return (
+            candidate.has_main_input is False
+            and "main" in [_normalize_connector_type(item) for item in candidate.output_connection_types]
+        )
+    return False
+
+
+def _candidate_requires_non_main_inputs(candidate: ArchitectNodeCandidate) -> bool:
+    inputs = [_normalize_connector_type(item) for item in candidate.input_connection_types]
+    return any(item and item != "main" for item in inputs)
+
+
+def _candidate_has_main_output(candidate: ArchitectNodeCandidate) -> bool:
+    outputs = [_normalize_connector_type(item) for item in candidate.output_connection_types]
+    return "main" in outputs
+
+
+def _user_explicitly_requested_ai(*texts: Any) -> bool:
+    combined = " ".join(_sanitize_text(text).lower() for text in texts if _sanitize_text(text))
+    return any(
+        token in combined
+        for token in (
+            " ai ",
+            " llm",
+            "openai",
+            "language model",
+            "gpt",
+            "chatgpt",
+            "machine learning",
+            "ml model",
+        )
+    ) or combined.startswith("ai ")
+
+
+def _stage_prefers_rule_based(*texts: Any) -> bool:
+    combined = " ".join(_sanitize_text(text).lower() for text in texts if _sanitize_text(text))
+    return any(
+        token in combined
+        for token in (
+            "heuristic",
+            "heuristics",
+            "rule-based",
+            "rule based",
+            "rules-based",
+            "rules based",
+            "if/then",
+            "if then",
+            "deterministic",
+            "without ai",
+        )
+    )
+
+
+def _candidate_looks_like_ai_classifier(candidate: ArchitectNodeCandidate) -> bool:
+    combined = " ".join(
+        [
+            candidate.node_type,
+            candidate.display_name or "",
+            candidate.capability_summary,
+        ]
+    ).lower()
+    if _candidate_requires_non_main_inputs(candidate):
         return True
-    return candidate.has_main_input is False and candidate.usage_mode in {"action_only", "both", "unknown"}
+    return any(
+        token in combined
+        for token in (" ai ", " llm", "language model", "openai", "textclassifier", "text classifier")
+    )
+
+
+def _candidate_rejection_reasons(
+    *,
+    candidate: ArchitectNodeCandidate,
+    stage: ArchitectureStage,
+    plan: ArchitecturePlan,
+    stage_requires_trigger: bool,
+) -> List[str]:
+    reasons: List[str] = []
+    combined = " ".join(
+        [
+            candidate.node_type,
+            candidate.display_name or "",
+            candidate.capability_summary,
+            " ".join(candidate.limitations),
+        ]
+    ).lower()
+
+    if candidate.usage_mode == "tool_only":
+        reasons.append("tool_only_candidate")
+    if _candidate_requires_non_main_inputs(candidate):
+        reasons.append("requires_non_main_input_connectors")
+    if not _candidate_has_main_output(candidate):
+        reasons.append("missing_main_output")
+    if stage_requires_trigger and not _is_trigger_candidate(candidate):
+        reasons.append("not_a_valid_inbound_trigger")
+    if stage_requires_trigger and any(
+        token in combined for token in ("send", "reply", "respond", "dispatch", "post ")
+    ):
+        reasons.append("outbound_nodes_are_invalid_for_intake")
+
+    if _stage_prefers_rule_based(
+        stage.name,
+        stage.purpose,
+        " ".join(stage.required_capabilities),
+        " ".join(stage.expected_inputs),
+        " ".join(stage.expected_outputs),
+        plan.workflow_summary,
+        plan.business_objective,
+        plan.desired_outcome,
+    ) and not _user_explicitly_requested_ai(
+        plan.business_objective,
+        plan.desired_outcome,
+        plan.workflow_summary,
+        stage.purpose,
+    ):
+        if _candidate_looks_like_ai_classifier(candidate):
+            reasons.append("rule_based_stage_rejects_ai_candidate")
+
+    return reasons
 
 
 def _candidate_summary(
@@ -468,7 +657,15 @@ def _candidate_from_group(
     )
     if usage_mode == "tool_only":
         limitations.append("This candidate only exposes AI-tool style connectors for the current evidence.")
-    if "main" not in [item.lower() for item in outputs]:
+    if _candidate_requires_non_main_inputs(
+        ArchitectNodeCandidate(
+            node_type=node_type,
+            input_connection_types=list(inputs),
+            output_connection_types=list(outputs),
+        )
+    ):
+        limitations.append("This candidate requires non-main input connectors and is invalid in v1 classic workflows.")
+    if "main" not in [_normalize_connector_type(item) for item in outputs]:
         limitations.append("This candidate does not expose a standard main output in the current evidence.")
 
     return ArchitectNodeCandidate(
@@ -480,8 +677,9 @@ def _candidate_from_group(
         rationale="Evidence-backed node candidate extracted from API docs and linked node definitions.",
         usage_mode=usage_mode,  # type: ignore[arg-type]
         usable_as_tool=usable_as_tool,
-        has_main_input=("main" in [item.lower() for item in inputs]) if inputs else False,
+        has_main_input=("main" in [_normalize_connector_type(item) for item in inputs]) if inputs else False,
         input_connection_types=list(inputs),
+        output_connection_types=list(outputs),
         evidence_chunk_ids=_safe_list(evidence_ids),
         evidence_refs=_safe_list(evidence_refs),
         rerank_confidence=rerank_confidence,
@@ -580,6 +778,12 @@ def _select_stage_nodes_with_structured_output(
     ]
     candidate_lines = []
     for candidate in candidates[:12]:
+        rejected_reasons = _candidate_rejection_reasons(
+            candidate=candidate,
+            stage=stage,
+            plan=plan,
+            stage_requires_trigger=stage_requires_trigger,
+        )
         candidate_lines.append(
             "\n".join(
                 [
@@ -589,9 +793,11 @@ def _select_stage_nodes_with_structured_output(
                     f"  Usable As Tool: {candidate.usable_as_tool}",
                     f"  Has Main Input: {candidate.has_main_input}",
                     f"  Input Connection Types: {', '.join(candidate.input_connection_types) or '-'}",
+                    f"  Output Connection Types: {', '.join(candidate.output_connection_types) or '-'}",
                     f"  Type Version: {candidate.type_version}",
                     f"  Capability Summary: {candidate.capability_summary or '-'}",
                     f"  Limitations: {', '.join(candidate.limitations) or '-'}",
+                    f"  Hard Reject Reasons In v1: {', '.join(rejected_reasons) or '-'}",
                     f"  Evidence Refs: {', '.join(candidate.evidence_refs[:3]) or '-'}",
                 ]
             )
@@ -601,8 +807,8 @@ def _select_stage_nodes_with_structured_output(
         "You are architect_agent for an n8n workflow assistant. "
         "Select the best standard n8n nodes for one workflow stage using only the candidates provided. "
         "Do not invent node types. "
-        "This release only supports classic workflows with normal connectors. "
-        "Do not select tool-only AI nodes."
+        "This release only supports classic workflows with main-only compatible nodes. "
+        "Treat the provided hard constraints as mandatory, not preferences."
     )
     user_prompt = (
         f"Workflow objective: {plan.business_objective}\n"
@@ -621,7 +827,11 @@ def _select_stage_nodes_with_structured_output(
         "- Select only from the listed node types.\n"
         "- Prefer the smallest bundle that fully satisfies the stage without breaking the overall workflow.\n"
         "- Keep the overall workflow coherent from start to finish.\n"
-        "- Reject candidates that are only usable as AI tools.\n"
+        "- For the first stage, only explicit inbound trigger/listener/polling nodes are valid.\n"
+        "- Send, post, respond, reply, and dispatch nodes are invalid for intake stages.\n"
+        "- Reject any candidate with hard reject reasons in v1.\n"
+        "- In v1, reject any node that requires ai_languageModel, ai_tool, ai_memory, or any other non-main required connector.\n"
+        "- If the stage is heuristic or rule-based, reject AI or LLM classifier nodes unless the user explicitly asked for AI.\n"
         f"- Stage requires trigger-capable node: {stage_requires_trigger}.\n"
         "- If no candidate fits confidently, set needs_clarification=true and ask only the minimum question needed.\n"
     )
@@ -665,7 +875,7 @@ def _fallback_workflow_blueprint(
 ) -> _WorkflowBlueprintOutput:
     nodes: List[_WorkflowNodeBlueprint] = []
     connections: List[_WorkflowConnectionBlueprint] = []
-    previous_node_id: Optional[str] = None
+    stage_primary_node_ids: Dict[str, str] = {}
     counter = 1
     for selection in stage_selections:
         for candidate in selection.selected_nodes:
@@ -679,18 +889,38 @@ def _fallback_workflow_blueprint(
                     type_version=max(1, candidate.type_version),
                     stage_id=selection.stage_id,
                     purpose=candidate.rationale or selection.rationale,
-                    depends_on=[previous_node_id] if previous_node_id else [],
+                    depends_on=[],
                 )
             )
-            if previous_node_id:
-                connections.append(
-                    _WorkflowConnectionBlueprint(
-                        source_node_id=previous_node_id,
-                        target_node_id=node_id,
-                    )
-                )
-            previous_node_id = node_id
+            stage_primary_node_ids.setdefault(selection.stage_id, node_id)
             counter += 1
+
+    nodes_by_stage = {node.stage_id: node for node in nodes}
+    stage_order = [selection.stage_id for selection in stage_selections]
+    stage_map = {stage.id: stage for stage in plan.stages}
+    for index, selection in enumerate(stage_selections):
+        node = nodes_by_stage.get(selection.stage_id)
+        if node is None:
+            continue
+        stage = stage_map.get(selection.stage_id)
+        deps = [
+            stage_primary_node_ids[dependency]
+            for dependency in list(stage.dependencies if stage is not None else [])
+            if dependency in stage_primary_node_ids
+        ]
+        if not deps and index > 0:
+            previous_stage_id = stage_order[index - 1]
+            previous_node_id = stage_primary_node_ids.get(previous_stage_id)
+            if previous_node_id:
+                deps = [previous_node_id]
+        node.depends_on = deps
+        for dep in deps:
+            connections.append(
+                _WorkflowConnectionBlueprint(
+                    source_node_id=dep,
+                    target_node_id=node.node_id,
+                )
+            )
 
     return _WorkflowBlueprintOutput(
         workflow_name=plan.title or "Architect Workflow Draft",
@@ -722,7 +952,9 @@ def _build_workflow_blueprint_with_structured_output(
             stage_nodes.append(
                 f"{candidate.node_type} (name={candidate.display_name or candidate.node_type}, "
                 f"typeVersion={candidate.type_version}, usage_mode={candidate.usage_mode}, "
-                f"has_main_input={candidate.has_main_input}, rationale={candidate.rationale or candidate.capability_summary})"
+                f"has_main_input={candidate.has_main_input}, "
+                f"inputs={candidate.input_connection_types}, outputs={candidate.output_connection_types}, "
+                f"rationale={candidate.rationale or candidate.capability_summary})"
             )
         selection_lines.append(
             "\n".join(
@@ -738,8 +970,8 @@ def _build_workflow_blueprint_with_structured_output(
     system_prompt = (
         "You are architect_agent for an n8n workflow assistant. "
         "Build the first structural n8n workflow draft using only the selected node candidates. "
-        "Do not generate parameter values, credentials, AI tool connectors, or unsupported connection types. "
-        "Use only classic workflow structure."
+        "Do not generate parameter values, credentials, AI tool connectors, unsupported connection types, "
+        "or invalid edges. Use only classic main-only workflow structure."
     )
     user_prompt = (
         f"Workflow title: {plan.title}\n"
@@ -753,6 +985,10 @@ def _build_workflow_blueprint_with_structured_output(
         "- Build a coherent draft for a classic non-AI workflow.\n"
         "- The draft must contain at least one trigger/start node.\n"
         "- Use only main connections.\n"
+        "- Validate every edge before emitting it.\n"
+        "- Do not connect through main into a node that requires unsupported auxiliary connectors.\n"
+        "- Do not force a linear chain only because the stage list is linear.\n"
+        "- If a selected node cannot participate in a classic main-only flow, return no invalid edge for it.\n"
         "- Return unique node ids and names.\n"
         "- type_version must come from the selected candidate metadata.\n"
         "- Keep the node order and dependencies coherent with the stage order.\n"
@@ -870,6 +1106,7 @@ def _block_architect(
 def _validate_blueprint(
     *,
     blueprint: _WorkflowBlueprintOutput,
+    plan: ArchitecturePlan,
     stage_map: Dict[str, ArchitectureStage],
     stage_selection_map: Dict[str, ArchitectStageSelection],
 ) -> List[str]:
@@ -899,12 +1136,36 @@ def _validate_blueprint(
             )
         if node.type_version <= 0:
             issues.append(f"Node '{node.node_id}' returned invalid type_version.")
+        candidate = next(
+            (item for item in selection.selected_nodes if item.node_type == node.node_type),
+            None,
+        )
+        if candidate is not None and _candidate_rejection_reasons(
+            candidate=candidate,
+            stage=stage_map[node.stage_id],
+            plan=plan,
+            stage_requires_trigger=(plan.stages and node.stage_id == plan.stages[0].id),
+        ):
+            issues.append(f"Node '{node.node_id}' is incompatible with v1 classic workflow constraints.")
 
     for connection in blueprint.connections:
         if connection.type != "main":
             issues.append("Workflow blueprint used non-main connection type in v1 architect flow.")
         if connection.source_node_id not in nodes_by_id or connection.target_node_id not in nodes_by_id:
             issues.append("Workflow blueprint returned a connection to a non-existent node.")
+            continue
+        target_node = nodes_by_id[connection.target_node_id]
+        selection = stage_selection_map.get(target_node.stage_id)
+        candidate = None
+        if selection is not None:
+            candidate = next(
+                (item for item in selection.selected_nodes if item.node_type == target_node.node_type),
+                None,
+            )
+        if candidate is not None and _candidate_requires_non_main_inputs(candidate):
+            issues.append(
+                f"Connection into '{target_node.node_id}' is invalid because the target requires non-main input connectors."
+            )
 
     for selection in stage_selection_map.values():
         selected_types = set(selection.selected_node_types)
@@ -981,6 +1242,7 @@ def _draft_from_blueprint(
                 usable_as_tool=(candidate.usable_as_tool if candidate else None),
                 has_main_input=(candidate.has_main_input if candidate else None),
                 input_connection_types=(list(candidate.input_connection_types) if candidate else []),
+                output_connection_types=(list(candidate.output_connection_types) if candidate else []),
             )
         )
 
@@ -1141,9 +1403,16 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                 },
             )
 
-            valid_candidates = [item for item in candidates if item.usage_mode != "tool_only"]
-            if stage_requires_trigger:
-                valid_candidates = [item for item in valid_candidates if _is_trigger_candidate(item)]
+            valid_candidates = [
+                item
+                for item in candidates
+                if not _candidate_rejection_reasons(
+                    candidate=item,
+                    stage=stage,
+                    plan=architecture_plan,
+                    stage_requires_trigger=stage_requires_trigger,
+                )
+            ]
 
             selection_output = _select_stage_nodes_with_structured_output(
                 plan=architecture_plan,
@@ -1224,6 +1493,7 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     )
     validation_issues = _validate_blueprint(
         blueprint=blueprint,
+        plan=architecture_plan,
         stage_map=stage_map,
         stage_selection_map=stage_selection_map,
     )
