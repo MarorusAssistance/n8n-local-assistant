@@ -596,6 +596,81 @@ def _candidate_summary(
     return _compact(" ".join(descriptions), max_chars=320)
 
 
+def _recent_selection_context(
+    *,
+    plan: ArchitecturePlan,
+    previous_selections: Sequence[ArchitectStageSelection],
+    limit: int = 3,
+) -> str:
+    if not previous_selections:
+        return "-"
+
+    stage_map = {stage.id: stage for stage in plan.stages}
+    lines: List[str] = []
+    for selection in list(previous_selections)[-limit:]:
+        stage = stage_map.get(selection.stage_id)
+        stage_label = stage.name if stage is not None else selection.stage_id
+        node_parts = []
+        for candidate in selection.selected_nodes[:3]:
+            node_parts.append(
+                (
+                    f"{candidate.node_type} "
+                    f"(inputs={candidate.input_connection_types or ['-']}, "
+                    f"outputs={candidate.output_connection_types or ['-']}, "
+                    f"usage={candidate.usage_mode})"
+                )
+            )
+        lines.append(
+            _compact(
+                f"{selection.stage_id} / {stage_label}: "
+                f"{' | '.join(node_parts) or ', '.join(selection.selected_node_types) or '-'}; "
+                f"rationale={selection.rationale or '-'}",
+                max_chars=320,
+            )
+        )
+    return "\n".join(lines) if lines else "-"
+
+
+def _stage_neighborhood_context(
+    *,
+    plan: ArchitecturePlan,
+    stage_selections: Sequence[ArchitectStageSelection],
+    limit: int = 3,
+) -> str:
+    if not stage_selections:
+        return "-"
+
+    stage_map = {stage.id: stage for stage in plan.stages}
+    lines: List[str] = []
+    for index, selection in enumerate(stage_selections):
+        stage = stage_map.get(selection.stage_id)
+        if stage is None:
+            continue
+        upstream = _recent_selection_context(
+            plan=plan,
+            previous_selections=list(stage_selections[:index]),
+            limit=limit,
+        )
+        downstream = []
+        for future in list(stage_selections[index + 1 : index + 1 + limit]):
+            future_stage = stage_map.get(future.stage_id)
+            downstream.append(
+                f"{future.stage_id}/{future_stage.name if future_stage is not None else future.stage_id}: "
+                f"{', '.join(future.selected_node_types) or '-'}"
+            )
+        lines.append(
+            "\n".join(
+                [
+                    f"Stage neighborhood for {selection.stage_id} / {stage.name}:",
+                    f"Current stage intent: {stage.purpose}",
+                    f"Recent upstream selected nodes:\n{upstream}",
+                    f"Nearest downstream stage bundles: {' | '.join(downstream) or '-'}",
+                ]
+            )
+        )
+    return "\n\n".join(lines) if lines else "-"
+
+
 def _candidate_from_group(
     *,
     stage_id: str,
@@ -776,6 +851,11 @@ def _select_stage_nodes_with_structured_output(
         for selection in previous_selections
         if selection.selected_node_types
     ]
+    recent_context = _recent_selection_context(
+        plan=plan,
+        previous_selections=previous_selections,
+        limit=3,
+    )
     candidate_lines = []
     for candidate in candidates[:12]:
         rejected_reasons = _candidate_rejection_reasons(
@@ -808,7 +888,8 @@ def _select_stage_nodes_with_structured_output(
         "Select the best standard n8n nodes for one workflow stage using only the candidates provided. "
         "Do not invent node types. "
         "This release only supports classic workflows with main-only compatible nodes. "
-        "Treat the provided hard constraints as mandatory, not preferences."
+        "Treat the provided hard constraints as mandatory, not preferences. "
+        "Reason like a workflow architect, not like a semantic search engine: choose nodes by structural role in the workflow."
     )
     user_prompt = (
         f"Workflow objective: {plan.business_objective}\n"
@@ -821,18 +902,26 @@ def _select_stage_nodes_with_structured_output(
         f"Current stage expected inputs: {', '.join(stage.expected_inputs) or '-'}\n"
         f"Current stage expected outputs: {', '.join(stage.expected_outputs) or '-'}\n"
         f"Previous selected stages: {' | '.join(selected_summary) or '-'}\n\n"
+        f"Recent upstream selected nodes and connectors:\n{recent_context}\n\n"
         "Candidate nodes:\n"
         f"{chr(10).join(candidate_lines)}\n\n"
         "Rules:\n"
         "- Select only from the listed node types.\n"
         "- Prefer the smallest bundle that fully satisfies the stage without breaking the overall workflow.\n"
         "- Keep the overall workflow coherent from start to finish.\n"
+        "- Use the recent upstream selected nodes as hard context for compatibility, I/O continuity, and realistic sequencing.\n"
+        "- Avoid selecting a node that would make the previous 2 to 3 stages impossible to connect coherently.\n"
+        "- Decide by functional role, not just semantic similarity. Distinguish trigger, poller, classifier, model provider, transformer, router, and sink roles.\n"
+        "- Reject provider-only or infrastructure-only nodes when the stage needs a complete business operation node.\n"
+        "- Prefer nodes whose main inputs and outputs naturally match the stage I/O and the nearest upstream node outputs.\n"
+        "- If a candidate would require an extra hidden node, hidden model attachment, or hidden auxiliary connection to work, reject it in this selection step.\n"
         "- For the first stage, only explicit inbound trigger/listener/polling nodes are valid.\n"
         "- Send, post, respond, reply, and dispatch nodes are invalid for intake stages.\n"
         "- Reject any candidate with hard reject reasons in v1.\n"
         "- In v1, reject any node that requires ai_languageModel, ai_tool, ai_memory, or any other non-main required connector.\n"
         "- If the stage is heuristic or rule-based, reject AI or LLM classifier nodes unless the user explicitly asked for AI.\n"
         f"- Stage requires trigger-capable node: {stage_requires_trigger}.\n"
+        "- Before selecting, perform a private compatibility check against: stage intent, stage I/O, previous 2 to 3 stages, and likely next-stage connectivity.\n"
         "- If no candidate fits confidently, set needs_clarification=true and ask only the minimum question needed.\n"
     )
     try:
@@ -966,12 +1055,18 @@ def _build_workflow_blueprint_with_structured_output(
                 ]
             )
         )
+    neighborhood_context = _stage_neighborhood_context(
+        plan=plan,
+        stage_selections=stage_selections,
+        limit=3,
+    )
 
     system_prompt = (
         "You are architect_agent for an n8n workflow assistant. "
         "Build the first structural n8n workflow draft using only the selected node candidates. "
         "Do not generate parameter values, credentials, AI tool connectors, unsupported connection types, "
-        "or invalid edges. Use only classic main-only workflow structure."
+        "or invalid edges. Use only classic main-only workflow structure. "
+        "Reason like a workflow architect assembling a valid DAG, not like a text generator."
     )
     user_prompt = (
         f"Workflow title: {plan.title}\n"
@@ -980,18 +1075,27 @@ def _build_workflow_blueprint_with_structured_output(
         f"Workflow summary: {plan.workflow_summary}\n\n"
         "Selected stage bundles:\n"
         f"{chr(10).join(selection_lines)}\n\n"
+        "Stage neighborhood context:\n"
+        f"{neighborhood_context}\n\n"
         "Rules:\n"
         "- Use only the selected node types.\n"
         "- Build a coherent draft for a classic non-AI workflow.\n"
         "- The draft must contain at least one trigger/start node.\n"
         "- Use only main connections.\n"
         "- Validate every edge before emitting it.\n"
+        "- When deciding each edge, consider the whole workflow objective, each stage I/O, and the nearest upstream selected nodes.\n"
+        "- Keep adjacency coherent: each node must make sense given the 2 to 3 closest previous nodes, not only the stage order.\n"
         "- Do not connect through main into a node that requires unsupported auxiliary connectors.\n"
         "- Do not force a linear chain only because the stage list is linear.\n"
         "- If a selected node cannot participate in a classic main-only flow, return no invalid edge for it.\n"
         "- Return unique node ids and names.\n"
         "- type_version must come from the selected candidate metadata.\n"
         "- Keep the node order and dependencies coherent with the stage order.\n"
+        "- Never reference a source_node_id or target_node_id that is not present in the returned nodes list.\n"
+        "- Do not invent helper nodes that were not selected.\n"
+        "- Do not assume hidden model wiring, hidden tools, hidden memory, or hidden side connections.\n"
+        "- Prefer the minimum valid edge set that preserves the workflow logic.\n"
+        "- Before returning, perform a private self-check: every dependency references an existing node id, every connection references existing node ids, every target can accept main, and the full graph stays coherent end-to-end.\n"
         "- Parameters remain empty at this stage.\n"
     )
     try:

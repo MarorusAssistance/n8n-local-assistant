@@ -231,6 +231,117 @@ def test_architect_stage_selection_returns_structured_output(monkeypatch: pytest
     assert output.selected_node_types == ["n8n-nodes-base.webhook"]
 
 
+def test_architect_stage_selection_prompt_includes_recent_upstream_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: Dict[str, Any] = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _StageSelectionOutput(
+            selected_node_types=["n8n-nodes-base.code"],
+            rationale="Use code after the upstream trigger.",
+            needs_clarification=False,
+            clarification_questions=[],
+        )
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._invoke_structured_output", _capture)
+
+    previous_selection = ArchitectStageSelection(
+        stage_id="stage_1",
+        selected_node_types=["n8n-nodes-base.gmailTrigger"],
+        selected_nodes=[
+            _candidate(
+                "n8n-nodes-base.gmailTrigger",
+                stage_id="stage_1",
+                has_main_input=False,
+                capability_summary="Receive inbound emails from Gmail.",
+            )
+        ],
+        rationale="Inbound email trigger",
+    )
+
+    _select_stage_nodes_with_structured_output(
+        plan=_plan(),
+        stage=_plan().stages[1],
+        candidates=[_candidate("n8n-nodes-base.code", stage_id="stage_2")],
+        previous_selections=[previous_selection],
+        stage_requires_trigger=False,
+        model="fake-model",
+        request_id="req-architect-upstream-context",
+    )
+
+    prompt = str(captured["user_prompt"])
+    assert "Recent upstream selected nodes and connectors" in prompt
+    assert "n8n-nodes-base.gmailTrigger" in prompt
+    assert "inputs=['-']" in prompt or "inputs=[]" in prompt
+
+
+def test_architect_prompts_emphasize_structural_role_and_id_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: List[Dict[str, Any]] = []
+
+    def _capture(**kwargs):
+        captured.append(kwargs)
+        output_model = kwargs["output_model"]
+        if output_model is _StageSelectionOutput:
+            return _StageSelectionOutput(
+                selected_node_types=["n8n-nodes-base.gmailTrigger"],
+                rationale="Selected by trigger role.",
+                needs_clarification=False,
+                clarification_questions=[],
+            )
+        return _WorkflowBlueprintOutput(
+            workflow_name="Email urgency classification",
+            summary="Architect draft",
+            nodes=[
+                _WorkflowNodeBlueprint(
+                    node_id="an_1",
+                    name="gmail_trigger_1",
+                    node_type="n8n-nodes-base.gmailTrigger",
+                    type_version=1,
+                    stage_id="stage_1",
+                    purpose="Receive emails",
+                    depends_on=[],
+                )
+            ],
+            connections=[],
+        )
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._invoke_structured_output", _capture)
+
+    _select_stage_nodes_with_structured_output(
+        plan=_plan(),
+        stage=_plan().stages[0],
+        candidates=[_candidate("n8n-nodes-base.gmailTrigger", stage_id="stage_1", has_main_input=False)],
+        previous_selections=[],
+        stage_requires_trigger=True,
+        model="fake-model",
+        request_id="req-architect-prompt-selection",
+    )
+    _build_workflow_blueprint_with_structured_output(
+        plan=_plan(),
+        stage_selections=[
+            ArchitectStageSelection(
+                stage_id="stage_1",
+                selected_node_types=["n8n-nodes-base.gmailTrigger"],
+                selected_nodes=[_candidate("n8n-nodes-base.gmailTrigger", stage_id="stage_1", has_main_input=False)],
+                rationale="Selected by trigger role.",
+            )
+        ],
+        model="fake-model",
+        request_id="req-architect-prompt-blueprint",
+    )
+
+    selection_prompt = str(captured[0]["user_prompt"])
+    blueprint_prompt = str(captured[1]["user_prompt"])
+    assert "Decide by functional role, not just semantic similarity." in selection_prompt
+    assert "Reject provider-only or infrastructure-only nodes when the stage needs a complete business operation node." in selection_prompt
+    assert "Never reference a source_node_id or target_node_id that is not present in the returned nodes list." in blueprint_prompt
+    assert "perform a private self-check" in blueprint_prompt
+
+
 def test_architect_parses_malformed_connector_fragments_into_clean_connector_types() -> None:
     page_key, _, _ = derive_doc_page_key(
         {},
