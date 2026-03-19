@@ -12,18 +12,28 @@ from app.features.reasoning.multi_agent_contracts import (
     EntryIntent,
     ImplementationStatus,
     NodeRequirement,
+    ProposedNode,
     WorkflowContext,
+    WorkflowDraft,
+    WorkflowDraftConnection,
+    WorkflowDraftNode,
 )
-from app.graphs.nodes.engineer_agent import engineer_agent_node
+from app.graphs.nodes import engineer_agent as engineer_mod
+from app.graphs.nodes.engineer_agent import (
+    DeveloperCredentialDefinition,
+    DeveloperNodeDefinition,
+    DeveloperParameterDefinition,
+    engineer_agent_node,
+)
 
 
 def _requirement(node_type: str, idx: int) -> NodeRequirement:
     return NodeRequirement(
         node_type=node_type,
         why_required=f"Required node {node_type}",
-        evidence_chunk_ids=[f"chunk-{idx}"],
-        evidence_refs=[f"ref-{idx}"],
-        evidence_confidence=0.8,
+        evidence_chunk_ids=[],
+        evidence_refs=[],
+        evidence_confidence=0.0,
     )
 
 
@@ -43,6 +53,7 @@ def _plan(node_types: List[str], *, title: str = "Automation Flow") -> Architect
                 expected_inputs=["input_payload"] if idx == 1 else [f"stage_{idx - 1}_output"],
                 expected_outputs=[f"stage_{idx}_output"],
                 dependencies=[prev_stage] if prev_stage else [],
+                success_criteria=[f"Stage {idx} is configured correctly."],
             )
         )
         if prev_stage:
@@ -69,34 +80,93 @@ def _plan(node_types: List[str], *, title: str = "Automation Flow") -> Architect
     )
 
 
+def _draft(node_types: List[str], *, title: str = "Automation Flow") -> WorkflowDraft:
+    nodes: List[WorkflowDraftNode] = []
+    connections: List[WorkflowDraftConnection] = []
+    for idx, node_type in enumerate(node_types, start=1):
+        node_id = f"an_{idx}"
+        nodes.append(
+            WorkflowDraftNode(
+                node_id=node_id,
+                name=f"{node_type.split('.')[-1]}_{idx}",
+                node_type=node_type,
+                type_version=2 if node_type.endswith(".code") else 1,
+                purpose=f"Purpose for {node_type}",
+                stage_id=f"stage_{idx}",
+                parameters_known={},
+                parameters_inferred={},
+                parameters_unresolved=[],
+                credential_refs={},
+                expected_inputs=["input_payload"] if idx == 1 else [f"stage_{idx - 1}_output"],
+                expected_outputs=[f"stage_{idx}_output"],
+                dependencies=[f"an_{idx - 1}"] if idx > 1 else [],
+                position=[260 * idx, 300],
+                notes=["architect_stage"],
+            )
+        )
+        if idx > 1:
+            connections.append(
+                WorkflowDraftConnection(
+                    source_node_id=f"an_{idx - 1}",
+                    target_node_id=node_id,
+                )
+            )
+    return WorkflowDraft(
+        name=title,
+        use_case_id="uc_engineer",
+        summary="Architect draft",
+        nodes=nodes,
+        connections=connections,
+        metadata={},
+    )
+
+
+def _proposed_nodes(node_types: List[str]) -> List[ProposedNode]:
+    return [
+        ProposedNode(
+            node_id=f"an_{idx}",
+            node_type=node_type,
+            stage_id=f"stage_{idx}",
+            purpose=f"Purpose for {node_type}",
+            depends_on=[f"an_{idx - 1}"] if idx > 1 else [],
+            expected_inputs=["input_payload"] if idx == 1 else [f"stage_{idx - 1}_output"],
+            expected_outputs=[f"stage_{idx}_output"],
+        )
+        for idx, node_type in enumerate(node_types, start=1)
+    ]
+
+
 def _state(
-    plan: ArchitecturePlan | None,
+    node_types: List[str] | None,
     *,
     entry_intent: EntryIntent = EntryIntent.workflow_build_request,
     user_query: str = "Implement workflow",
+    runtime_context: Dict[str, Any] | None = None,
     extra: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    required_node_types = [item.node_type for item in plan.required_nodes] if plan else []
+    plan = _plan(node_types or []) if node_types else None
+    draft = _draft(node_types or [], title=plan.title if plan else "Workflow Draft") if node_types else None
+    proposed = _proposed_nodes(node_types or []) if node_types else []
     state: Dict[str, Any] = {
         "user_query": user_query,
         "entry_intent": entry_intent,
-        "current_stage": "product_manager_agent",
+        "current_stage": "architect_agent" if plan else None,
         "target_stage": AgentStage.engineer_agent if plan else None,
-        "routing_signals": ["handoff_ready_engineer"],
+        "routing_signals": ["handoff_ready_engineer"] if plan else [],
         "architecture_plan": plan,
         "workflow_context": WorkflowContext(
             use_case_id=(plan.use_case_id if plan else "unknown"),
             planning_ready=bool(plan),
             handoff_target=AgentStage.engineer_agent if plan else None,
-            required_node_types=required_node_types,
+            required_node_types=[item.node_type for item in plan.required_nodes] if plan else [],
             unresolved_inputs=[],
-            notes=[],
-        ),
+            notes=["architect_complete"] if plan else [],
+        ) if plan else None,
         "missing_user_inputs": [],
         "missing_user_input_details": [],
-        "proposed_nodes": [],
+        "proposed_nodes": proposed,
         "required_credentials": [],
-        "workflow_draft": None,
+        "workflow_draft": draft,
         "workflow_versions": [],
         "node_implementation_queue": [],
         "implemented_nodes": [],
@@ -105,235 +175,407 @@ def _state(
         "implementation_status": None,
         "engineer_notes": [],
         "final_workflow_json": {},
-        "runtime_context": {"model": None, "request_id": "req-engineer-test"},
+        "runtime_context": runtime_context or {"model": None, "request_id": "req-engineer-test", "persist_to_n8n": False},
         "resume_requested": False,
+        "active_workflow_id": "wf_existing" if plan else None,
+        "active_workflow_name": draft.name if draft else None,
+        "active_workflow_url": "http://localhost:5678/workflow/wf_existing" if plan else None,
+        "workflow_persisted": False,
+        "workflow_persist_action": None,
+        "workflow_api_sync_result": {},
     }
     if extra:
         state.update(extra)
     return state
 
 
-@pytest.mark.parametrize(
-    "node_types",
-    [
-        ["n8n-nodes-base.webhook", "n8n-nodes-base.set"],
-        ["n8n-nodes-base.webhook", "n8n-nodes-base.if", "n8n-nodes-base.set"],
-        ["n8n-nodes-base.set", "n8n-nodes-base.switch"],
-    ],
-)
-def test_engineer_successful_iterative_construction(node_types: List[str]) -> None:
-    updates = engineer_agent_node(_state(_plan(node_types)))
+def _node_def(
+    node_type: str,
+    *,
+    required_params: List[str] | None = None,
+    credential_types: List[str] | None = None,
+    type_version: int = 1,
+) -> DeveloperNodeDefinition:
+    params = [
+        DeveloperParameterDefinition(name=name, required=True, description=f"Required param {name}")
+        for name in (required_params or [])
+    ]
+    return DeveloperNodeDefinition(
+        node_type=node_type,
+        display_name=node_type.split(".")[-1],
+        type_version=type_version,
+        summary=f"Definition for {node_type}",
+        parameter_schema=params,
+        credential_types_required=list(credential_types or []),
+        source_refs=["n8n://definition"],
+        raw_chunks=[],
+    )
+
+
+def _stub_definition_lookups(
+    monkeypatch: pytest.MonkeyPatch,
+    specs: Dict[str, Dict[str, Any]],
+) -> None:
+    defs: Dict[str, DeveloperNodeDefinition] = {}
+    creds: Dict[str, List[DeveloperCredentialDefinition]] = {}
+    for node_type, spec in specs.items():
+        defs[node_type] = _node_def(
+            node_type,
+            required_params=spec.get("required_params", []),
+            credential_types=spec.get("credential_types", []),
+            type_version=spec.get("type_version", 1),
+        )
+        creds[node_type] = [
+            DeveloperCredentialDefinition(
+                credential_type=item,
+                display_name=spec.get("credential_display_names", {}).get(item, item),
+                field_names=["apiKey"],
+                summary=f"Credential for {item}",
+            )
+            for item in spec.get("credential_types", [])
+        ]
+
+    monkeypatch.setattr(engineer_mod, "get_node_definition", lambda node_type: defs.get(node_type))
+    monkeypatch.setattr(
+        engineer_mod,
+        "get_node_parameter_schema",
+        lambda node_type: list((defs.get(node_type) or _node_def(node_type)).parameter_schema),
+    )
+    monkeypatch.setattr(
+        engineer_mod,
+        "get_node_credential_requirements",
+        lambda node_type: list(creds.get(node_type, [])),
+    )
+
+
+def test_engineer_success_from_architect_handoff_simple(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+        },
+    )
+
+    updates = engineer_agent_node(
+        _state(["n8n-nodes-base.webhook", "n8n-nodes-base.set"])
+    )
 
     assert updates["implementation_status"] == ImplementationStatus.completed
-    assert updates["final_workflow_json"]["nodes"]
-    assert len(updates["final_workflow_json"]["nodes"]) == len(node_types)
     assert updates["target_stage"] == AgentStage.qa_agent
-    assert "handoff_ready_qa" in updates["routing_signals"]
-    assert all(item.status == "implemented" for item in updates["node_implementation_queue"])
+    assert len(updates["implemented_nodes"]) == 2
+    assert updates["workflow_draft"].nodes[0].node_id == "an_1"
+    assert updates["workflow_draft"].connections
+
+
+def test_engineer_success_preserves_architect_structure(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.code": {"type_version": 2},
+            "n8n-nodes-base.googleSheets": {},
+        },
+    )
+
+    state = _state(
+        ["n8n-nodes-base.webhook", "n8n-nodes-base.code", "n8n-nodes-base.googleSheets"]
+    )
+    updates = engineer_agent_node(state)
+
+    draft = updates["workflow_draft"]
+    assert updates["implementation_status"] == ImplementationStatus.completed
+    assert [node.node_id for node in draft.nodes] == ["an_1", "an_2", "an_3"]
+    assert [node.position for node in draft.nodes] == [[260, 300], [520, 300], [780, 300]]
+    assert draft.nodes[1].type_version == 2
+    assert len(draft.connections) == 2
+
+
+def test_engineer_success_with_existing_known_parameters(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.httpRequest": {"required_params": ["url"]},
+        },
+    )
+
+    state = _state(["n8n-nodes-base.httpRequest"])
+    state["workflow_draft"].nodes[0].parameters_known = {"url": "https://api.example.com"}
+    updates = engineer_agent_node(state)
+
+    assert updates["implementation_status"] == ImplementationStatus.completed
+    assert updates["workflow_draft"].nodes[0].parameters_known["url"] == "https://api.example.com"
 
 
 @pytest.mark.parametrize(
-    "plan_obj",
+    "node_type,required_param",
     [
-        _plan(["n8n-nodes-base.httpRequest"], title="HTTP sync flow"),
-        _plan(["n8n-nodes-base.slack"], title="Slack alert flow"),
-        _plan(["n8n-nodes-base.googleSheets"], title="Row logging flow"),
+        ("n8n-nodes-base.httpRequest", "url"),
+        ("n8n-nodes-base.slack", "text"),
+        ("n8n-nodes-base.googleSheets", "sheetName"),
     ],
 )
-def test_engineer_blocks_when_critical_inputs_missing(plan_obj: ArchitecturePlan) -> None:
-    updates = engineer_agent_node(_state(plan_obj))
+def test_engineer_blocks_when_required_parameter_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    node_type: str,
+    required_param: str,
+) -> None:
+    _stub_definition_lookups(monkeypatch, {node_type: {"required_params": [required_param]}})
+
+    updates = engineer_agent_node(_state([node_type]))
 
     assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
     assert updates["blocked_nodes"]
     assert updates["missing_user_input_details"]
-    assert updates["final_workflow_json"] == {}
-    assert updates["target_stage"] is None
+    assert updates["missing_user_input_details"][0].category == "parameter"
+    assert required_param in updates["missing_user_input_details"][0].question
 
 
 @pytest.mark.parametrize(
-    "plan_obj",
+    "node_type,credential_type",
     [
-        _plan(["n8n-nodes-base.googleSheets"], title="Google Sheet sync"),
-        _plan(["n8n-nodes-base.postgres"], title="Database write flow"),
+        ("n8n-nodes-base.googleSheets", "googleSheetsOAuth2Api"),
+        ("n8n-nodes-base.postgres", "postgres"),
     ],
 )
-def test_engineer_does_not_infer_missing_credentials_from_node_type_heuristics(
-    plan_obj: ArchitecturePlan,
+def test_engineer_blocks_when_credential_reference_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    node_type: str,
+    credential_type: str,
 ) -> None:
-    updates = engineer_agent_node(_state(plan_obj))
-
-    assert updates["implementation_status"] == ImplementationStatus.completed
-    assert updates["final_workflow_json"]["nodes"]
-    categories = {item.category for item in updates["missing_user_input_details"]}
-    assert "credential" not in categories
-
-
-def test_variable_registry_tracks_origins_and_consumers() -> None:
-    updates = engineer_agent_node(
-        _state(_plan(["n8n-nodes-base.webhook", "n8n-nodes-base.set"]))
+    _stub_definition_lookups(
+        monkeypatch,
+        {node_type: {"credential_types": [credential_type]}},
     )
 
+    updates = engineer_agent_node(_state([node_type]))
+
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert updates["blocked_nodes"]
+    assert any(item.category == "credential" for item in updates["missing_user_input_details"])
+    assert updates["required_credentials"][0].credential_key == credential_type
+
+
+def test_variable_registry_tracks_downstream_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+            "n8n-nodes-base.if": {},
+        },
+    )
+
+    updates = engineer_agent_node(
+        _state(["n8n-nodes-base.webhook", "n8n-nodes-base.set", "n8n-nodes-base.if"])
+    )
+
+    assert updates["implementation_status"] == ImplementationStatus.completed
     registry = updates["variable_registry"]
     assert registry
     assert any(item.destination_node_ids for item in registry)
     assert all(item.origin_node_id for item in registry)
-    assert all(item.semantic_meaning for item in registry)
 
 
-def test_variable_registry_across_three_nodes() -> None:
-    updates = engineer_agent_node(
-        _state(_plan(["n8n-nodes-base.webhook", "n8n-nodes-base.if", "n8n-nodes-base.set"]))
+def test_workflow_versions_capture_incremental_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+        },
     )
-    queue_ids = {item.queue_id for item in updates["node_implementation_queue"]}
-    downstream_ids = {dest for item in updates["variable_registry"] for dest in item.destination_node_ids}
-    assert "pn_2" in queue_ids and "pn_3" in queue_ids
-    assert "pn_2" in downstream_ids or "pn_3" in downstream_ids
+
+    updates = engineer_agent_node(_state(["n8n-nodes-base.webhook", "n8n-nodes-base.set"]))
+    reasons = [item.reason for item in updates["workflow_versions"]]
+
+    assert len(updates["workflow_versions"]) >= 4
+    assert any("implemented node an_1" in reason for reason in reasons)
+    assert any("implemented node an_2" in reason for reason in reasons)
 
 
-def test_workflow_versions_are_incremental_and_reasoned() -> None:
-    updates = engineer_agent_node(
-        _state(_plan(["n8n-nodes-base.webhook", "n8n-nodes-base.set", "n8n-nodes-base.if"]))
+def test_engineer_resume_after_parameter_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {"n8n-nodes-base.httpRequest": {"required_params": ["url"]}},
     )
-    versions = updates["workflow_versions"]
 
-    assert len(versions) >= 5
-    version_ids = [item.version for item in versions]
-    assert version_ids == sorted(version_ids)
-    assert any("implemented node" in item.reason for item in versions)
-    assert versions[0].reason.startswith("initialized engineer workflow draft")
-
-
-def test_workflow_versions_grow_after_resume_completion() -> None:
-    initial_state = _state(_plan(["n8n-nodes-base.httpRequest"], title="HTTP flow"))
-    first = engineer_agent_node(initial_state)
+    initial = _state(["n8n-nodes-base.httpRequest"])
+    first = engineer_agent_node(initial)
     assert first["implementation_status"] == ImplementationStatus.blocked_waiting_user
-    first_versions = len(first["workflow_versions"])
 
-    resumed_state = dict(initial_state)
-    resumed_state.update(first)
-    resumed_state["user_query"] = "parameter:pn_1:url=https://api.example.com/resource"
-    resumed_state["resume_requested"] = True
-    resumed_state["runtime_context"] = {"model": None, "request_id": "req-engineer-resume"}
-    second = engineer_agent_node(resumed_state)
+    resumed = dict(initial)
+    resumed.update(first)
+    resumed["user_query"] = "parameter:an_1:url=https://api.example.com/resource"
+    resumed["resume_requested"] = True
+    second = engineer_agent_node(resumed)
 
     assert second["implementation_status"] == ImplementationStatus.completed
-    assert len(second["workflow_versions"]) > first_versions
-    assert second["final_workflow_json"]["nodes"]
+    assert second["workflow_draft"].nodes[0].parameters_known["url"] == "https://api.example.com/resource"
+
+
+def test_engineer_resume_after_credential_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {"n8n-nodes-base.googleSheets": {"credential_types": ["googleSheetsOAuth2Api"]}},
+    )
+
+    initial = _state(["n8n-nodes-base.googleSheets"])
+    first = engineer_agent_node(initial)
+    assert first["implementation_status"] == ImplementationStatus.blocked_waiting_user
+
+    resumed = dict(initial)
+    resumed.update(first)
+    resumed["user_query"] = "credential:an_1:googleSheetsOAuth2Api=cred_google"
+    resumed["resume_requested"] = True
+    second = engineer_agent_node(resumed)
+
+    assert second["implementation_status"] == ImplementationStatus.completed
+    assert second["workflow_draft"].nodes[0].credential_refs["googleSheetsOAuth2Api"] == "cred_google"
 
 
 @pytest.mark.parametrize(
-    "entry_intent,expected_status",
+    "entry_intent,active_workflow_id,expected_status",
     [
-        (EntryIntent.workflow_build_request, ImplementationStatus.failed),
-        (EntryIntent.workflow_edit_request, ImplementationStatus.blocked_waiting_user),
+        (EntryIntent.workflow_build_request, None, ImplementationStatus.failed),
+        (EntryIntent.workflow_edit_request, None, ImplementationStatus.blocked_waiting_user),
     ],
 )
-def test_invalid_or_missing_pm_handoff_fails_cleanly(
+def test_engineer_handles_missing_handoff_cleanly(
     entry_intent: EntryIntent,
+    active_workflow_id: str | None,
     expected_status: ImplementationStatus,
 ) -> None:
-    updates = engineer_agent_node(_state(None, entry_intent=entry_intent))
+    updates = engineer_agent_node(
+        _state(
+            None,
+            entry_intent=entry_intent,
+            extra={"active_workflow_id": active_workflow_id},
+        )
+    )
 
     assert updates["implementation_status"] == expected_status
     assert updates["final_workflow_json"] == {}
-    if expected_status == ImplementationStatus.blocked_waiting_user:
-        assert updates["missing_user_input_details"]
 
 
-def test_engineer_does_not_execute_qa_logic_on_completion() -> None:
-    updates = engineer_agent_node(_state(_plan(["n8n-nodes-base.webhook", "n8n-nodes-base.set"])))
+def test_engineer_bootstraps_from_active_workflow_on_edit_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    workflow_payload = {
+        "id": "wf_edit_1",
+        "name": "Existing Workflow",
+        "nodes": [
+            {
+                "id": "node_1",
+                "name": "Webhook",
+                "type": "n8n-nodes-base.webhook",
+                "typeVersion": 1,
+                "position": [260, 300],
+                "parameters": {},
+            },
+            {
+                "id": "node_2",
+                "name": "Set",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 1,
+                "position": [520, 300],
+                "parameters": {},
+            },
+        ],
+        "connections": {
+            "Webhook": {
+                "main": [[{"node": "Set", "type": "main", "index": 0}]]
+            }
+        },
+    }
+    monkeypatch.setattr(engineer_mod, "get_active_workflow", lambda workflow_id: workflow_payload)
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+        },
+    )
+
+    updates = engineer_agent_node(
+        _state(
+            None,
+            entry_intent=EntryIntent.workflow_edit_request,
+            extra={
+                "active_workflow_id": "wf_edit_1",
+                "active_workflow_name": None,
+                "active_workflow_url": None,
+            },
+        )
+    )
+
+    assert updates["implementation_status"] == ImplementationStatus.completed
+    assert "engineer_bootstrapped_from_active_workflow" in updates["routing_signals"]
+    assert updates["workflow_draft"].nodes[0].node_id == "node_1"
+    assert updates["active_workflow_id"] == "wf_edit_1"
+
+
+def test_engineer_persists_incremental_updates(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+        },
+    )
+
+    calls: List[tuple[str, str]] = []
+
+    def _update(self, workflow_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        calls.append((workflow_id, payload["name"]))
+        return {
+            "id": workflow_id,
+            "name": payload["name"],
+            "url": f"http://localhost:5678/workflow/{workflow_id}",
+        }
+
+    monkeypatch.setattr("app.graphs.nodes.engineer_agent.N8NClient.update_workflow", _update)
+
+    updates = engineer_agent_node(
+        _state(
+            ["n8n-nodes-base.webhook", "n8n-nodes-base.set"],
+            runtime_context={"model": None, "request_id": "req-persist", "persist_to_n8n": True},
+        )
+    )
+
+    assert updates["implementation_status"] == ImplementationStatus.completed
+    assert updates["workflow_persisted"] is True
+    assert updates["workflow_persist_action"] == "updated"
+    assert len(calls) >= 3
+
+
+def test_engineer_does_not_execute_qa_logic(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+        },
+    )
+
+    updates = engineer_agent_node(_state(["n8n-nodes-base.webhook", "n8n-nodes-base.set"]))
+
     assert updates["implementation_status"] == ImplementationStatus.completed
     assert updates["current_stage"] == "engineer_agent"
     assert "entered_qa_agent" not in updates["routing_signals"]
     assert updates["target_stage"] == AgentStage.qa_agent
 
 
-def test_engineer_does_not_execute_qa_logic_when_blocked() -> None:
-    updates = engineer_agent_node(_state(_plan(["n8n-nodes-base.httpRequest"])))
-    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
-    assert updates["target_stage"] is None
-    assert "entered_qa_agent" not in updates["routing_signals"]
-
-
-def test_engineer_does_not_skip_iterative_steps_to_final_json() -> None:
-    updates = engineer_agent_node(
-        _state(_plan(["n8n-nodes-base.webhook", "n8n-nodes-base.if", "n8n-nodes-base.set"]))
-    )
-
-    assert len(updates["node_implementation_queue"]) == 3
-    assert len(updates["implemented_nodes"]) == 3
-    assert len(updates["workflow_versions"]) >= 5
-    assert updates["final_workflow_json"]["connections"] is not None
-
-
-def test_engineer_iterative_history_contains_per_node_updates() -> None:
-    updates = engineer_agent_node(
-        _state(_plan(["n8n-nodes-base.webhook", "n8n-nodes-base.set"]))
-    )
-    reasons = [item.reason for item in updates["workflow_versions"]]
-    assert any("implemented node pn_1" in reason for reason in reasons)
-    assert any("implemented node pn_2" in reason for reason in reasons)
-
-
-def test_engineer_persists_new_workflow_in_n8n_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    plan = _plan(["n8n-nodes-base.webhook", "n8n-nodes-base.set"], title="Persist Create")
-    state = _state(
-        plan,
-        extra={"runtime_context": {"model": None, "request_id": "req-create", "persist_to_n8n": True}},
-    )
-
-    captured: Dict[str, Any] = {}
-
-    def _create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        captured["payload"] = payload
-        assert "active" not in payload
-        assert "settings" in payload
-        return {
-            "id": "wf_100",
-            "name": payload.get("name"),
-            "url": "http://localhost:5678/workflow/wf_100",
-        }
-
-    monkeypatch.setattr("app.graphs.nodes.engineer_agent.N8NClient.create_workflow", _create)
-
-    updates = engineer_agent_node(state)
-
-    assert updates["implementation_status"] == ImplementationStatus.completed
-    assert updates["workflow_persisted"] is True
-    assert updates["workflow_persist_action"] == "created"
-    assert updates["active_workflow_id"] == "wf_100"
-    assert updates["active_workflow_url"] == "http://localhost:5678/workflow/wf_100"
-    assert captured["payload"]["name"] == "Persist Create"
-
-
-def test_engineer_updates_existing_workflow_in_n8n_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    plan = _plan(["n8n-nodes-base.webhook", "n8n-nodes-base.set"], title="Persist Update")
-    state = _state(
-        plan,
-        extra={
-            "active_workflow_id": "wf_existing",
-            "runtime_context": {"model": None, "request_id": "req-update", "persist_to_n8n": True},
+def test_engineer_relies_on_definition_lookup_not_hardcoded_heuristics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.httpRequest": {"required_params": ["customUrl"]},
         },
     )
-    seen: Dict[str, Any] = {}
 
-    def _update(self, workflow_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        seen["workflow_id"] = workflow_id
-        seen["name"] = payload.get("name")
-        assert "active" not in payload
-        assert "settings" in payload
-        return {
-            "id": workflow_id,
-            "name": payload.get("name"),
-            "url": f"http://localhost:5678/workflow/{workflow_id}",
-        }
+    updates = engineer_agent_node(_state(["n8n-nodes-base.httpRequest"]))
 
-    monkeypatch.setattr("app.graphs.nodes.engineer_agent.N8NClient.update_workflow", _update)
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert updates["missing_user_input_details"][0].missing_item == "customUrl"
 
-    updates = engineer_agent_node(state)
-
-    assert updates["implementation_status"] == ImplementationStatus.completed
-    assert updates["workflow_persisted"] is True
-    assert updates["workflow_persist_action"] == "updated"
-    assert seen["workflow_id"] == "wf_existing"
-    assert updates["active_workflow_id"] == "wf_existing"

@@ -5,15 +5,22 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from pydantic import BaseModel, Field
+
+from ...config import settings
+from ...db import query_definition_chunks_by_entity
 from ...features.reasoning.multi_agent_contracts import (
     AgentStage,
+    ArchitectureDataFlowItem,
     ArchitecturePlan,
+    ArchitectureStage,
     BlockedNode,
     EntryIntent,
     ImplementationQueueItem,
     ImplementationStatus,
     ImplementedNode,
     MissingUserInput,
+    NodeRequirement,
     ProposedNode,
     RequiredCredential,
     VariableDefinition,
@@ -23,6 +30,8 @@ from ...features.reasoning.multi_agent_contracts import (
     WorkflowVersion,
     WorkflowContext,
 )
+from ...llm import get_langchain_chat_model
+from ...observability import emit_llm_output_event, emit_llm_prompt_event, emit_trace_event
 from ...workflow.n8n_client import N8NClient, N8NClientError
 from ..multi_agent_state import MultiAgentGraphState
 
@@ -36,25 +45,65 @@ _N8N_WORKFLOW_READ_ONLY_FIELDS = {
     "updatedAt",
     "versionId",
 }
+_NODE_DEFINITION_SOURCE = settings.LINKED_DEFS_NODES_SOURCE or "n8n-nodes"
+_CREDENTIAL_DEFINITION_SOURCE = settings.LINKED_DEFS_CREDENTIALS_SOURCE or "n8n-credentials"
 
-_NODE_REQUIRED_PARAMS: Dict[str, List[str]] = {
-    "n8n-nodes-base.webhook": ["path"],
-    "n8n-nodes-base.httpRequest": ["url"],
-    "n8n-nodes-base.googleSheets": ["sheetName"],
-    "n8n-nodes-base.postgres": ["operation"],
-    "n8n-nodes-base.mysql": ["operation"],
-    "n8n-nodes-base.slack": ["channel", "text"],
-    "n8n-nodes-base.if": ["conditions"],
-    "n8n-nodes-base.switch": ["rules"],
-    "n8n-nodes-base.set": ["values"],
-}
 
-_DEFAULT_PARAM_VALUES: Dict[str, str] = {
-    "path": "incoming-event",
-    "httpMethod": "POST",
-    "method": "POST",
-    "operation": "append",
-}
+class DeveloperParameterDefinition(BaseModel):
+    name: str
+    display_name: Optional[str] = None
+    description: str = ""
+    field_type: Optional[str] = None
+    required: bool = False
+    default_value: Any = None
+    scope: Optional[str] = None
+    options_preview: List[str] = Field(default_factory=list)
+
+
+class DeveloperCredentialDefinition(BaseModel):
+    credential_type: str
+    display_name: Optional[str] = None
+    supported_nodes: List[str] = Field(default_factory=list)
+    field_names: List[str] = Field(default_factory=list)
+    summary: str = ""
+    source_refs: List[str] = Field(default_factory=list)
+
+
+class DeveloperNodeDefinition(BaseModel):
+    node_type: str
+    display_name: Optional[str] = None
+    type_version: int = Field(default=1, ge=1)
+    summary: str = ""
+    parameter_schema: List[DeveloperParameterDefinition] = Field(default_factory=list)
+    credential_types_required: List[str] = Field(default_factory=list)
+    source_refs: List[str] = Field(default_factory=list)
+    raw_chunks: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class DeveloperMissingInputDecision(BaseModel):
+    key_name: str
+    category: str = "parameter"
+    reason: str
+    question: str
+
+
+class DeveloperVariableOutput(BaseModel):
+    name: str
+    semantic_meaning: str
+    expected_format: Optional[str] = None
+    destination_queue_ids: List[str] = Field(default_factory=list)
+    mapping_notes: Optional[str] = None
+
+
+class NodeImplementationDecision(BaseModel):
+    parameters_known: Dict[str, Any] = Field(default_factory=dict)
+    parameters_inferred: Dict[str, Any] = Field(default_factory=dict)
+    parameters_unresolved: List[str] = Field(default_factory=list)
+    credential_refs: Dict[str, str] = Field(default_factory=dict)
+    missing_inputs: List[DeveloperMissingInputDecision] = Field(default_factory=list)
+    variable_outputs: List[DeveloperVariableOutput] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+    can_apply: bool = False
 
 
 def _short_type(node_type: str) -> str:
@@ -118,6 +167,18 @@ def _normalize_status(value: Any) -> Optional[ImplementationStatus]:
     return None
 
 
+def _safe_string_list(values: Iterable[Any]) -> List[str]:
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        output.append(item)
+    return output
+
+
 def _build_stage_dependency_map(plan: ArchitecturePlan) -> Dict[str, List[str]]:
     output: Dict[str, List[str]] = {}
     for item in plan.data_flow:
@@ -136,9 +197,24 @@ def _derive_proposed_nodes(
     plan: ArchitecturePlan,
     workflow_context: Optional[WorkflowContext],
     provided_nodes: List[ProposedNode],
+    workflow_draft: Optional[WorkflowDraft],
 ) -> List[ProposedNode]:
     if provided_nodes:
         return provided_nodes
+
+    if workflow_draft is not None and workflow_draft.nodes:
+        return [
+            ProposedNode(
+                node_id=node.node_id,
+                node_type=node.node_type,
+                stage_id=node.stage_id,
+                purpose=node.purpose or f"Configure existing node '{node.name}'.",
+                depends_on=list(node.dependencies),
+                expected_inputs=list(node.expected_inputs),
+                expected_outputs=list(node.expected_outputs),
+            )
+            for node in workflow_draft.nodes
+        ]
 
     stage_ids = [stage.id for stage in plan.stages]
     proposed: List[ProposedNode] = []
@@ -174,13 +250,6 @@ def _derive_proposed_nodes(
     return proposed
 
 
-def _derive_required_credentials(
-    *,
-    provided_credentials: List[RequiredCredential],
-) -> List[RequiredCredential]:
-    return provided_credentials
-
-
 def _build_queue(
     *,
     plan: ArchitecturePlan,
@@ -204,7 +273,7 @@ def _build_queue(
             for source_stage in stage_dependencies.get(node.stage_id, []):
                 source_nodes = by_stage.get(source_stage, [])
                 if source_nodes:
-                    dependencies.append(source_nodes[0].node_id)
+                    dependencies.extend(item.node_id for item in source_nodes)
         if not dependencies and idx > 0:
             dependencies.append(proposed_nodes[idx - 1].node_id)
         queue.append(
@@ -213,7 +282,7 @@ def _build_queue(
                 node_type=node.node_type,
                 stage_id=node.stage_id,
                 purpose=node.purpose,
-                dependencies=dependencies,
+                dependencies=_safe_string_list(dependencies),
                 expected_inputs=list(node.expected_inputs),
                 expected_outputs=list(node.expected_outputs),
                 status="pending",
@@ -222,33 +291,641 @@ def _build_queue(
     return queue
 
 
-def _required_params(node_type: str) -> List[str]:
-    if node_type in _NODE_REQUIRED_PARAMS:
-        return list(_NODE_REQUIRED_PARAMS[node_type])
+def _raw_json_from_row(row: Dict[str, Any]) -> Any:
+    metadata = row.get("metadata")
+    if isinstance(metadata, dict) and "raw_json" in metadata:
+        return metadata.get("raw_json")
+    return None
+
+
+def _append_parameter_definition(
+    by_name: Dict[str, DeveloperParameterDefinition],
+    definition: DeveloperParameterDefinition,
+) -> None:
+    existing = by_name.get(definition.name)
+    if existing is None:
+        by_name[definition.name] = definition
+        return
+    if not existing.display_name and definition.display_name:
+        existing.display_name = definition.display_name
+    if not existing.description and definition.description:
+        existing.description = definition.description
+    if not existing.field_type and definition.field_type:
+        existing.field_type = definition.field_type
+    if not existing.required and definition.required:
+        existing.required = True
+    if existing.default_value is None and definition.default_value is not None:
+        existing.default_value = definition.default_value
+    if not existing.scope and definition.scope:
+        existing.scope = definition.scope
+    if definition.options_preview:
+        existing.options_preview = _safe_string_list(
+            list(existing.options_preview) + list(definition.options_preview)
+        )
+
+
+def _parameter_defs_from_raw(raw_json: Any, *, scope: Optional[str]) -> List[DeveloperParameterDefinition]:
+    if isinstance(raw_json, dict):
+        properties = raw_json.get("properties")
+        if isinstance(properties, list):
+            output: List[DeveloperParameterDefinition] = []
+            for prop in properties:
+                if not isinstance(prop, dict):
+                    continue
+                name = str(prop.get("name") or "").strip()
+                if not name:
+                    continue
+                options: List[str] = []
+                raw_options = prop.get("options")
+                if isinstance(raw_options, list):
+                    for option in raw_options[:10]:
+                        if isinstance(option, dict):
+                            value = option.get("value") or option.get("name")
+                        else:
+                            value = option
+                        text = str(value or "").strip()
+                        if text:
+                            options.append(text)
+                output.append(
+                    DeveloperParameterDefinition(
+                        name=name,
+                        display_name=str(prop.get("displayName") or "").strip() or None,
+                        description=_safe_text(prop.get("description") or "", max_chars=240),
+                        field_type=str(prop.get("type") or "").strip() or None,
+                        required=bool(prop.get("required", False)),
+                        default_value=prop.get("default"),
+                        scope=scope,
+                        options_preview=_safe_string_list(options),
+                    )
+                )
+            return output
+    if isinstance(raw_json, list):
+        output = []
+        for item in raw_json:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            output.append(
+                DeveloperParameterDefinition(
+                    name=name,
+                    display_name=str(item.get("displayName") or "").strip() or None,
+                    description=_safe_text(item.get("description") or "", max_chars=240),
+                    field_type=str(item.get("type") or "").strip() or None,
+                    required=bool(item.get("required", False)),
+                    default_value=item.get("default"),
+                    scope=scope,
+                )
+            )
+        return output
     return []
 
 
-def _infer_param_value(
-    *,
-    param_name: str,
-    queue_item: ImplementationQueueItem,
-    plan: ArchitecturePlan,
-) -> Optional[str]:
-    if param_name in _DEFAULT_PARAM_VALUES:
-        return _DEFAULT_PARAM_VALUES[param_name]
-    if param_name == "values":
-        return "mapped_fields"
-    if param_name == "conditions":
-        return "business_conditions"
-    if param_name == "rules":
-        return "routing_rules"
-    if param_name == "sheetName" and "sheet" in plan.title.lower():
-        return "Sheet1"
-    if param_name == "url":
+def get_node_definition(node_type: str) -> Optional[DeveloperNodeDefinition]:
+    node_type_value = str(node_type or "").strip()
+    if not node_type_value:
         return None
-    _ = queue_item
-    return None
+    rows = query_definition_chunks_by_entity(
+        entity_key="nodeType",
+        entity_id=node_type_value,
+        source_value=_NODE_DEFINITION_SOURCE,
+    )
+    if not rows:
+        rows = query_definition_chunks_by_entity(
+            entity_key="nodeType",
+            entity_id=node_type_value,
+            source_value=None,
+        )
+    if not rows:
+        return None
 
+    overview = next(
+        (
+            row
+            for row in rows
+            if str((row.get("metadata") or {}).get("kind") or row.get("__meta_kind") or "") == "NODE_OVERVIEW"
+        ),
+        rows[0],
+    )
+    overview_meta = overview.get("metadata") if isinstance(overview.get("metadata"), dict) else {}
+    display_name = str(overview_meta.get("displayName") or overview.get("title") or "").strip() or None
+    source_refs = _safe_string_list(row.get("url") for row in rows if row.get("url"))
+    summary_parts = []
+    by_name: Dict[str, DeveloperParameterDefinition] = {}
+    credential_types: List[str] = []
+
+    for row in rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        raw_json = _raw_json_from_row(row)
+        scope = str(row.get("section") or metadata.get("section") or "").strip() or None
+        for item in _parameter_defs_from_raw(raw_json, scope=scope):
+            _append_parameter_definition(by_name, item)
+        raw_param_names = metadata.get("param_names")
+        if isinstance(raw_param_names, list):
+            for name in raw_param_names:
+                text = str(name or "").strip()
+                if text:
+                    _append_parameter_definition(
+                        by_name,
+                        DeveloperParameterDefinition(name=text, scope=scope),
+                    )
+        raw_credential_types = metadata.get("credentialTypes_required")
+        if isinstance(raw_credential_types, list):
+            credential_types.extend(str(item).strip() for item in raw_credential_types if str(item).strip())
+        text = str(row.get("text") or "").strip()
+        if text and len(summary_parts) < 3:
+            summary_parts.append(_safe_text(text, max_chars=240))
+
+    version = overview_meta.get("version") or 1
+    return DeveloperNodeDefinition(
+        node_type=node_type_value,
+        display_name=display_name,
+        type_version=max(1, int(version or 1)),
+        summary="\n".join(summary_parts),
+        parameter_schema=list(by_name.values()),
+        credential_types_required=_safe_string_list(credential_types),
+        source_refs=source_refs,
+        raw_chunks=rows,
+    )
+
+
+def get_node_parameter_schema(node_type: str) -> List[DeveloperParameterDefinition]:
+    definition = get_node_definition(node_type)
+    if definition is None:
+        return []
+    return list(definition.parameter_schema)
+
+
+def get_credential_definition(credential_type: str) -> Optional[DeveloperCredentialDefinition]:
+    credential_type_value = str(credential_type or "").strip()
+    if not credential_type_value:
+        return None
+    rows = query_definition_chunks_by_entity(
+        entity_key="credentialType",
+        entity_id=credential_type_value,
+        source_value=_CREDENTIAL_DEFINITION_SOURCE,
+    )
+    if not rows:
+        rows = query_definition_chunks_by_entity(
+            entity_key="credentialType",
+            entity_id=credential_type_value,
+            source_value=None,
+        )
+    if not rows:
+        return None
+    overview = next(
+        (
+            row
+            for row in rows
+            if str((row.get("metadata") or {}).get("kind") or row.get("__meta_kind") or "") == "CRED_OVERVIEW"
+        ),
+        rows[0],
+    )
+    overview_meta = overview.get("metadata") if isinstance(overview.get("metadata"), dict) else {}
+    display_name = str(overview_meta.get("displayName") or overview.get("title") or "").strip() or None
+    supported_nodes = overview_meta.get("supportedNodes") if isinstance(overview_meta.get("supportedNodes"), list) else []
+    field_names: List[str] = []
+    summary_parts: List[str] = []
+    for row in rows:
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        raw_field_names = metadata.get("field_names")
+        if isinstance(raw_field_names, list):
+            field_names.extend(str(item).strip() for item in raw_field_names if str(item).strip())
+        text = str(row.get("text") or "").strip()
+        if text and len(summary_parts) < 3:
+            summary_parts.append(_safe_text(text, max_chars=220))
+    return DeveloperCredentialDefinition(
+        credential_type=credential_type_value,
+        display_name=display_name,
+        supported_nodes=_safe_string_list(supported_nodes),
+        field_names=_safe_string_list(field_names),
+        summary="\n".join(summary_parts),
+        source_refs=_safe_string_list(row.get("url") for row in rows if row.get("url")),
+    )
+
+
+def get_node_credential_requirements(node_type: str) -> List[DeveloperCredentialDefinition]:
+    definition = get_node_definition(node_type)
+    if definition is None:
+        return []
+    output: List[DeveloperCredentialDefinition] = []
+    for credential_type in definition.credential_types_required:
+        credential_definition = get_credential_definition(credential_type)
+        if credential_definition is not None:
+            output.append(credential_definition)
+        else:
+            output.append(
+                DeveloperCredentialDefinition(
+                    credential_type=credential_type,
+                    display_name=credential_type,
+                )
+            )
+    return output
+
+
+def get_active_workflow(workflow_id: str) -> Dict[str, Any]:
+    return N8NClient().get_workflow(workflow_id)
+
+
+def _dependencies_from_workflow_connections(
+    workflow: Dict[str, Any],
+    name_to_id: Dict[str, str],
+) -> Dict[str, List[str]]:
+    output: Dict[str, List[str]] = {node_id: [] for node_id in name_to_id.values()}
+    connections = workflow.get("connections") if isinstance(workflow.get("connections"), dict) else {}
+    for source_name, source_payload in connections.items():
+        source_id = name_to_id.get(str(source_name))
+        if not source_id or not isinstance(source_payload, dict):
+            continue
+        main = source_payload.get("main")
+        if not isinstance(main, list):
+            continue
+        for bucket in main:
+            if not isinstance(bucket, list):
+                continue
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
+                target_name = str(item.get("node") or "").strip()
+                target_id = name_to_id.get(target_name)
+                if not target_id:
+                    continue
+                current = output.setdefault(target_id, [])
+                if source_id not in current:
+                    current.append(source_id)
+    return output
+
+
+def _draft_from_active_workflow_payload(
+    workflow: Dict[str, Any],
+    *,
+    workflow_id: str,
+) -> Tuple[WorkflowDraft, List[ProposedNode], ArchitecturePlan, WorkflowContext]:
+    workflow_name = str(workflow.get("name") or f"Workflow {workflow_id}").strip()
+    nodes_raw = workflow.get("nodes") if isinstance(workflow.get("nodes"), list) else []
+    name_to_id: Dict[str, str] = {}
+    draft_nodes: List[WorkflowDraftNode] = []
+
+    for idx, raw_node in enumerate(nodes_raw, start=1):
+        if not isinstance(raw_node, dict):
+            continue
+        node_id = str(raw_node.get("id") or f"wf_{idx}").strip()
+        node_name = str(raw_node.get("name") or node_id).strip() or node_id
+        node_type = str(raw_node.get("type") or "").strip()
+        type_version = raw_node.get("typeVersion") or 1
+        position = raw_node.get("position") if isinstance(raw_node.get("position"), list) else [260 * idx, 300]
+        parameters = raw_node.get("parameters") if isinstance(raw_node.get("parameters"), dict) else {}
+        credential_refs: Dict[str, str] = {}
+        raw_credentials = raw_node.get("credentials")
+        if isinstance(raw_credentials, dict):
+            for key, value in raw_credentials.items():
+                if isinstance(value, dict):
+                    reference = str(value.get("id") or value.get("name") or "").strip()
+                else:
+                    reference = str(value or "").strip()
+                if reference:
+                    credential_refs[str(key)] = reference
+        name_to_id[node_name] = node_id
+        draft_nodes.append(
+            WorkflowDraftNode(
+                node_id=node_id,
+                name=node_name,
+                node_type=node_type,
+                type_version=max(1, int(type_version or 1)),
+                purpose=f"Existing workflow node '{node_name}'.",
+                stage_id=f"stage_{idx}",
+                parameters_known=dict(parameters),
+                parameters_inferred={},
+                parameters_unresolved=[],
+                credential_refs=credential_refs,
+                expected_inputs=[],
+                expected_outputs=[],
+                dependencies=[],
+                position=[int(position[0]), int(position[1])] if len(position) >= 2 else [260 * idx, 300],
+                notes=["bootstrapped_from_active_workflow"],
+            )
+        )
+
+    dependencies = _dependencies_from_workflow_connections(workflow, name_to_id)
+    for node in draft_nodes:
+        node.dependencies = list(dependencies.get(node.node_id, []))
+
+    proposed_nodes = [
+        ProposedNode(
+            node_id=node.node_id,
+            node_type=node.node_type,
+            stage_id=node.stage_id,
+            purpose=node.purpose,
+            depends_on=list(node.dependencies),
+            expected_inputs=[],
+            expected_outputs=[],
+        )
+        for node in draft_nodes
+    ]
+    stages: List[ArchitectureStage] = []
+    data_flow: List[ArchitectureDataFlowItem] = []
+    required_nodes: List[NodeRequirement] = []
+    for idx, node in enumerate(draft_nodes, start=1):
+        stage_id = node.stage_id or f"stage_{idx}"
+        stage_dependencies = [
+            item.stage_id
+            for item in draft_nodes
+            if item.node_id in node.dependencies and item.stage_id
+        ]
+        stages.append(
+            ArchitectureStage(
+                id=stage_id,
+                name=node.name,
+                purpose=node.purpose,
+                required_capabilities=[f"Configure node type {node.node_type}"],
+                expected_inputs=[],
+                expected_outputs=[],
+                dependencies=stage_dependencies,
+                success_criteria=[f"Node '{node.name}' is configured correctly."],
+            )
+        )
+        for source_stage_id in stage_dependencies:
+            data_flow.append(
+                ArchitectureDataFlowItem(
+                    source_stage_id=source_stage_id,
+                    target_stage_id=stage_id,
+                    data_items=[],
+                )
+            )
+        required_nodes.append(
+            NodeRequirement(
+                node_type=node.node_type,
+                why_required=f"Existing workflow node '{node.name}' is part of the active workflow.",
+                evidence_chunk_ids=[],
+                evidence_refs=[],
+                evidence_confidence=0.0,
+            )
+        )
+
+    draft = WorkflowDraft(
+        name=workflow_name,
+        use_case_id=workflow_id,
+        summary=f"Bootstrapped from active workflow {workflow_id}.",
+        nodes=draft_nodes,
+        connections=[
+            WorkflowDraftConnection(source_node_id=source_id, target_node_id=target_id)
+            for target_id, source_ids in dependencies.items()
+            for source_id in source_ids
+        ],
+        metadata={"bootstrapped_from_active_workflow": True},
+    )
+    plan = ArchitecturePlan(
+        use_case_id=workflow_id,
+        title=workflow_name,
+        business_objective=f"Edit existing workflow '{workflow_name}'.",
+        desired_outcome="Update the existing workflow safely.",
+        workflow_summary=f"Existing workflow '{workflow_name}' loaded from n8n for iterative configuration.",
+        stages=stages,
+        data_flow=data_flow,
+        assumptions=[],
+        missing_information=[],
+        implementation_notes_for_engineer=["Bootstrapped from an existing workflow fetched from n8n."],
+        required_nodes=required_nodes,
+    )
+    workflow_context = WorkflowContext(
+        use_case_id=workflow_id,
+        planning_ready=True,
+        handoff_target=AgentStage.engineer_agent,
+        required_node_types=[node.node_type for node in draft_nodes],
+        unresolved_inputs=[],
+        notes=["bootstrapped_from_active_workflow"],
+    )
+    return draft, proposed_nodes, plan, workflow_context
+
+
+def _invoke_structured_output(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    output_model: Any,
+    model: Optional[str],
+    request_id: Optional[str],
+    stage: str,
+    temperature: float = 0.0,
+) -> Any:
+    if not isinstance(model, str) or not model.strip():
+        raise RuntimeError("No model configured for engineer structured output")
+    llm = get_langchain_chat_model(model=model, temperature=temperature)
+    if llm is None:
+        raise RuntimeError("LangChain chat model is unavailable")
+    structured = llm.with_structured_output(output_model)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    emit_llm_prompt_event(
+        trace_logger,
+        request_id=request_id,
+        stage=stage,
+        model=model,
+        messages=messages,
+        estimated_tokens=0,
+        params={"temperature": temperature, "structured": True},
+    )
+    response = structured.invoke(messages)
+    emit_llm_output_event(
+        trace_logger,
+        request_id=request_id,
+        stage=stage,
+        model=model,
+        latency_ms=None,
+        content=(
+            response.model_dump_json(exclude_none=True)
+            if hasattr(response, "model_dump_json")
+            else str(response)
+        ),
+        usage=None,
+        extra={"structured": True},
+    )
+    return response
+
+
+def _decision_prompt_payload(
+    *,
+    user_query: str,
+    architecture_plan: ArchitecturePlan,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    node_definition: DeveloperNodeDefinition,
+    parameter_schema: List[DeveloperParameterDefinition],
+    credential_requirements: List[DeveloperCredentialDefinition],
+    upstream_variables: List[VariableDefinition],
+    resolved_inputs: Dict[str, str],
+    downstream_queue_ids: List[str],
+) -> str:
+    return json.dumps(
+        {
+            "user_query": user_query,
+            "workflow_name": architecture_plan.title,
+            "workflow_summary": architecture_plan.workflow_summary,
+            "queue_item": queue_item.model_dump(mode="json"),
+            "current_node": current_node.model_dump(mode="json"),
+            "node_definition": node_definition.model_dump(mode="json"),
+            "parameter_schema": [item.model_dump(mode="json") for item in parameter_schema],
+            "credential_requirements": [item.model_dump(mode="json") for item in credential_requirements],
+            "upstream_variables": [item.model_dump(mode="json") for item in upstream_variables],
+            "resolved_inputs": resolved_inputs,
+            "downstream_queue_ids": downstream_queue_ids,
+            "rules": {
+                "do_not_invent_secrets": True,
+                "do_not_invent_ids_or_urls": True,
+                "preserve_existing_configuration": True,
+                "prefer_blocking_over_guessing": True,
+            },
+        },
+        ensure_ascii=True,
+    )
+
+
+def _decide_node_implementation_with_structured_output(
+    *,
+    user_query: str,
+    architecture_plan: ArchitecturePlan,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    node_definition: DeveloperNodeDefinition,
+    parameter_schema: List[DeveloperParameterDefinition],
+    credential_requirements: List[DeveloperCredentialDefinition],
+    upstream_variables: List[VariableDefinition],
+    resolved_inputs: Dict[str, str],
+    downstream_queue_ids: List[str],
+    model: Optional[str],
+    request_id: Optional[str],
+) -> NodeImplementationDecision:
+    system_prompt = (
+        "You are the developer agent for an n8n workflow. Configure one node at a time using only the provided structured context. "
+        "Do not redesign the workflow. Preserve ids, names, positions, and connections. "
+        "Keep real user-confirmed values in parameters_known. Use parameters_inferred only for safe, non-sensitive values supported by the schema and workflow context. "
+        "Never invent secrets, credential ids, endpoint URLs, resource identifiers, or business rules. "
+        "If critical information is missing, set can_apply=false and return explicit missing_inputs."
+    )
+    response = _invoke_structured_output(
+        system_prompt=system_prompt,
+        user_prompt=_decision_prompt_payload(
+            user_query=user_query,
+            architecture_plan=architecture_plan,
+            queue_item=queue_item,
+            current_node=current_node,
+            node_definition=node_definition,
+            parameter_schema=parameter_schema,
+            credential_requirements=credential_requirements,
+            upstream_variables=upstream_variables,
+            resolved_inputs=resolved_inputs,
+            downstream_queue_ids=downstream_queue_ids,
+        ),
+        output_model=NodeImplementationDecision,
+        model=model,
+        request_id=request_id,
+        stage="multi_agent.engineer.node_decision",
+        temperature=0.0,
+    )
+    if isinstance(response, NodeImplementationDecision):
+        return response
+    return NodeImplementationDecision.model_validate(response)
+
+
+def _fallback_node_implementation_decision(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    parameter_schema: List[DeveloperParameterDefinition],
+    credential_requirements: List[DeveloperCredentialDefinition],
+    resolved_inputs: Dict[str, str],
+    downstream_queue_ids: List[str],
+) -> NodeImplementationDecision:
+    known = dict(current_node.parameters_known)
+    inferred = dict(current_node.parameters_inferred)
+    unresolved: List[str] = []
+    missing_inputs: List[DeveloperMissingInputDecision] = []
+    credential_refs = dict(current_node.credential_refs)
+
+    for param in parameter_schema:
+        input_key = f"parameter:{queue_item.queue_id}:{param.name}"
+        supplied = _lookup_user_value(input_key, resolved_inputs)
+        if supplied is not None:
+            known[param.name] = supplied
+            continue
+        if param.name in known or param.name in inferred:
+            continue
+        if param.required:
+            unresolved.append(param.name)
+            missing_inputs.append(
+                DeveloperMissingInputDecision(
+                    key_name=param.name,
+                    category="parameter",
+                    reason=f"Parameter '{param.name}' is required by the indexed node definition and is still unknown.",
+                    question=f"Provide value for parameter '{param.name}' required by node '{queue_item.queue_id}'.",
+                )
+            )
+
+    for credential in credential_requirements:
+        reference_key = credential.display_name or credential.credential_type
+        supplied = (
+            _lookup_user_value(f"credential:{queue_item.queue_id}:{reference_key}", resolved_inputs)
+            or _lookup_user_value(credential.credential_type, resolved_inputs)
+            or _lookup_user_value(reference_key, resolved_inputs)
+        )
+        if supplied:
+            credential_refs[reference_key] = supplied
+            continue
+        if reference_key in credential_refs:
+            continue
+        missing_inputs.append(
+            DeveloperMissingInputDecision(
+                key_name=reference_key,
+                category="credential",
+                reason=f"Credential reference for '{reference_key}' is required by the indexed node definition.",
+                question=f"Provide the credential reference to use for '{reference_key}' in node '{queue_item.queue_id}'.",
+            )
+        )
+
+    outputs = [
+        DeveloperVariableOutput(
+            name=(item if "." in item else f"{queue_item.queue_id}.{item}"),
+            semantic_meaning=f"Output of {queue_item.queue_id} for downstream workflow steps.",
+            expected_format="unknown",
+            destination_queue_ids=list(downstream_queue_ids),
+            mapping_notes="Fallback developer decision based on workflow queue context.",
+        )
+        for item in (list(queue_item.expected_outputs) or [f"{_short_type(queue_item.node_type)}_output"])
+    ]
+    return NodeImplementationDecision(
+        parameters_known=known,
+        parameters_inferred=inferred,
+        parameters_unresolved=_safe_string_list(unresolved),
+        credential_refs=credential_refs,
+        missing_inputs=missing_inputs,
+        variable_outputs=outputs,
+        notes=["fallback_structured_decision"],
+        can_apply=not missing_inputs,
+    )
+
+
+def _required_credentials_from_definitions(proposed_nodes: List[ProposedNode]) -> List[RequiredCredential]:
+    output: List[RequiredCredential] = []
+    seen = set()
+    for node in proposed_nodes:
+        for credential in get_node_credential_requirements(node.node_type):
+            key = (node.node_id, credential.credential_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(
+                RequiredCredential(
+                    credential_key=credential.credential_type,
+                    node_type=node.node_type,
+                    credential_name=credential.display_name or credential.credential_type,
+                    required_for=node.node_id,
+                    source="developer_lookup",
+                )
+            )
+    return output
 
 def _extract_json_pairs(text: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -305,19 +982,20 @@ def _missing_input(
     queue_id: str,
     key_name: str,
     reason: str,
+    question: Optional[str] = None,
 ) -> MissingUserInput:
     input_key = f"{category}:{queue_id}:{key_name}"
-    if category == "credential":
+    if not question and category == "credential":
         question = (
             f"Provide credential reference for '{key_name}' to configure node '{queue_id}'."
         )
-    elif category == "mapping":
+    elif not question and category == "mapping":
         question = (
             f"Provide mapping definition for '{key_name}' required by node '{queue_id}'."
         )
-    elif category == "handoff":
+    elif not question and category == "handoff":
         question = reason
-    else:
+    elif not question:
         question = f"Provide value for '{key_name}' required by node '{queue_id}'."
     return MissingUserInput(
         input_id=input_key,
@@ -371,6 +1049,20 @@ def _normalize_workflow_draft(
     )
 
 
+def _find_draft_node(draft: WorkflowDraft, queue_id: str) -> Optional[WorkflowDraftNode]:
+    for node in draft.nodes:
+        if node.node_id == queue_id:
+            return node
+    mapping = _queue_node_id_map(draft)
+    mapped_id = mapping.get(queue_id)
+    if not mapped_id:
+        return None
+    for node in draft.nodes:
+        if node.node_id == mapped_id:
+            return node
+    return None
+
+
 def _upsert_draft_node(draft: WorkflowDraft, node: WorkflowDraftNode) -> None:
     for idx, current in enumerate(draft.nodes):
         if current.node_id == node.node_id:
@@ -408,6 +1100,23 @@ def _set_queue_node_id_map(draft: WorkflowDraft, mapping: Dict[str, str]) -> Non
     draft.metadata["queue_node_map"] = {str(key): str(value) for key, value in mapping.items()}
 
 
+def _ensure_queue_node_id_map(
+    draft: WorkflowDraft,
+    queue: List[ImplementationQueueItem],
+) -> Dict[str, str]:
+    mapping = _queue_node_id_map(draft)
+    changed = False
+    for item in queue:
+        if item.queue_id in mapping:
+            continue
+        if any(node.node_id == item.queue_id for node in draft.nodes):
+            mapping[item.queue_id] = item.queue_id
+            changed = True
+    if changed:
+        _set_queue_node_id_map(draft, mapping)
+    return mapping
+
+
 def _resolved_inputs(draft: WorkflowDraft) -> Dict[str, str]:
     value = draft.metadata.get("resolved_inputs")
     if isinstance(value, dict):
@@ -419,35 +1128,111 @@ def _set_resolved_inputs(draft: WorkflowDraft, values: Dict[str, str]) -> None:
     draft.metadata["resolved_inputs"] = {str(key): str(value) for key, value in values.items()}
 
 
+def _missing_details_from_decision(
+    *,
+    queue_item: ImplementationQueueItem,
+    decision: NodeImplementationDecision,
+) -> List[MissingUserInput]:
+    output: List[MissingUserInput] = []
+    for item in decision.missing_inputs:
+        output.append(
+            _missing_input(
+                category=item.category,
+                queue_id=queue_item.queue_id,
+                key_name=item.key_name,
+                reason=item.reason,
+                question=item.question,
+            )
+        )
+    return output
+
+
+def _node_context_for_queue_item(
+    *,
+    draft: WorkflowDraft,
+    queue_item: ImplementationQueueItem,
+    queue_node_ids: Dict[str, str],
+    node_definition: DeveloperNodeDefinition,
+) -> WorkflowDraftNode:
+    existing = _find_draft_node(draft, queue_item.queue_id)
+    if existing is not None:
+        updated = existing.model_copy(deep=True)
+        if not updated.stage_id:
+            updated.stage_id = queue_item.stage_id
+        if not updated.purpose:
+            updated.purpose = queue_item.purpose
+        if not updated.expected_inputs:
+            updated.expected_inputs = list(queue_item.expected_inputs)
+        if not updated.expected_outputs:
+            updated.expected_outputs = list(queue_item.expected_outputs)
+        if not updated.dependencies:
+            updated.dependencies = list(queue_item.dependencies)
+        if getattr(updated, "type_version", 1) < 1:
+            updated.type_version = node_definition.type_version
+        return updated
+
+    node_id = queue_node_ids.get(queue_item.queue_id) or queue_item.queue_id
+    queue_node_ids[queue_item.queue_id] = node_id
+    return WorkflowDraftNode(
+        node_id=node_id,
+        name=f"{_short_type(queue_item.node_type)}_{len(queue_node_ids)}",
+        node_type=queue_item.node_type,
+        type_version=node_definition.type_version,
+        purpose=queue_item.purpose,
+        stage_id=queue_item.stage_id,
+        parameters_known={},
+        parameters_inferred={},
+        parameters_unresolved=[],
+        credential_refs={},
+        expected_inputs=list(queue_item.expected_inputs),
+        expected_outputs=list(queue_item.expected_outputs),
+        dependencies=list(queue_item.dependencies),
+        position=[240 * max(0, len(draft.nodes)), 300],
+        notes=["created_by_engineer_agent"],
+    )
+
+
 def _update_variable_registry(
     registry: List[VariableDefinition],
     *,
     queue_item: ImplementationQueueItem,
     node_id: str,
     queue: List[ImplementationQueueItem],
+    decision: NodeImplementationDecision,
 ) -> List[VariableDefinition]:
     by_key: Dict[Tuple[str, str], VariableDefinition] = {
         (item.name, item.origin_node_id): item for item in registry
     }
-    downstream = [
+    downstream_default = [
         candidate.queue_id
         for candidate in queue
         if queue_item.queue_id in candidate.dependencies
     ]
-    outputs = list(queue_item.expected_outputs) or [f"{_short_type(queue_item.node_type)}_output"]
-    for output_name in outputs:
-        variable_name = output_name if "." in output_name else f"{queue_item.queue_id}.{output_name}"
+    outputs = list(decision.variable_outputs)
+    if not outputs:
+        outputs = [
+            DeveloperVariableOutput(
+                name=(output_name if "." in output_name else f"{queue_item.queue_id}.{output_name}"),
+                semantic_meaning=f"Output from {queue_item.queue_id} for downstream workflow steps.",
+                expected_format="unknown",
+                destination_queue_ids=list(downstream_default),
+                mapping_notes=(
+                    f"Mapped from node type '{queue_item.node_type}' to dependent nodes."
+                    if downstream_default
+                    else "Terminal output in current draft."
+                ),
+            )
+            for output_name in (list(queue_item.expected_outputs) or [f"{_short_type(queue_item.node_type)}_output"])
+        ]
+    for output in outputs:
+        variable_name = output.name if "." in output.name else f"{queue_item.queue_id}.{output.name}"
         definition = VariableDefinition(
             name=variable_name,
             origin_node_id=node_id,
-            destination_node_ids=downstream,
-            semantic_meaning=f"Output from {queue_item.queue_id} for downstream workflow steps.",
-            expected_format="unknown",
-            mapping_notes=(
-                f"Mapped from node type '{queue_item.node_type}' to dependent nodes."
-                if downstream
-                else "Terminal output in current draft."
-            ),
+            destination_node_ids=list(output.destination_queue_ids or downstream_default),
+            semantic_meaning=output.semantic_meaning,
+            expected_format=output.expected_format,
+            mapping_notes=output.mapping_notes,
         )
         by_key[(definition.name, definition.origin_node_id)] = definition
     return list(by_key.values())
@@ -767,22 +1552,59 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     resume_requested = bool(state.get("resume_requested"))
     user_query = str(state.get("user_query") or "").strip()
 
+    workflow_draft = _normalize_model(state.get("workflow_draft"), WorkflowDraft)
+
+    if architecture_plan is None and entry_intent == EntryIntent.workflow_edit_request and active_workflow_id:
+        try:
+            workflow_payload = get_active_workflow(active_workflow_id)
+            workflow_draft, boot_nodes, architecture_plan, workflow_context = _draft_from_active_workflow_payload(
+                workflow_payload,
+                workflow_id=active_workflow_id,
+            )
+            if not provided_nodes:
+                provided_nodes = boot_nodes
+            if not active_workflow_name:
+                active_workflow_name = workflow_draft.name
+            if not active_workflow_url:
+                active_workflow_url = _default_workflow_url(N8NClient().base_url, active_workflow_id)
+            persist_payload = _persist_fields(
+                active_workflow_id=active_workflow_id,
+                active_workflow_name=active_workflow_name,
+                active_workflow_url=active_workflow_url,
+                workflow_persisted=workflow_persisted,
+                workflow_persist_action=workflow_persist_action,
+                workflow_api_sync_result=workflow_api_sync_result,
+            )
+            if "engineer_bootstrapped_from_active_workflow" not in routing_signals:
+                routing_signals.append("engineer_bootstrapped_from_active_workflow")
+        except N8NClientError as exc:
+            missing_details = _merge_missing_details(
+                missing_details,
+                [
+                    _missing_input(
+                        category="handoff",
+                        queue_id="engineer_handoff",
+                        key_name="active_workflow",
+                        reason=f"The active workflow could not be loaded from n8n: {exc}",
+                    )
+                ],
+            )
+
     if architecture_plan is None:
         if entry_intent == EntryIntent.workflow_edit_request:
             handoff_missing = _missing_input(
                 category="handoff",
                 queue_id="engineer_handoff",
-                key_name="architecture_plan",
+                key_name="active_workflow_id",
                 reason=(
-                    "Missing product-manager handoff. Please provide architecture plan, "
-                    "proposed nodes, and required credentials to continue implementation."
+                    "Missing workflow handoff. Provide an active workflow id or architect handoff to continue implementation."
                 ),
             )
             missing_details = _merge_missing_details(missing_details, [handoff_missing])
             missing_user_inputs = [item.question for item in missing_details]
             implementation_status = ImplementationStatus.blocked_waiting_user
             routing_signals.append("engineer_blocked_waiting_user")
-            engineer_notes.append("Engineer blocked: PM handoff missing for edit request.")
+            engineer_notes.append("Engineer blocked: workflow edit request missing active workflow context.")
             return {
                 "current_stage": "engineer_agent",
                 "target_stage": None,
@@ -792,7 +1614,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                 "routing_signals": routing_signals,
                 "engineer_notes": engineer_notes,
                 "final_workflow_json": {},
-                "workflow_draft": None,
+                "workflow_draft": workflow_draft,
                 "workflow_versions": workflow_versions,
                 "node_implementation_queue": queue,
                 "implemented_nodes": implemented_nodes,
@@ -815,7 +1637,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             "routing_signals": routing_signals,
             "engineer_notes": engineer_notes,
             "final_workflow_json": {},
-            "workflow_draft": None,
+            "workflow_draft": workflow_draft,
             "workflow_versions": workflow_versions,
             "node_implementation_queue": queue,
             "implemented_nodes": implemented_nodes,
@@ -827,13 +1649,18 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             **persist_payload,
         }
 
+    workflow_draft = _normalize_workflow_draft(
+        workflow_draft,
+        plan=architecture_plan,
+    )
     proposed_nodes = _derive_proposed_nodes(
         plan=architecture_plan,
         workflow_context=workflow_context,
         provided_nodes=provided_nodes,
+        workflow_draft=workflow_draft,
     )
-    required_credentials = _derive_required_credentials(
-        provided_credentials=provided_credentials,
+    required_credentials = provided_credentials or _required_credentials_from_definitions(
+        proposed_nodes
     )
 
     if not proposed_nodes:
@@ -864,7 +1691,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             "routing_signals": routing_signals,
             "engineer_notes": engineer_notes,
             "final_workflow_json": {},
-            "workflow_draft": None,
+            "workflow_draft": workflow_draft,
             "workflow_versions": workflow_versions,
             "node_implementation_queue": queue,
             "implemented_nodes": implemented_nodes,
@@ -892,10 +1719,6 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         if queue_item and queue_item.status == "pending":
             queue_item.status = "blocked"
 
-    workflow_draft = _normalize_workflow_draft(
-        state.get("workflow_draft"),
-        plan=architecture_plan,
-    )
     if not workflow_versions:
         _append_version(workflow_versions, workflow_draft, reason="initialized engineer workflow draft")
 
@@ -941,7 +1764,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     blocked_nodes = active_blocked_nodes
     missing_user_inputs = [item.question for item in missing_details]
 
-    queue_node_ids = _queue_node_id_map(workflow_draft)
+    queue_node_ids = _ensure_queue_node_id_map(workflow_draft, queue)
     implementation_status = implementation_status or ImplementationStatus.ready
     if queue:
         implementation_status = ImplementationStatus.in_progress
@@ -956,65 +1779,123 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             if not _queue_dependencies_met(queue_item, queue_by_id):
                 continue
 
-            unresolved_inputs: List[MissingUserInput] = []
-            known_params: Dict[str, Any] = {}
-            inferred_params: Dict[str, Any] = {}
-            credential_refs: Dict[str, str] = {}
-
-            for param_name in _required_params(queue_item.node_type):
-                input_key = f"parameter:{queue_item.queue_id}:{param_name}"
-                value = _lookup_user_value(input_key, resolved_inputs)
-                if value:
-                    known_params[param_name] = value
-                    continue
-                inferred = _infer_param_value(
-                    param_name=param_name,
-                    queue_item=queue_item,
-                    plan=architecture_plan,
-                )
-                if inferred is not None:
-                    inferred_params[param_name] = inferred
-                    continue
-                unresolved_inputs.append(
+            node_definition = get_node_definition(queue_item.node_type)
+            if node_definition is None:
+                unresolved_inputs = [
                     _missing_input(
-                        category="parameter",
+                        category="dependency",
                         queue_id=queue_item.queue_id,
-                        key_name=param_name,
+                        key_name=queue_item.node_type,
                         reason=(
-                            f"Parameter '{param_name}' is required for node '{queue_item.node_type}' "
-                            "and could not be inferred safely."
+                            f"Indexed node definition for '{queue_item.node_type}' is unavailable, so the node cannot be configured safely."
+                        ),
+                        question=(
+                            f"The node definition for '{queue_item.node_type}' is not available in the local index. Choose another node or refresh the definitions index."
                         ),
                     )
+                ]
+                queue_item.status = "blocked"
+                blocked_nodes = [item for item in blocked_nodes if item.queue_id != queue_item.queue_id]
+                blocked_nodes.append(
+                    BlockedNode(
+                        queue_id=queue_item.queue_id,
+                        node_type=queue_item.node_type,
+                        reason="Node configuration blocked because no indexed definition is available.",
+                        missing_input_ids=[item.input_id for item in unresolved_inputs],
+                    )
                 )
+                missing_details = _merge_missing_details(missing_details, unresolved_inputs)
+                missing_user_inputs = [item.question for item in missing_details]
+                implementation_status = ImplementationStatus.blocked_waiting_user
+                routing_signals.append("engineer_blocked_waiting_user")
+                engineer_notes.append(
+                    f"Blocked node '{queue_item.queue_id}' because no indexed definition was found for '{queue_item.node_type}'."
+                )
+                return {
+                    "current_stage": "engineer_agent",
+                    "target_stage": None,
+                    "implementation_status": implementation_status,
+                    "workflow_draft": workflow_draft,
+                    "workflow_versions": workflow_versions,
+                    "node_implementation_queue": queue,
+                    "implemented_nodes": implemented_nodes,
+                    "blocked_nodes": blocked_nodes,
+                    "variable_registry": variable_registry,
+                    "missing_user_inputs": missing_user_inputs,
+                    "missing_user_input_details": missing_details,
+                    "routing_signals": routing_signals,
+                    "engineer_notes": engineer_notes,
+                    "final_workflow_json": {},
+                    "proposed_nodes": proposed_nodes,
+                    "required_credentials": required_credentials,
+                    "workflow_context": workflow_context,
+                    "resume_requested": False,
+                    **persist_payload,
+                }
 
-            credential_requirements = [
-                item
-                for item in required_credentials
-                if (item.required_for == queue_item.queue_id) or (item.node_type == queue_item.node_type)
+            parameter_schema = get_node_parameter_schema(queue_item.node_type)
+            credential_requirements = get_node_credential_requirements(queue_item.node_type)
+            current_node = _node_context_for_queue_item(
+                draft=workflow_draft,
+                queue_item=queue_item,
+                queue_node_ids=queue_node_ids,
+                node_definition=node_definition,
+            )
+            downstream_queue_ids = [
+                candidate.queue_id
+                for candidate in queue
+                if queue_item.queue_id in candidate.dependencies
             ]
-            for credential in credential_requirements:
-                input_key = f"credential:{queue_item.queue_id}:{credential.credential_name}"
-                value = (
-                    _lookup_user_value(input_key, resolved_inputs)
-                    or _lookup_user_value(credential.credential_key, resolved_inputs)
-                    or _lookup_user_value(credential.credential_name, resolved_inputs)
+            upstream_variables = [
+                item
+                for item in variable_registry
+                if queue_item.queue_id in item.destination_node_ids
+            ]
+
+            try:
+                decision = _decide_node_implementation_with_structured_output(
+                    user_query=user_query,
+                    architecture_plan=architecture_plan,
+                    queue_item=queue_item,
+                    current_node=current_node,
+                    node_definition=node_definition,
+                    parameter_schema=parameter_schema,
+                    credential_requirements=credential_requirements,
+                    upstream_variables=upstream_variables,
+                    resolved_inputs=resolved_inputs,
+                    downstream_queue_ids=downstream_queue_ids,
+                    model=model,
+                    request_id=request_id,
                 )
-                if value:
-                    credential_refs[credential.credential_name] = value
-                    continue
-                unresolved_inputs.append(
-                    _missing_input(
-                        category="credential",
-                        queue_id=queue_item.queue_id,
-                        key_name=credential.credential_name,
-                        reason=(
-                            f"Credential reference for '{credential.credential_name}' is required "
-                            f"to configure node '{queue_item.node_type}'."
-                        ),
-                    )
+            except Exception as exc:
+                logger.warning(
+                    "engineer structured decision fallback: request_id=%s node=%s error=%s",
+                    request_id or "-",
+                    queue_item.queue_id,
+                    str(exc),
+                )
+                decision = _fallback_node_implementation_decision(
+                    queue_item=queue_item,
+                    current_node=current_node,
+                    parameter_schema=parameter_schema,
+                    credential_requirements=credential_requirements,
+                    resolved_inputs=resolved_inputs,
+                    downstream_queue_ids=downstream_queue_ids,
                 )
 
-            if unresolved_inputs:
+            unresolved_inputs = _missing_details_from_decision(
+                queue_item=queue_item,
+                decision=decision,
+            )
+            if unresolved_inputs or not decision.can_apply:
+                current_node.parameters_known = dict(decision.parameters_known)
+                current_node.parameters_inferred = dict(decision.parameters_inferred)
+                current_node.parameters_unresolved = _safe_string_list(decision.parameters_unresolved)
+                current_node.credential_refs = dict(decision.credential_refs)
+                current_node.notes = _safe_string_list(
+                    list(current_node.notes) + list(decision.notes) + ["blocked_by_missing_inputs"]
+                )
+                _upsert_draft_node(workflow_draft, current_node)
                 queue_item.status = "blocked"
                 blocked_nodes = [
                     item for item in blocked_nodes if item.queue_id != queue_item.queue_id
@@ -1069,29 +1950,23 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                     "resume_requested": False,
                     **persist_payload,
                 }
-
-            node_id = queue_node_ids.get(queue_item.queue_id) or queue_item.queue_id
-            queue_node_ids[queue_item.queue_id] = node_id
-            _set_queue_node_id_map(workflow_draft, queue_node_ids)
-            position = [240 * max(0, len(workflow_draft.nodes)), 300]
-            draft_node = WorkflowDraftNode(
-                node_id=node_id,
-                name=f"{_short_type(queue_item.node_type)}_{len(queue_node_ids)}",
-                node_type=queue_item.node_type,
-                purpose=queue_item.purpose,
-                stage_id=queue_item.stage_id,
-                parameters_known=known_params,
-                parameters_inferred=inferred_params,
-                parameters_unresolved=[],
-                credential_refs=credential_refs,
-                expected_inputs=list(queue_item.expected_inputs),
-                expected_outputs=list(queue_item.expected_outputs)
-                or [f"{_short_type(queue_item.node_type)}_output"],
-                dependencies=list(queue_item.dependencies),
-                position=position,
-                notes=["implemented by engineer_agent iterative step"],
+            current_node.parameters_known = dict(decision.parameters_known)
+            current_node.parameters_inferred = dict(decision.parameters_inferred)
+            current_node.parameters_unresolved = []
+            current_node.credential_refs = dict(decision.credential_refs)
+            current_node.expected_inputs = list(queue_item.expected_inputs or current_node.expected_inputs)
+            current_node.expected_outputs = (
+                [item.name for item in decision.variable_outputs]
+                or list(queue_item.expected_outputs or current_node.expected_outputs)
             )
-            _upsert_draft_node(workflow_draft, draft_node)
+            current_node.dependencies = list(queue_item.dependencies)
+            current_node.type_version = max(1, int(node_definition.type_version or current_node.type_version or 1))
+            current_node.notes = _safe_string_list(
+                list(current_node.notes) + list(decision.notes) + ["implemented_by_engineer_agent"]
+            )
+            _upsert_draft_node(workflow_draft, current_node)
+            queue_node_ids[queue_item.queue_id] = current_node.node_id
+            _set_queue_node_id_map(workflow_draft, queue_node_ids)
 
             queue_item.status = "implemented"
             blocked_nodes = [item for item in blocked_nodes if item.queue_id != queue_item.queue_id]
@@ -1103,7 +1978,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             implemented_nodes.append(
                 ImplementedNode(
                     queue_id=queue_item.queue_id,
-                    node_id=node_id,
+                    node_id=current_node.node_id,
                     node_type=queue_item.node_type,
                     purpose=queue_item.purpose,
                     version=version,
@@ -1112,10 +1987,19 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             variable_registry = _update_variable_registry(
                 variable_registry,
                 queue_item=queue_item,
-                node_id=node_id,
+                node_id=current_node.node_id,
                 queue=queue,
+                decision=decision,
             )
             progressed = True
+
+            incremental_json = _draft_to_final_workflow_json(workflow_draft)
+            persist_payload = _persist_workflow_candidate(
+                state={**state, **persist_payload},
+                final_workflow_json=incremental_json,
+                workflow_name=workflow_draft.name,
+                request_id=request_id,
+            )
 
         if not progressed:
             implementation_status = ImplementationStatus.failed
@@ -1191,12 +2075,13 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             **persist_payload,
         }
 
-    workflow_draft.connections = _build_connections(queue, queue_node_ids)
+    if not workflow_draft.connections:
+        workflow_draft.connections = _build_connections(queue, queue_node_ids)
     final_workflow_json = _draft_to_final_workflow_json(workflow_draft)
     _append_version(workflow_versions, workflow_draft, reason="connected workflow graph and produced final candidate")
 
     persist_payload = _persist_workflow_candidate(
-        state=state,
+        state={**state, **persist_payload},
         final_workflow_json=final_workflow_json,
         workflow_name=workflow_draft.name,
         request_id=request_id,
@@ -1218,12 +2103,13 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             use_case_id=architecture_plan.use_case_id,
             planning_ready=True,
             handoff_target=AgentStage.qa_agent,
-            required_node_types=[node.node_type for node in architecture_plan.required_nodes],
+            required_node_types=[node.node_type for node in proposed_nodes],
             unresolved_inputs=[],
             notes=[],
         )
     workflow_context.unresolved_inputs = []
     workflow_context.handoff_target = AgentStage.qa_agent
+    workflow_context.required_node_types = [node.node_type for node in proposed_nodes]
     if "handoff_ready_qa" not in routing_signals:
         routing_signals.append("handoff_ready_qa")
     engineer_notes.append("Engineer completed iterative workflow construction. QA handoff is ready.")

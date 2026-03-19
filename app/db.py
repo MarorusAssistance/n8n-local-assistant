@@ -776,6 +776,93 @@ def _fetch_definition_rows(
     return selected
 
 
+def query_definition_chunks_by_entity(
+    *,
+    entity_key: str,
+    entity_id: str,
+    source_value: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not entity_key or not entity_id:
+        return []
+    if not settings.METADATA_COLUMN:
+        return []
+
+    metadata_col = sql.Identifier(settings.METADATA_COLUMN)
+    entity_expr = sql.SQL("{meta_col} ->> {field}").format(
+        meta_col=metadata_col,
+        field=sql.Literal(entity_key),
+    )
+    kind_expr = sql.SQL("{meta_col} ->> 'kind'").format(meta_col=metadata_col)
+
+    select_cols = [
+        sql.SQL("{text_col} AS text").format(text_col=sql.Identifier(settings.TEXT_COLUMN)),
+        _select_output_expr(settings.URL_COLUMN, settings.URL_JSON_PATH, "url"),
+        _select_output_expr(settings.TITLE_COLUMN, settings.TITLE_JSON_PATH, "title"),
+        _select_output_expr(settings.SECTION_COLUMN, settings.SECTION_JSON_PATH, "section"),
+        sql.SQL("{meta_col} AS metadata").format(meta_col=metadata_col),
+        sql.SQL("{entity_expr} AS {alias}").format(
+            entity_expr=entity_expr,
+            alias=sql.Identifier(LINK_ENTITY_KEY),
+        ),
+        sql.SQL("{kind_expr} AS {alias}").format(
+            kind_expr=kind_expr,
+            alias=sql.Identifier(LINK_META_KIND_KEY),
+        ),
+    ]
+
+    conditions: List[sql.SQL] = [
+        sql.SQL("{entity_expr} = %s").format(entity_expr=entity_expr),
+    ]
+    params: List[Any] = [entity_id]
+
+    source_condition, source_params = _source_match_condition(source_value)
+    if source_condition is not None:
+        conditions.append(source_condition)
+        params.extend(source_params)
+
+    where_clause = _combine_where(conditions)
+    query = sql.SQL(
+        "SELECT {select_cols} "
+        "FROM {table} "
+        "{where_clause}"
+    ).format(
+        select_cols=sql.SQL(", ").join(select_cols),
+        table=sql.Identifier(settings.TABLE_NAME),
+        where_clause=where_clause,
+    )
+
+    try:
+        with _connect() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+    except PsycopgError as exc:
+        trace_logger.warning(
+            "definition lookup failed: entity_key=%s entity_id=%s error=%s",
+            entity_key,
+            entity_id,
+            exc,
+        )
+        return []
+
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            payload["metadata"] = {}
+        output.append(payload)
+
+    output.sort(
+        key=lambda item: (
+            str(item.get(LINK_META_KIND_KEY) or item.get("metadata", {}).get("kind") or ""),
+            str(item.get("section") or ""),
+            str(item.get("title") or ""),
+        )
+    )
+    return output
+
+
 def _build_related_chunk(
     row: Dict[str, Any],
     *,
