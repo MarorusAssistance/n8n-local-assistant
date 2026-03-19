@@ -24,6 +24,7 @@ from app.graphs.nodes.engineer_agent import (
     DeveloperNodeDefinition,
     DeveloperParameterDefinition,
     engineer_agent_node,
+    get_node_definition,
 )
 
 
@@ -246,6 +247,29 @@ def _stub_definition_lookups(
         "get_node_credential_requirements",
         lambda node_type: list(creds.get(node_type, [])),
     )
+
+
+def test_get_node_definition_accepts_list_version_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [
+        {
+            "title": "AI Transform",
+            "url": "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.aitransform/",
+            "text": "Overview for AI Transform",
+            "metadata": {
+                "kind": "NODE_OVERVIEW",
+                "displayName": "AI Transform",
+                "version": [1],
+                "credentialTypes_required": [],
+            },
+        }
+    ]
+    monkeypatch.setattr(engineer_mod, "query_definition_chunks_by_entity", lambda **kwargs: rows)
+
+    definition = get_node_definition("n8n-nodes-base.aiTransform")
+
+    assert definition is not None
+    assert definition.display_name == "AI Transform"
+    assert definition.type_version == 1
 
 
 def test_engineer_success_from_architect_handoff_simple(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -578,4 +602,3 @@ def test_engineer_relies_on_definition_lookup_not_hardcoded_heuristics(
 
     assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
     assert updates["missing_user_input_details"][0].missing_item == "customUrl"
-

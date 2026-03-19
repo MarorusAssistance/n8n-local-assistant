@@ -179,6 +179,94 @@ def _safe_string_list(values: Iterable[Any]) -> List[str]:
     return output
 
 
+def _coerce_positive_int(value: Any, default: int = 1) -> int:
+    candidates: List[Any] = []
+    if isinstance(value, (list, tuple)):
+        candidates.extend(list(value))
+    else:
+        candidates.append(value)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if isinstance(candidate, bool):
+            continue
+        if isinstance(candidate, (int, float)):
+            try:
+                coerced = int(candidate)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if coerced >= 1:
+                return coerced
+            continue
+        text = str(candidate).strip()
+        if not text:
+            continue
+        try:
+            coerced = int(float(text))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if coerced >= 1:
+            return coerced
+    return max(1, int(default or 1))
+
+
+def _queue_item_trace_summary(queue_item: ImplementationQueueItem) -> Dict[str, Any]:
+    return {
+        "queue_id": queue_item.queue_id,
+        "node_type": queue_item.node_type,
+        "stage_id": queue_item.stage_id,
+        "status": queue_item.status,
+        "dependencies": list(queue_item.dependencies),
+        "expected_inputs": list(queue_item.expected_inputs),
+        "expected_outputs": list(queue_item.expected_outputs),
+        "purpose": _safe_text(queue_item.purpose, max_chars=220),
+    }
+
+
+def _node_definition_trace_summary(node_definition: Optional[DeveloperNodeDefinition]) -> Dict[str, Any]:
+    if node_definition is None:
+        return {}
+    return {
+        "node_type": node_definition.node_type,
+        "display_name": node_definition.display_name,
+        "type_version": node_definition.type_version,
+        "summary": _safe_text(node_definition.summary, max_chars=220),
+        "parameter_names": [item.name for item in node_definition.parameter_schema],
+        "credential_types_required": list(node_definition.credential_types_required),
+        "source_refs": list(node_definition.source_refs[:3]),
+    }
+
+
+def _decision_trace_summary(decision: NodeImplementationDecision) -> Dict[str, Any]:
+    return {
+        "can_apply": decision.can_apply,
+        "parameters_known_keys": sorted(decision.parameters_known.keys()),
+        "parameters_inferred_keys": sorted(decision.parameters_inferred.keys()),
+        "parameters_unresolved": list(decision.parameters_unresolved),
+        "credential_ref_keys": sorted(decision.credential_refs.keys()),
+        "missing_inputs": [
+            {
+                "key_name": item.key_name,
+                "category": item.category,
+                "reason": _safe_text(item.reason, max_chars=180),
+                "question": _safe_text(item.question, max_chars=180),
+            }
+            for item in decision.missing_inputs
+        ],
+        "variable_outputs": [
+            {
+                "name": item.name,
+                "semantic_meaning": _safe_text(item.semantic_meaning, max_chars=160),
+                "expected_format": item.expected_format,
+                "destination_queue_ids": list(item.destination_queue_ids),
+            }
+            for item in decision.variable_outputs
+        ],
+        "notes": list(decision.notes),
+    }
+
+
 def _build_stage_dependency_map(plan: ArchitecturePlan) -> Dict[str, List[str]]:
     output: Dict[str, List[str]] = {}
     for item in plan.data_flow:
@@ -441,7 +529,7 @@ def get_node_definition(node_type: str) -> Optional[DeveloperNodeDefinition]:
     return DeveloperNodeDefinition(
         node_type=node_type_value,
         display_name=display_name,
-        type_version=max(1, int(version or 1)),
+        type_version=_coerce_positive_int(version, default=1),
         summary="\n".join(summary_parts),
         parameter_schema=list(by_name.values()),
         credential_types_required=_safe_string_list(credential_types),
@@ -1394,6 +1482,20 @@ def _persist_workflow_candidate(
     workflow_name_value = str(workflow_name or "").strip() or current_name
 
     if not _runtime_flag(state, "persist_to_n8n", default=False):
+        emit_trace_event(
+            trace_logger,
+            event="workflow_persist_result",
+            request_id=request_id,
+            stage="multi_agent.workflow_persist",
+            payload={
+                "workflow_name": workflow_name_value,
+                "action": "skipped",
+                "reason": "persist_to_n8n disabled",
+                "node_count": len(final_workflow_json.get("nodes") or []),
+                "connection_count": len(final_workflow_json.get("connections") or {}),
+                "active_workflow_id": current_id,
+            },
+        )
         return _persist_fields(
             active_workflow_id=current_id,
             active_workflow_name=workflow_name_value,
@@ -1431,6 +1533,24 @@ def _persist_workflow_candidate(
             action,
             exc.status_code,
             str(exc),
+        )
+        emit_trace_event(
+            trace_logger,
+            event="workflow_persist_result",
+            request_id=request_id,
+            stage="multi_agent.workflow_persist",
+            payload={
+                "workflow_name": workflow_name_value,
+                "action": action,
+                "ok": False,
+                "status_code": exc.status_code,
+                "error": str(exc),
+                "node_count": len(payload.get("nodes") or []),
+                "connection_keys": sorted((payload.get("connections") or {}).keys())
+                if isinstance(payload.get("connections"), dict)
+                else [],
+                "active_workflow_id": current_id,
+            },
         )
         return _persist_fields(
             active_workflow_id=current_id,
@@ -1473,6 +1593,23 @@ def _persist_workflow_candidate(
             if isinstance(response_data.get("url"), str) and str(response_data.get("url")).strip()
             else _default_workflow_url(client.base_url, persisted_id)
         )
+    )
+    emit_trace_event(
+        trace_logger,
+        event="workflow_persist_result",
+        request_id=request_id,
+        stage="multi_agent.workflow_persist",
+        payload={
+            "workflow_name": persisted_name,
+            "action": action,
+            "ok": True,
+            "active_workflow_id": persisted_id,
+            "active_workflow_url": persisted_url,
+            "node_count": len(payload.get("nodes") or []),
+            "connection_keys": sorted((payload.get("connections") or {}).keys())
+            if isinstance(payload.get("connections"), dict)
+            else [],
+        },
     )
     return _persist_fields(
         active_workflow_id=persisted_id,
@@ -1577,6 +1714,26 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             )
             if "engineer_bootstrapped_from_active_workflow" not in routing_signals:
                 routing_signals.append("engineer_bootstrapped_from_active_workflow")
+            emit_trace_event(
+                trace_logger,
+                event="engineer_bootstrap_active_workflow",
+                request_id=request_id,
+                stage="multi_agent.engineer",
+                payload={
+                    "active_workflow_id": active_workflow_id,
+                    "workflow_name": workflow_draft.name,
+                    "node_count": len(workflow_draft.nodes),
+                    "connection_count": len(workflow_draft.connections),
+                    "proposed_nodes": [
+                        {
+                            "node_id": item.node_id,
+                            "node_type": item.node_type,
+                            "stage_id": item.stage_id,
+                        }
+                        for item in boot_nodes
+                    ],
+                },
+            )
         except N8NClientError as exc:
             missing_details = _merge_missing_details(
                 missing_details,
@@ -1588,6 +1745,16 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                         reason=f"The active workflow could not be loaded from n8n: {exc}",
                     )
                 ],
+            )
+            emit_trace_event(
+                trace_logger,
+                event="engineer_bootstrap_active_workflow_failed",
+                request_id=request_id,
+                stage="multi_agent.engineer",
+                payload={
+                    "active_workflow_id": active_workflow_id,
+                    "error": str(exc),
+                },
             )
 
     if architecture_plan is None:
@@ -1605,6 +1772,17 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             implementation_status = ImplementationStatus.blocked_waiting_user
             routing_signals.append("engineer_blocked_waiting_user")
             engineer_notes.append("Engineer blocked: workflow edit request missing active workflow context.")
+            emit_trace_event(
+                trace_logger,
+                event="engineer_result",
+                request_id=request_id,
+                stage="multi_agent.engineer",
+                payload={
+                    "status": implementation_status.value,
+                    "reason": "missing_active_workflow_context",
+                    "missing_user_inputs": list(missing_user_inputs),
+                },
+            )
             return {
                 "current_stage": "engineer_agent",
                 "target_stage": None,
@@ -1628,6 +1806,16 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
 
         implementation_status = ImplementationStatus.failed
         engineer_notes.append("Engineer failed: architecture_plan is required.")
+        emit_trace_event(
+            trace_logger,
+            event="engineer_result",
+            request_id=request_id,
+            stage="multi_agent.engineer",
+            payload={
+                "status": implementation_status.value,
+                "reason": "missing_architecture_plan",
+            },
+        )
         return {
             "current_stage": "engineer_agent",
             "target_stage": None,
@@ -1682,6 +1870,17 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         implementation_status = ImplementationStatus.blocked_waiting_user
         routing_signals.append("engineer_blocked_waiting_user")
         engineer_notes.append("Engineer blocked: no proposed nodes available.")
+        emit_trace_event(
+            trace_logger,
+            event="engineer_result",
+            request_id=request_id,
+            stage="multi_agent.engineer",
+            payload={
+                "status": implementation_status.value,
+                "reason": "no_proposed_nodes",
+                "missing_user_inputs": list(missing_user_inputs),
+            },
+        )
         return {
             "current_stage": "engineer_agent",
             "target_stage": None,
@@ -1707,6 +1906,30 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         plan=architecture_plan,
         proposed_nodes=proposed_nodes,
         existing_queue=queue,
+    )
+    emit_trace_event(
+        trace_logger,
+        event="engineer_handoff_loaded",
+        request_id=request_id,
+        stage="multi_agent.engineer",
+        payload={
+            "entry_intent": entry_intent.value if isinstance(entry_intent, EntryIntent) else str(entry_intent or ""),
+            "workflow_name": workflow_draft.name,
+            "active_workflow_id": persist_payload.get("active_workflow_id"),
+            "proposed_node_count": len(proposed_nodes),
+            "required_credential_count": len(required_credentials),
+            "queue_count": len(queue),
+            "proposed_nodes": [
+                {
+                    "node_id": item.node_id,
+                    "node_type": item.node_type,
+                    "stage_id": item.stage_id,
+                    "depends_on": list(item.depends_on),
+                }
+                for item in proposed_nodes
+            ],
+            "queue": [_queue_item_trace_summary(item) for item in queue],
+        },
     )
     queue_by_id = {item.queue_id: item for item in queue}
 
@@ -1780,6 +2003,18 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                 continue
 
             node_definition = get_node_definition(queue_item.node_type)
+            emit_trace_event(
+                trace_logger,
+                event="engineer_node_iteration_start",
+                request_id=request_id,
+                stage="multi_agent.engineer.node_iteration",
+                payload={
+                    "queue_item": _queue_item_trace_summary(queue_item),
+                    "resolved_input_keys": sorted(resolved_inputs.keys())[:20],
+                    "current_blocked_nodes": [item.queue_id for item in blocked_nodes],
+                    "node_definition": _node_definition_trace_summary(node_definition),
+                },
+            )
             if node_definition is None:
                 unresolved_inputs = [
                     _missing_input(
@@ -1810,6 +2045,17 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                 routing_signals.append("engineer_blocked_waiting_user")
                 engineer_notes.append(
                     f"Blocked node '{queue_item.queue_id}' because no indexed definition was found for '{queue_item.node_type}'."
+                )
+                emit_trace_event(
+                    trace_logger,
+                    event="engineer_node_blocked",
+                    request_id=request_id,
+                    stage="multi_agent.engineer.node_iteration",
+                    payload={
+                        "queue_item": _queue_item_trace_summary(queue_item),
+                        "reason": "missing_indexed_node_definition",
+                        "missing_user_inputs": [item.question for item in unresolved_inputs],
+                    },
                 )
                 return {
                     "current_stage": "engineer_agent",
@@ -1882,6 +2128,29 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                     resolved_inputs=resolved_inputs,
                     downstream_queue_ids=downstream_queue_ids,
                 )
+            emit_trace_event(
+                trace_logger,
+                event="engineer_node_decision",
+                request_id=request_id,
+                stage="multi_agent.engineer.node_decision",
+                payload={
+                    "queue_item": _queue_item_trace_summary(queue_item),
+                    "upstream_variables": [
+                        {
+                            "name": item.name,
+                            "origin_node_id": item.origin_node_id,
+                            "destination_node_ids": list(item.destination_node_ids),
+                        }
+                        for item in upstream_variables
+                    ],
+                    "downstream_queue_ids": list(downstream_queue_ids),
+                    "parameter_schema_names": [item.name for item in parameter_schema],
+                    "credential_requirement_types": [
+                        item.credential_type for item in credential_requirements
+                    ],
+                    "decision": _decision_trace_summary(decision),
+                },
+            )
 
             unresolved_inputs = _missing_details_from_decision(
                 queue_item=queue_item,
@@ -1928,6 +2197,25 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                     request_id or "-",
                     queue_item.queue_id,
                     len(unresolved_inputs),
+                )
+                emit_trace_event(
+                    trace_logger,
+                    event="engineer_node_blocked",
+                    request_id=request_id,
+                    stage="multi_agent.engineer.node_iteration",
+                    payload={
+                        "queue_item": _queue_item_trace_summary(queue_item),
+                        "decision": _decision_trace_summary(decision),
+                        "missing_details": [
+                            {
+                                "input_id": item.input_id,
+                                "input_key": item.input_key,
+                                "category": item.category,
+                                "question": item.question,
+                            }
+                            for item in unresolved_inputs
+                        ],
+                    },
                 )
                 return {
                     "current_stage": "engineer_agent",
@@ -2000,6 +2288,19 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                 workflow_name=workflow_draft.name,
                 request_id=request_id,
             )
+            emit_trace_event(
+                trace_logger,
+                event="engineer_node_implemented",
+                request_id=request_id,
+                stage="multi_agent.engineer.node_iteration",
+                payload={
+                    "queue_item": _queue_item_trace_summary(queue_item),
+                    "decision": _decision_trace_summary(decision),
+                    "version_count": len(workflow_versions),
+                    "active_workflow_id": persist_payload.get("active_workflow_id"),
+                    "persist_action": persist_payload.get("workflow_persist_action"),
+                },
+            )
 
         if not progressed:
             implementation_status = ImplementationStatus.failed
@@ -2027,6 +2328,18 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     if implementation_status == ImplementationStatus.failed:
         if workflow_context is not None:
             workflow_context.handoff_target = None
+        emit_trace_event(
+            trace_logger,
+            event="engineer_result",
+            request_id=request_id,
+            stage="multi_agent.engineer",
+            payload={
+                "status": implementation_status.value,
+                "remaining_queue": [_queue_item_trace_summary(item) for item in queue if item.status != "implemented"],
+                "blocked_nodes": [item.queue_id for item in blocked_nodes],
+                "missing_user_inputs": list(missing_user_inputs),
+            },
+        )
         return {
             "current_stage": "engineer_agent",
             "target_stage": None,
@@ -2053,6 +2366,17 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         if workflow_context is not None:
             workflow_context.handoff_target = None
             workflow_context.unresolved_inputs = list(missing_user_inputs)
+        emit_trace_event(
+            trace_logger,
+            event="engineer_result",
+            request_id=request_id,
+            stage="multi_agent.engineer",
+            payload={
+                "status": implementation_status.value,
+                "blocked_nodes": [item.queue_id for item in blocked_nodes],
+                "missing_user_inputs": list(missing_user_inputs),
+            },
+        )
         return {
             "current_stage": "engineer_agent",
             "target_stage": None,
@@ -2114,11 +2438,37 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         routing_signals.append("handoff_ready_qa")
     engineer_notes.append("Engineer completed iterative workflow construction. QA handoff is ready.")
 
-    trace_logger.info(
-        "engineer completed: request_id=%s nodes=%d versions=%d",
-        request_id or "-",
-        len(workflow_draft.nodes),
-        len(workflow_versions),
+    emit_trace_event(
+        trace_logger,
+        event="engineer_result",
+        request_id=request_id,
+        stage="multi_agent.engineer",
+        payload={
+            "status": implementation_status.value,
+            "node_count": len(workflow_draft.nodes),
+            "version_count": len(workflow_versions),
+            "implemented_nodes": [
+                {
+                    "queue_id": item.queue_id,
+                    "node_id": item.node_id,
+                    "node_type": item.node_type,
+                    "version": item.version,
+                }
+                for item in implemented_nodes
+            ],
+            "variable_registry": [
+                {
+                    "name": item.name,
+                    "origin_node_id": item.origin_node_id,
+                    "destination_node_ids": list(item.destination_node_ids),
+                    "semantic_meaning": item.semantic_meaning,
+                }
+                for item in variable_registry
+            ],
+            "active_workflow_id": persist_payload.get("active_workflow_id"),
+            "persist_action": persist_payload.get("workflow_persist_action"),
+            "target_stage": AgentStage.qa_agent.value,
+        },
     )
 
     return {

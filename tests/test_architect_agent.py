@@ -19,6 +19,7 @@ from app.features.reasoning.multi_agent_contracts import (
 )
 from app.graphs.nodes.architect_agent import (
     _StageSelectionOutput,
+    _build_workflow_blueprint_with_structured_output,
     _WorkflowConnectionBlueprint,
     _WorkflowBlueprintOutput,
     _WorkflowNodeBlueprint,
@@ -339,7 +340,76 @@ def test_architect_prompts_emphasize_structural_role_and_id_validation(
     assert "Decide by functional role, not just semantic similarity." in selection_prompt
     assert "Reject provider-only or infrastructure-only nodes when the stage needs a complete business operation node." in selection_prompt
     assert "Never reference a source_node_id or target_node_id that is not present in the returned nodes list." in blueprint_prompt
+    assert "Allowed blueprint nodes (use these exact ids and names in the output):" in blueprint_prompt
+    assert "Never use placeholder ids such as '-', '', null, none, output, end, terminal, or similar." in blueprint_prompt
     assert "perform a private self-check" in blueprint_prompt
+
+
+def test_architect_normalizes_blueprint_ids_and_strips_invalid_placeholder_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _capture(**kwargs):
+        output_model = kwargs["output_model"]
+        if output_model is not _WorkflowBlueprintOutput:
+            raise AssertionError("unexpected output model")
+        return _WorkflowBlueprintOutput(
+            workflow_name="Email urgency classification",
+            summary="Architect draft",
+            nodes=[
+                _WorkflowNodeBlueprint(
+                    node_id="cronTrigger",
+                    name="Cron Trigger",
+                    node_type="n8n-nodes-base.gmailTrigger",
+                    type_version=1,
+                    stage_id="stage_1",
+                    purpose="Receive emails",
+                    depends_on=["-"],
+                ),
+                _WorkflowNodeBlueprint(
+                    node_id="classify",
+                    name="Classifier",
+                    node_type="n8n-nodes-base.code",
+                    type_version=2,
+                    stage_id="stage_2",
+                    purpose="Classify urgency",
+                    depends_on=["cronTrigger"],
+                ),
+            ],
+            connections=[
+                _WorkflowConnectionBlueprint(source_node_id="cronTrigger", target_node_id="classify"),
+                _WorkflowConnectionBlueprint(source_node_id="classify", target_node_id="-"),
+            ],
+        )
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._invoke_structured_output", _capture)
+
+    output = _build_workflow_blueprint_with_structured_output(
+        plan=_plan(),
+        stage_selections=[
+            ArchitectStageSelection(
+                stage_id="stage_1",
+                selected_node_types=["n8n-nodes-base.gmailTrigger"],
+                selected_nodes=[_candidate("n8n-nodes-base.gmailTrigger", stage_id="stage_1", has_main_input=False)],
+                rationale="Receive emails",
+            ),
+            ArchitectStageSelection(
+                stage_id="stage_2",
+                selected_node_types=["n8n-nodes-base.code"],
+                selected_nodes=[_candidate("n8n-nodes-base.code", stage_id="stage_2", type_version=2)],
+                rationale="Classify urgency",
+            ),
+        ],
+        model="fake-model",
+        request_id="req-architect-blueprint-normalize",
+    )
+
+    assert [node.node_id for node in output.nodes] == ["stage_1_gmailtrigger", "stage_2_code"]
+    assert [node.name for node in output.nodes] == ["gmailTrigger", "code"]
+    assert output.nodes[0].depends_on == []
+    assert output.nodes[1].depends_on == ["stage_1_gmailtrigger"]
+    assert len(output.connections) == 1
+    assert output.connections[0].source_node_id == "stage_1_gmailtrigger"
+    assert output.connections[0].target_node_id == "stage_2_code"
 
 
 def test_architect_parses_malformed_connector_fragments_into_clean_connector_types() -> None:

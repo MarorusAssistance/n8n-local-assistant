@@ -105,6 +105,69 @@ def _safe_list(values: Iterable[Any]) -> List[str]:
     return output
 
 
+def _candidate_trace_summary(
+    candidate: ArchitectNodeCandidate,
+    *,
+    rejected_reasons: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    return {
+        "node_type": candidate.node_type,
+        "display_name": candidate.display_name,
+        "usage_mode": candidate.usage_mode,
+        "usable_as_tool": candidate.usable_as_tool,
+        "has_main_input": candidate.has_main_input,
+        "input_connection_types": list(candidate.input_connection_types),
+        "output_connection_types": list(candidate.output_connection_types),
+        "type_version": candidate.type_version,
+        "rerank_confidence": candidate.rerank_confidence,
+        "link_confidence": candidate.link_confidence,
+        "limitations": list(candidate.limitations),
+        "rejected_reasons": list(rejected_reasons or []),
+        "evidence_refs": list(candidate.evidence_refs[:3]),
+    }
+
+
+def _selection_trace_summary(selection: ArchitectStageSelection) -> Dict[str, Any]:
+    return {
+        "stage_id": selection.stage_id,
+        "selected_node_types": list(selection.selected_node_types),
+        "passes_used": selection.passes_used,
+        "blocked": selection.blocked,
+        "missing_information": list(selection.missing_information),
+        "selected_nodes": [_candidate_trace_summary(item) for item in selection.selected_nodes],
+        "rationale": selection.rationale,
+    }
+
+
+def _blueprint_trace_summary(blueprint: _WorkflowBlueprintOutput) -> Dict[str, Any]:
+    return {
+        "workflow_name": blueprint.workflow_name,
+        "summary": blueprint.summary,
+        "node_count": len(blueprint.nodes),
+        "connection_count": len(blueprint.connections),
+        "nodes": [
+            {
+                "node_id": node.node_id,
+                "name": node.name,
+                "node_type": node.node_type,
+                "type_version": node.type_version,
+                "stage_id": node.stage_id,
+                "depends_on": list(node.depends_on),
+            }
+            for node in blueprint.nodes
+        ],
+        "connections": [
+            {
+                "source_node_id": connection.source_node_id,
+                "target_node_id": connection.target_node_id,
+                "type": connection.type,
+                "index": connection.index,
+            }
+            for connection in blueprint.connections
+        ],
+    }
+
+
 def _runtime_context(state: MultiAgentGraphState) -> Tuple[Optional[str], Optional[str]]:
     runtime_context = state.get("runtime_context")
     if not isinstance(runtime_context, dict):
@@ -957,23 +1020,40 @@ def _short_type(node_type: str) -> str:
     return value.split(".")[-1]
 
 
-def _fallback_workflow_blueprint(
+def _slugify_identifier(value: str) -> str:
+    token = re.sub(r"[^a-zA-Z0-9]+", "_", str(value or "").strip()).strip("_").lower()
+    return token or "node"
+
+
+def _canonical_blueprint_nodes(
     *,
-    plan: ArchitecturePlan,
     stage_selections: Sequence[ArchitectStageSelection],
-) -> _WorkflowBlueprintOutput:
-    nodes: List[_WorkflowNodeBlueprint] = []
-    connections: List[_WorkflowConnectionBlueprint] = []
-    stage_primary_node_ids: Dict[str, str] = {}
-    counter = 1
+) -> List[_WorkflowNodeBlueprint]:
+    seeds: List[_WorkflowNodeBlueprint] = []
+    used_ids: set[str] = set()
+    used_names: set[str] = set()
+
     for selection in stage_selections:
-        for candidate in selection.selected_nodes:
-            node_id = f"an_{counter}"
-            node_name = f"{_short_type(candidate.node_type)}_{counter}"
-            nodes.append(
+        for index, candidate in enumerate(selection.selected_nodes, start=1):
+            base_name = str(candidate.display_name or _short_type(candidate.node_type)).strip() or _short_type(
+                candidate.node_type
+            )
+            base_id = f"{selection.stage_id}_{_slugify_identifier(base_name)}"
+            node_id = base_id
+            duplicate = 2
+            while node_id in used_ids:
+                node_id = f"{base_id}_{duplicate}"
+                duplicate += 1
+            name = base_name
+            while name in used_names:
+                name = f"{base_name} {duplicate - 1}"
+                duplicate += 1
+            used_ids.add(node_id)
+            used_names.add(name)
+            seeds.append(
                 _WorkflowNodeBlueprint(
                     node_id=node_id,
-                    name=node_name,
+                    name=name,
                     node_type=candidate.node_type,
                     type_version=max(1, candidate.type_version),
                     stage_id=selection.stage_id,
@@ -981,8 +1061,98 @@ def _fallback_workflow_blueprint(
                     depends_on=[],
                 )
             )
-            stage_primary_node_ids.setdefault(selection.stage_id, node_id)
-            counter += 1
+    return seeds
+
+
+def _normalize_node_ref(value: str, alias_map: Dict[str, str]) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw or raw in {"-", "null", "none"}:
+        return None
+    return alias_map.get(raw, raw)
+
+
+def _normalize_workflow_blueprint_output(
+    *,
+    output: _WorkflowBlueprintOutput,
+    stage_selections: Sequence[ArchitectStageSelection],
+) -> _WorkflowBlueprintOutput:
+    seeds = _canonical_blueprint_nodes(stage_selections=stage_selections)
+    if not seeds:
+        return output
+
+    seed_by_key = {(item.stage_id, item.node_type): item for item in seeds}
+    alias_map: Dict[str, str] = {}
+    normalized_nodes: List[_WorkflowNodeBlueprint] = []
+
+    for node in output.nodes:
+        seed = seed_by_key.get((node.stage_id, node.node_type))
+        if seed is None:
+            normalized_nodes.append(node)
+            alias_map[str(node.node_id)] = str(node.node_id)
+            continue
+        alias_map[str(node.node_id)] = seed.node_id
+        alias_map[str(seed.node_id)] = seed.node_id
+        alias_map[str(node.name)] = seed.node_id
+        normalized_nodes.append(
+            seed.model_copy(
+                update={
+                    "purpose": node.purpose or seed.purpose,
+                    "depends_on": list(node.depends_on),
+                }
+            )
+        )
+
+    node_ids = {node.node_id for node in normalized_nodes}
+    normalized_connections: List[_WorkflowConnectionBlueprint] = []
+    for connection in output.connections:
+        source_id = _normalize_node_ref(connection.source_node_id, alias_map)
+        target_id = _normalize_node_ref(connection.target_node_id, alias_map)
+        if not source_id or not target_id:
+            continue
+        if source_id not in node_ids or target_id not in node_ids:
+            continue
+        normalized_connections.append(
+            _WorkflowConnectionBlueprint(
+                source_node_id=source_id,
+                target_node_id=target_id,
+                type=connection.type,
+                index=connection.index,
+            )
+        )
+
+    normalized_nodes = [
+        node.model_copy(
+            update={
+                "depends_on": [
+                    dep
+                    for dep in [
+                        _normalize_node_ref(item, alias_map) for item in list(node.depends_on)
+                    ]
+                    if dep and dep in node_ids
+                ]
+            }
+        )
+        for node in normalized_nodes
+    ]
+
+    return _WorkflowBlueprintOutput(
+        workflow_name=output.workflow_name,
+        summary=output.summary,
+        nodes=normalized_nodes,
+        connections=normalized_connections,
+    )
+
+
+def _fallback_workflow_blueprint(
+    *,
+    plan: ArchitecturePlan,
+    stage_selections: Sequence[ArchitectStageSelection],
+) -> _WorkflowBlueprintOutput:
+    nodes: List[_WorkflowNodeBlueprint] = _canonical_blueprint_nodes(stage_selections=stage_selections)
+    connections: List[_WorkflowConnectionBlueprint] = []
+    stage_primary_node_ids: Dict[str, str] = {}
+    for node in nodes:
+        stage_primary_node_ids.setdefault(node.stage_id, node.node_id)
 
     nodes_by_stage = {node.stage_id: node for node in nodes}
     stage_order = [selection.stage_id for selection in stage_selections]
@@ -1035,6 +1205,7 @@ def _build_workflow_blueprint_with_structured_output(
         )
 
     selection_lines = []
+    allowed_blueprint_nodes = _canonical_blueprint_nodes(stage_selections=stage_selections)
     for selection in stage_selections:
         stage_nodes = []
         for candidate in selection.selected_nodes:
@@ -1060,6 +1231,18 @@ def _build_workflow_blueprint_with_structured_output(
         stage_selections=stage_selections,
         limit=3,
     )
+    blueprint_seed_lines = [
+        "\n".join(
+            [
+                f"- Exact node_id: {item.node_id}",
+                f"  Exact name: {item.name}",
+                f"  Node type: {item.node_type}",
+                f"  Stage id: {item.stage_id}",
+                f"  type_version: {item.type_version}",
+            ]
+        )
+        for item in allowed_blueprint_nodes
+    ]
 
     system_prompt = (
         "You are architect_agent for an n8n workflow assistant. "
@@ -1075,10 +1258,14 @@ def _build_workflow_blueprint_with_structured_output(
         f"Workflow summary: {plan.workflow_summary}\n\n"
         "Selected stage bundles:\n"
         f"{chr(10).join(selection_lines)}\n\n"
+        "Allowed blueprint nodes (use these exact ids and names in the output):\n"
+        f"{chr(10).join(blueprint_seed_lines)}\n\n"
         "Stage neighborhood context:\n"
         f"{neighborhood_context}\n\n"
         "Rules:\n"
         "- Use only the selected node types.\n"
+        "- Materialize only the allowed blueprint nodes listed above.\n"
+        "- Use the exact node_id and exact name for each allowed node; do not rename them and do not invent additional ids.\n"
         "- Build a coherent draft for a classic non-AI workflow.\n"
         "- The draft must contain at least one trigger/start node.\n"
         "- Use only main connections.\n"
@@ -1092,6 +1279,9 @@ def _build_workflow_blueprint_with_structured_output(
         "- type_version must come from the selected candidate metadata.\n"
         "- Keep the node order and dependencies coherent with the stage order.\n"
         "- Never reference a source_node_id or target_node_id that is not present in the returned nodes list.\n"
+        "- Never use placeholder ids such as '-', '', null, none, output, end, terminal, or similar.\n"
+        "- If a node has no valid downstream target, emit no connection for it.\n"
+        "- depends_on must reference only existing allowed node ids, or be empty.\n"
         "- Do not invent helper nodes that were not selected.\n"
         "- Do not assume hidden model wiring, hidden tools, hidden memory, or hidden side connections.\n"
         "- Prefer the minimum valid edge set that preserves the workflow logic.\n"
@@ -1110,7 +1300,10 @@ def _build_workflow_blueprint_with_structured_output(
         )
         if not output.nodes:
             return _fallback_workflow_blueprint(plan=plan, stage_selections=stage_selections)
-        return output
+        return _normalize_workflow_blueprint_output(
+            output=output,
+            stage_selections=stage_selections,
+        )
     except Exception as exc:
         logger.warning("architect workflow blueprint fallback to deterministic draft: %s", str(exc))
         return _fallback_workflow_blueprint(plan=plan, stage_selections=stage_selections)
@@ -1517,6 +1710,36 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                     stage_requires_trigger=stage_requires_trigger,
                 )
             ]
+            rejected_candidates = [
+                {
+                    "node_type": item.node_type,
+                    "rejected_reasons": _candidate_rejection_reasons(
+                        candidate=item,
+                        stage=stage,
+                        plan=architecture_plan,
+                        stage_requires_trigger=stage_requires_trigger,
+                    ),
+                }
+                for item in candidates
+                if item not in valid_candidates
+            ]
+            emit_trace_event(
+                trace_logger,
+                event="architect_stage_candidates",
+                request_id=request_id,
+                stage="multi_agent.architect.stage_selection",
+                payload={
+                    "stage_id": stage.id,
+                    "pass_index": pass_index,
+                    "stage_requires_trigger": stage_requires_trigger,
+                    "candidate_count": len(candidates),
+                    "valid_candidate_count": len(valid_candidates),
+                    "valid_candidates": [
+                        _candidate_trace_summary(item) for item in valid_candidates[:8]
+                    ],
+                    "rejected_candidates": rejected_candidates[:8],
+                },
+            )
 
             selection_output = _select_stage_nodes_with_structured_output(
                 plan=architecture_plan,
@@ -1530,6 +1753,23 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             selected_candidates = [
                 item for item in valid_candidates if item.node_type in set(selection_output.selected_node_types)
             ]
+            emit_trace_event(
+                trace_logger,
+                event="architect_stage_selection_decision",
+                request_id=request_id,
+                stage="multi_agent.architect.stage_selection",
+                payload={
+                    "stage_id": stage.id,
+                    "pass_index": pass_index,
+                    "selected_node_types": list(selection_output.selected_node_types),
+                    "needs_clarification": selection_output.needs_clarification,
+                    "clarification_questions": list(selection_output.clarification_questions),
+                    "selected_candidates": [
+                        _candidate_trace_summary(item) for item in selected_candidates
+                    ],
+                    "rationale": selection_output.rationale,
+                },
+            )
             if (
                 not selection_output.needs_clarification
                 and selected_candidates
@@ -1589,11 +1829,28 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         stage_selections = [item for item in stage_selections if item.stage_id != stage.id] + [final_selection]
 
     ordered_selections = [stage_selection_map[stage.id] for stage in architecture_plan.stages if stage.id in stage_selection_map]
+    emit_trace_event(
+        trace_logger,
+        event="architect_stage_selection_summary",
+        request_id=request_id,
+        stage="multi_agent.architect",
+        payload={
+            "stage_count": len(ordered_selections),
+            "selections": [_selection_trace_summary(item) for item in ordered_selections],
+        },
+    )
     blueprint = _build_workflow_blueprint_with_structured_output(
         plan=architecture_plan,
         stage_selections=ordered_selections,
         model=model,
         request_id=request_id,
+    )
+    emit_trace_event(
+        trace_logger,
+        event="architect_workflow_blueprint_generated",
+        request_id=request_id,
+        stage="multi_agent.architect.workflow_blueprint",
+        payload=_blueprint_trace_summary(blueprint),
     )
     validation_issues = _validate_blueprint(
         blueprint=blueprint,
@@ -1602,6 +1859,16 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         stage_selection_map=stage_selection_map,
     )
     if validation_issues:
+        emit_trace_event(
+            trace_logger,
+            event="architect_workflow_blueprint_invalid",
+            request_id=request_id,
+            stage="multi_agent.architect.workflow_blueprint",
+            payload={
+                **_blueprint_trace_summary(blueprint),
+                "validation_issues": validation_issues,
+            },
+        )
         updates = _block_architect(
             architecture_plan=architecture_plan,
             workflow_context=workflow_context,
@@ -1624,6 +1891,17 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             },
         )
         return updates
+    emit_trace_event(
+        trace_logger,
+        event="architect_workflow_blueprint_validated",
+        request_id=request_id,
+        stage="multi_agent.architect.workflow_blueprint",
+        payload={
+            "workflow_name": blueprint.workflow_name,
+            "node_count": len(blueprint.nodes),
+            "connection_count": len(blueprint.connections),
+        },
+    )
 
     draft, proposed_nodes = _draft_from_blueprint(
         blueprint=blueprint,
@@ -1682,6 +1960,25 @@ def architect_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             "status": architect_status.value,
             "selected_stage_count": len(ordered_selections),
             "selected_node_types": [item.node_type for item in proposed_nodes],
+            "workflow_draft_nodes": [
+                {
+                    "node_id": item.node_id,
+                    "name": item.name,
+                    "node_type": item.node_type,
+                    "stage_id": item.stage_id,
+                    "dependencies": list(item.dependencies),
+                }
+                for item in draft.nodes
+            ],
+            "workflow_draft_connections": [
+                {
+                    "source_node_id": item.source_node_id,
+                    "target_node_id": item.target_node_id,
+                    "source_output": item.source_output,
+                    "target_input": item.target_input,
+                }
+                for item in draft.connections
+            ],
             "workflow_id": persist_payload.get("active_workflow_id"),
             "persist_action": persist_payload.get("workflow_persist_action"),
         },

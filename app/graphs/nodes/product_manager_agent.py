@@ -75,6 +75,25 @@ def _safe_list(values: Sequence[Any]) -> List[str]:
     return output
 
 
+def _stage_trace_summary(stages: Sequence[Any]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    for stage in stages:
+        purpose = getattr(stage, "purpose", None) or getattr(stage, "objective", "")
+        output.append(
+            {
+                "id": getattr(stage, "id", None),
+                "name": getattr(stage, "name", None),
+                "purpose": _compact(purpose, max_chars=180),
+                "required_capabilities": _safe_list(getattr(stage, "required_capabilities", []) or [])[:5],
+                "expected_inputs": _safe_list(getattr(stage, "expected_inputs", []) or [])[:5],
+                "expected_outputs": _safe_list(getattr(stage, "expected_outputs", []) or [])[:5],
+                "dependencies": _safe_list(getattr(stage, "dependencies", []) or []),
+                "success_criteria": _safe_list(getattr(stage, "success_criteria", []) or [])[:4],
+            }
+        )
+    return output
+
+
 def _runtime_context(state: MultiAgentGraphState) -> Tuple[Optional[str], Optional[str]]:
     runtime_context = state.get("runtime_context")
     if not isinstance(runtime_context, dict):
@@ -581,9 +600,16 @@ def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             stage="multi_agent.product_manager",
             payload={
                 "pm_status": pm_status.value,
+                "use_case_id": selected_use_case.id,
+                "title": architecture_plan.title,
+                "workflow_summary": architecture_plan.workflow_summary,
                 "stage_count": len(stage_plan),
+                "stages": _stage_trace_summary(stage_plan),
+                "missing_information": _safe_list(architecture_plan.missing_information),
+                "assumptions": _safe_list(architecture_plan.assumptions)[:6],
                 "clarification_attempts": clarification_state.attempts_used,
                 "planning_ready": False,
+                "handoff_target": None,
             },
         )
         return {
@@ -634,9 +660,16 @@ def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         stage="multi_agent.product_manager",
         payload={
             "pm_status": pm_status.value,
+            "use_case_id": selected_use_case.id,
+            "title": architecture_plan.title,
+            "workflow_summary": architecture_plan.workflow_summary,
             "stage_count": len(stage_plan),
+            "stages": _stage_trace_summary(stage_plan),
+            "missing_information": _safe_list(architecture_plan.missing_information),
+            "assumptions": _safe_list(architecture_plan.assumptions)[:6],
             "clarification_attempts": clarification_state.attempts_used,
             "planning_ready": True,
+            "handoff_target": AgentStage.architect_agent.value,
         },
     )
 
