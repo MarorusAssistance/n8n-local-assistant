@@ -139,6 +139,16 @@ def test_graph_routes_direct_build_request_to_architect_via_product_manager(monk
             "final_workflow_json": {"name": "Build flow", "nodes": [{"id": "an_1"}], "connections": {}},
         },
     )
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.engineer_agent_node",
+        lambda state: {
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.completed,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
+            "final_workflow_json": state.get("final_workflow_json") or {"name": "Build flow", "nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
 
     result = runtime.run(
         user_prompt="Build a new workflow from scratch.",
@@ -146,8 +156,8 @@ def test_graph_routes_direct_build_request_to_architect_via_product_manager(monk
         request_id="req-build-1",
         existing_workflow=None,
     )
-    assert result.current_stage == "architect_agent"
-    assert result.target_stage == AgentStage.engineer_agent
+    assert result.current_stage == "engineer_agent"
+    assert result.target_stage == AgentStage.qa_agent
     assert result.workflow_context is not None
     assert result.workflow_context.handoff_target == AgentStage.engineer_agent
     assert result.status == "stub_routed"
@@ -287,6 +297,16 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
             "final_workflow_json": {"nodes": [{"id": "an_1"}], "connections": {}},
         },
     )
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.engineer_agent_node",
+        lambda state: {
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.completed,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
+            "final_workflow_json": state.get("final_workflow_json") or {"nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
     runtime = ReasoningGraphRuntime()
     monkeypatch.setattr(
         "app.graphs.reasoning_graph.route_entry_intent",
@@ -299,12 +319,13 @@ def test_graph_business_discovery_sets_handoff_ready_state(monkeypatch: pytest.M
         request_id="req-commercial-1",
         existing_workflow=None,
     )
-    assert result.current_stage == "architect_agent"
+    assert result.current_stage == "engineer_agent"
     assert result.selected_use_case is not None
-    assert result.target_stage == AgentStage.engineer_agent
+    assert result.target_stage == AgentStage.qa_agent
     assert "handoff_ready_product_manager" in result.routing_signals
     assert "handoff_ready_architect" in result.routing_signals
     assert "handoff_ready_engineer" in result.routing_signals
+    assert "handoff_ready_qa" in result.routing_signals
     assert result.architecture_plan is not None
     assert result.workflow_context is not None
     assert result.workflow_context.handoff_target == AgentStage.engineer_agent
@@ -568,6 +589,16 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
             "final_workflow_json": {"name": "PM Resume", "nodes": [{"id": "an_1"}], "connections": {}},
         },
     )
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.engineer_agent_node",
+        lambda state: {
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.completed,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
+            "final_workflow_json": state.get("final_workflow_json") or {"name": "PM Resume", "nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
 
     run_config = {"configurable": {"thread_id": "thread-pm-resume-1"}}
     first = runtime.run(
@@ -588,13 +619,14 @@ def test_runtime_resumes_blocked_pm_state_on_same_thread(
         run_config=run_config,
     )
     assert route_calls["count"] == 1
-    assert second.current_stage == "architect_agent"
+    assert second.current_stage == "engineer_agent"
     assert second.pm_status == "pm_completed"
-    assert second.target_stage == AgentStage.engineer_agent
+    assert second.target_stage == AgentStage.qa_agent
     assert second.workflow_context is not None
     assert second.workflow_context.handoff_target == AgentStage.engineer_agent
     assert "resume_pm_from_checkpoint" in second.routing_signals
     assert "handoff_ready_engineer" in second.routing_signals
+    assert "handoff_ready_qa" in second.routing_signals
 
 
 def test_runtime_resumes_blocked_architect_state_on_same_thread(
@@ -690,6 +722,16 @@ def test_runtime_resumes_blocked_architect_state_on_same_thread(
         }
 
     monkeypatch.setattr("app.graphs.reasoning_graph.architect_agent_node", _architect_node)
+    monkeypatch.setattr(
+        "app.graphs.reasoning_graph.engineer_agent_node",
+        lambda state: {
+            "current_stage": "engineer_agent",
+            "target_stage": AgentStage.qa_agent,
+            "implementation_status": ImplementationStatus.completed,
+            "routing_signals": list(state.get("routing_signals") or []) + ["handoff_ready_qa"],
+            "final_workflow_json": state.get("final_workflow_json") or {"nodes": [{"id": "an_1"}], "connections": {}},
+        },
+    )
 
     run_config = {"configurable": {"thread_id": "thread-architect-resume-1"}}
     first = runtime.run(
@@ -709,7 +751,9 @@ def test_runtime_resumes_blocked_architect_state_on_same_thread(
         existing_workflow=None,
         run_config=run_config,
     )
-    assert second.current_stage == "architect_agent"
+    assert second.current_stage == "engineer_agent"
     assert second.architect_status == ArchitectStatus.architect_completed
-    assert second.target_stage == AgentStage.engineer_agent
+    assert second.target_stage == AgentStage.qa_agent
     assert "resume_architect_from_checkpoint" in second.routing_signals
+    assert "handoff_ready_engineer" in second.routing_signals
+    assert "handoff_ready_qa" in second.routing_signals

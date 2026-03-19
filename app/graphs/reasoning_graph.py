@@ -265,6 +265,19 @@ def _route_after_product_manager(state: MultiAgentGraphState) -> str:
     return "end"
 
 
+def _route_after_architect(state: MultiAgentGraphState) -> str:
+    architect_status = _normalize_architect_status(state.get("architect_status"))
+    workflow_context = _model_or_none(state.get("workflow_context"), WorkflowContext)
+    if (
+        architect_status == ArchitectStatus.architect_completed
+        and workflow_context is not None
+        and workflow_context.planning_ready
+        and workflow_context.handoff_target == AgentStage.engineer_agent
+    ):
+        return "engineer_agent"
+    return "end"
+
+
 class ReasoningGraphRuntime:
     """Entry graph runtime for multi-agent routing and stage handoff."""
 
@@ -316,7 +329,14 @@ class ReasoningGraphRuntime:
                 "end": END,
             },
         )
-        graph.add_edge("architect_agent", END)
+        graph.add_conditional_edges(
+            "architect_agent",
+            _route_after_architect,
+            {
+                "engineer_agent": "engineer_agent",
+                "end": END,
+            },
+        )
         graph.add_edge("consultant_agent", END)
         graph.add_edge("engineer_agent", END)
         graph.add_edge("qa_agent", END)
@@ -414,14 +434,20 @@ class ReasoningGraphRuntime:
                 current.update(self._product_manager_node(current))
                 if _route_after_product_manager(current) == "architect_agent":
                     current.update(self._architect_node(current))
+                    if _route_after_architect(current) == "engineer_agent":
+                        current.update(self._engineer_node(current))
         elif route == "consultant_agent":
             current.update(self._consultant_node(current))
         elif route == "product_manager_agent":
             current.update(self._product_manager_node(current))
             if _route_after_product_manager(current) == "architect_agent":
                 current.update(self._architect_node(current))
+                if _route_after_architect(current) == "engineer_agent":
+                    current.update(self._engineer_node(current))
         elif route == "architect_agent":
             current.update(self._architect_node(current))
+            if _route_after_architect(current) == "engineer_agent":
+                current.update(self._engineer_node(current))
         elif route == "engineer_agent":
             current.update(self._engineer_node(current))
         elif route == "qa_agent":
