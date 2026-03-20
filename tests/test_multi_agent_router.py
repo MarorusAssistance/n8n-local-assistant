@@ -7,6 +7,7 @@ from app.graphs.nodes import multi_agent_router
 
 
 def _route_with_heuristics(monkeypatch: pytest.MonkeyPatch, query: str):
+    monkeypatch.setattr(multi_agent_router.settings, "ROUTER_USE_LLM", True, raising=False)
     monkeypatch.setattr(
         multi_agent_router,
         "_classify_with_structured_output",
@@ -24,6 +25,7 @@ def _route_with_heuristics(monkeypatch: pytest.MonkeyPatch, query: str):
         ("Create a new automation to capture webhook orders and store them in a database.", EntryIntent.workflow_build_request, AgentStage.product_manager_agent),
         ("Build a new workflow from scratch for invoice approvals.", EntryIntent.workflow_build_request, AgentStage.product_manager_agent),
         ("Set up a workflow that reads emails and writes rows to Google Sheets.", EntryIntent.workflow_build_request, AgentStage.product_manager_agent),
+        ("Crea un workflow para coger los emails que vaya recibiendo y clasificarlos por urgencia.", EntryIntent.workflow_build_request, AgentStage.product_manager_agent),
         ("Modify this workflow to add Slack notifications after payment is confirmed.", EntryIntent.workflow_edit_request, AgentStage.engineer_agent),
         ("Update the existing workflow node mapping to include customer_id.", EntryIntent.workflow_edit_request, AgentStage.engineer_agent),
         ("Change current workflow behavior so it retries only once.", EntryIntent.workflow_edit_request, AgentStage.engineer_agent),
@@ -148,3 +150,19 @@ def test_router_short_ambiguous_input_adds_unknown_signals(monkeypatch: pytest.M
     assert result.target_stage is None
     assert "fallback_unknown" in result.routing_signals
     assert result.missing_user_inputs
+
+
+def test_router_respects_router_use_llm_false_for_spanish_build_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(multi_agent_router.settings, "ROUTER_USE_LLM", False, raising=False)
+    monkeypatch.setattr(
+        multi_agent_router,
+        "_classify_with_structured_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("llm router should not run")),
+    )
+
+    result = multi_agent_router.route_entry_intent(
+        "crea un workflow para coger los emails que vaya recibiendo y que los clasifique por nivel de urgencia con IA"
+    )
+
+    assert result.entry_intent == EntryIntent.workflow_build_request
+    assert result.target_stage == AgentStage.product_manager_agent

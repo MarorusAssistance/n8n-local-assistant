@@ -58,6 +58,10 @@ def _client_with_store() -> tuple[TestClient, ChatService]:
     return TestClient(app), service
 
 
+def _read_temporal_result(service: ChatService) -> dict:
+    return json.loads(service._temporal_result_path.read_text(encoding="utf-8"))  # noqa: SLF001
+
+
 def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un workflow",
@@ -589,7 +593,8 @@ def test_docs_only_uses_langgraph_reasoning_runtime_when_enabled(monkeypatch) ->
     assert response.status_code == 200
     payload = response.json()
     content = payload["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
+    assert content == "Aqui lo tienes: http://localhost:5678/workflow/wf_architect_1"
+    parsed = _read_temporal_result(service)
     assert parsed["entry_intent"] == "business_discovery_conversation"
     assert parsed["target_stage"] == "engineer_agent"
     assert parsed["current_stage"] == "architect_agent"
@@ -659,7 +664,8 @@ def test_reasoning_payload_hides_pm_legacy_node_fields(monkeypatch) -> None:
     assert response.status_code == 200
     payload = response.json()
     content = payload["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
+    assert content == "He dejado el plan listo para la siguiente fase."
+    parsed = _read_temporal_result(service)
     assert "required_nodes" not in parsed["architecture_plan"]
     assert "pm_stage_selections" not in parsed
     assert "proposed_nodes" not in parsed
@@ -686,7 +692,8 @@ def test_reasoning_payload_includes_engineer_fields_when_engineer_stage_runs(mon
         },
     )
     assert response.status_code == 200
-    parsed = json.loads(response.json()["choices"][0]["message"]["content"])
+    assert response.json()["choices"][0]["message"]["content"] == "Aqui lo tienes: http://localhost:5678/workflow/wf_200"
+    parsed = _read_temporal_result(service)
     assert parsed["current_stage"] == "engineer_agent"
     assert parsed["workflow_draft"]["nodes"]
     assert parsed["workflow_versions"]
@@ -698,6 +705,79 @@ def test_reasoning_payload_includes_engineer_fields_when_engineer_stage_runs(mon
     assert parsed["workflow_persisted"] is True
     assert parsed["workflow_reference"]["id"] == "wf_200"
     assert "final_workflow_json" not in parsed
+
+
+def test_reasoning_shows_only_questions_when_agents_need_user_input(monkeypatch) -> None:
+    client, service = _client_with_store()
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", False, raising=False)
+
+    result = _fake_engineer_reasoning_result().model_copy(
+        update={
+            "missing_user_inputs": ["Provide credential reference"],
+            "implementation_status": ImplementationStatus.blocked_waiting_user,
+        }
+    )
+    monkeypatch.setattr(
+        service._graph_runtime,
+        "run_reasoning",
+        lambda **kwargs: result,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local-model",
+            "messages": [{"role": "user", "content": "Continue workflow"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "Provide credential reference"
+    parsed = _read_temporal_result(service)
+    assert parsed["missing_user_inputs"] == ["Provide credential reference"]
+    assert parsed["workflow_reference"]["id"] == "wf_200"
+
+
+def test_reasoning_shows_info_message_when_architect_cannot_create_workflow(monkeypatch) -> None:
+    client, service = _client_with_store()
+    monkeypatch.setattr(settings, "AGENT_RUNTIME", "langgraph", raising=False)
+    monkeypatch.setattr(settings, "LANGGRAPH_REASONING_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "REASONING_PIPELINE_ENABLED", False, raising=False)
+
+    result = _fake_reasoning_result().model_copy(
+        update={
+            "target_stage": None,
+            "architect_status": ArchitectStatus.architect_failed_no_solution,
+            "workflow_persisted": False,
+            "workflow_persist_action": None,
+            "active_workflow_id": None,
+            "active_workflow_name": None,
+            "active_workflow_url": None,
+            "architect_notes": ["No valid node candidates found for stage_escalation."],
+        }
+    )
+    monkeypatch.setattr(
+        service._graph_runtime,
+        "run_reasoning",
+        lambda **kwargs: result,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "local-model",
+            "messages": [{"role": "user", "content": "Crea un workflow"}],
+        },
+    )
+
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert "No se pudo crear el workflow" in content
+    parsed = _read_temporal_result(service)
+    assert parsed["architect_status"] == "architect_failed_no_solution"
+    assert parsed["workflow_persisted"] is False
 
 
 def test_reasoning_consultant_returns_plain_text_content(monkeypatch) -> None:

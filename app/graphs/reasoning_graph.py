@@ -18,6 +18,7 @@ from ..features.reasoning.multi_agent_contracts import (
     ConsultantRetrievalResult,
     ConsultantSource,
     ConsultantToolUsage,
+    DecisionSlot,
     EntryIntent,
     ImplementationQueueItem,
     ImplementationStatus,
@@ -519,6 +520,12 @@ class ReasoningGraphRuntime:
 
         return MultiAgentGraphResult(
             user_query=state.get("user_query") or "",
+            request_context_query=(
+                str(state.get("request_context_query")).strip()
+                if isinstance(state.get("request_context_query"), str)
+                and str(state.get("request_context_query")).strip()
+                else (state.get("user_query") or "")
+            ),
             entry_intent=entry_intent,
             target_stage=target_stage_enum,
             confidence=float(state.get("confidence", 0.0)),
@@ -547,6 +554,72 @@ class ReasoningGraphRuntime:
             selection_reason=state.get("selection_reason"),
             architecture_plan=architecture_plan,
             workflow_context=workflow_context,
+            pending_decision_slots=(
+                _model_list(state.get("pending_decision_slots"), DecisionSlot)
+                or (
+                    list(workflow_context.pending_decision_slots)
+                    if workflow_context is not None
+                    else []
+                )
+            ),
+            resolved_decision_slots=(
+                _model_list(state.get("resolved_decision_slots"), DecisionSlot)
+                or (
+                    list(workflow_context.resolved_decision_slots)
+                    if workflow_context is not None
+                    else []
+                )
+            ),
+            clarification_owner=(
+                AgentStage(state.get("clarification_owner"))
+                if isinstance(state.get("clarification_owner"), str)
+                and str(state.get("clarification_owner")).strip() in {item.value for item in AgentStage}
+                else (
+                    state.get("clarification_owner")
+                    if isinstance(state.get("clarification_owner"), AgentStage)
+                    else (
+                        workflow_context.clarification_owner
+                        if workflow_context is not None
+                        else None
+                    )
+                )
+            ),
+            clarification_reason=(
+                str(state.get("clarification_reason")).strip()
+                if isinstance(state.get("clarification_reason"), str) and str(state.get("clarification_reason")).strip()
+                else (
+                    workflow_context.clarification_reason
+                    if workflow_context is not None
+                    else None
+                )
+            ),
+            last_block_cause=(
+                str(state.get("last_block_cause")).strip()
+                if isinstance(state.get("last_block_cause"), str) and str(state.get("last_block_cause")).strip()
+                else (
+                    workflow_context.last_block_cause
+                    if workflow_context is not None
+                    else None
+                )
+            ),
+            stage_bundle_map=(
+                dict(state.get("stage_bundle_map"))
+                if isinstance(state.get("stage_bundle_map"), dict)
+                else (
+                    dict(workflow_context.stage_bundle_map)
+                    if workflow_context is not None
+                    else {}
+                )
+            ),
+            evidence_fingerprints=(
+                dict(state.get("evidence_fingerprints"))
+                if isinstance(state.get("evidence_fingerprints"), dict)
+                else (
+                    dict(workflow_context.evidence_fingerprints)
+                    if workflow_context is not None
+                    else {}
+                )
+            ),
             planning_summary=state.get("planning_summary"),
             pm_status=pm_status,
             pm_stage_plan=_model_list(state.get("pm_stage_plan"), PMStagePlan),
@@ -659,6 +732,17 @@ class ReasoningGraphRuntime:
         if resume_from_blocked and isinstance(previous_state, dict):
             state: MultiAgentGraphState = dict(previous_state)
             state["user_query"] = user_prompt or ""
+            state["request_context_query"] = (
+                str(previous_state.get("request_context_query")).strip()
+                if isinstance(previous_state.get("request_context_query"), str)
+                and str(previous_state.get("request_context_query")).strip()
+                else (
+                    str(previous_state.get("user_query")).strip()
+                    if isinstance(previous_state.get("user_query"), str)
+                    and str(previous_state.get("user_query")).strip()
+                    else str(user_prompt or "").strip()
+                )
+            )
             state["runtime_context"] = {
                 "model": model,
                 "request_id": request_id,
@@ -670,6 +754,7 @@ class ReasoningGraphRuntime:
         else:
             state = {
                 "user_query": user_prompt or "",
+                "request_context_query": user_prompt or "",
                 "entry_intent": EntryIntent.unknown,
                 "target_stage": None,
                 "confidence": 0.0,
@@ -688,6 +773,13 @@ class ReasoningGraphRuntime:
                 "alternative_use_cases": [],
                 "selection_reason": None,
                 "workflow_context": None,
+                "pending_decision_slots": [],
+                "resolved_decision_slots": [],
+                "clarification_owner": None,
+                "clarification_reason": None,
+                "last_block_cause": None,
+                "stage_bundle_map": {},
+                "evidence_fingerprints": {},
                 "architecture_plan": None,
                 "planning_summary": None,
                 "pm_status": None,

@@ -9,10 +9,13 @@ from app.features.reasoning.multi_agent_contracts import (
     ArchitectureDataFlowItem,
     ArchitecturePlan,
     ArchitectureStage,
+    BlockedNode,
     EntryIntent,
     ImplementationStatus,
+    MissingUserInput,
     NodeRequirement,
     ProposedNode,
+    StageKind,
     WorkflowContext,
     WorkflowDraft,
     WorkflowDraftConnection,
@@ -23,6 +26,7 @@ from app.graphs.nodes.engineer_agent import (
     DeveloperCredentialDefinition,
     DeveloperNodeDefinition,
     DeveloperParameterDefinition,
+    NodeImplementationDecision,
     engineer_agent_node,
     get_node_definition,
 )
@@ -194,11 +198,18 @@ def _node_def(
     node_type: str,
     *,
     required_params: List[str] | None = None,
+    param_defaults: Dict[str, Any] | None = None,
     credential_types: List[str] | None = None,
     type_version: int = 1,
 ) -> DeveloperNodeDefinition:
+    defaults = param_defaults or {}
     params = [
-        DeveloperParameterDefinition(name=name, required=True, description=f"Required param {name}")
+        DeveloperParameterDefinition(
+            name=name,
+            required=True,
+            description=f"Required param {name}",
+            default_value=defaults.get(name),
+        )
         for name in (required_params or [])
     ]
     return DeveloperNodeDefinition(
@@ -223,6 +234,7 @@ def _stub_definition_lookups(
         defs[node_type] = _node_def(
             node_type,
             required_params=spec.get("required_params", []),
+            param_defaults=spec.get("param_defaults", {}),
             credential_types=spec.get("credential_types", []),
             type_version=spec.get("type_version", 1),
         )
@@ -328,7 +340,51 @@ def test_engineer_success_with_existing_known_parameters(monkeypatch: pytest.Mon
     updates = engineer_agent_node(state)
 
     assert updates["implementation_status"] == ImplementationStatus.completed
-    assert updates["workflow_draft"].nodes[0].parameters_known["url"] == "https://api.example.com"
+
+
+def test_engineer_does_not_store_freeform_text_as_credential_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.googleSheets": {
+                "credential_types": ["googleSheetsOAuth2Api"],
+                "credential_display_names": {"googleSheetsOAuth2Api": "Google Sheets OAuth2 API"},
+            },
+        },
+    )
+
+    state = _state(
+        ["n8n-nodes-base.googleSheets"],
+        user_query=(
+            "No tengo mas datos tecnicos. Si te falta alguna credencial o parametro no critico, "
+            "usa defaults razonables y continua."
+        ),
+        extra={
+            "resume_requested": True,
+            "missing_user_inputs": [
+                "Indica la referencia de credencial que debe usar el nodo 'an_1' para 'Google Sheets OAuth2 API'."
+            ],
+            "missing_user_input_details": [
+                MissingUserInput(
+                    input_id="credential:an_1:googleSheetsOAuth2Api",
+                    input_key="credential:an_1:googleSheetsOAuth2Api",
+                    missing_item="googleSheetsOAuth2Api",
+                    reason="Credential is required.",
+                    blocking_node_id="an_1",
+                    category="credential",
+                    question="Indica la referencia de credencial.",
+                )
+            ],
+        },
+    )
+
+    updates = engineer_agent_node(state)
+    node = updates["workflow_draft"].nodes[0]
+
+    assert node.credential_refs == {}
+    assert not any("Applied freeform user response" in note for note in updates["engineer_notes"])
 
 
 @pytest.mark.parametrize(
@@ -456,6 +512,175 @@ def test_engineer_resume_after_credential_block(monkeypatch: pytest.MonkeyPatch)
 
     assert second["implementation_status"] == ImplementationStatus.completed
     assert second["workflow_draft"].nodes[0].credential_refs["googleSheetsOAuth2Api"] == "cred_google"
+
+
+def test_engineer_rephrases_pending_question_in_spanish_without_consuming_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {"n8n-nodes-base.googleSheets": {"credential_types": ["googleSheetsOAuth2Api"]}},
+    )
+
+    initial = _state(["n8n-nodes-base.googleSheets"])
+    first = engineer_agent_node(initial)
+
+    assert first["implementation_status"] == ImplementationStatus.blocked_waiting_user
+
+    resumed = dict(initial)
+    resumed.update(first)
+    resumed["user_query"] = "No entiendo la pregunta, me la puedes hacer en espanol?"
+    resumed["resume_requested"] = True
+    second = engineer_agent_node(resumed)
+
+    assert second["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert second["missing_user_input_details"][0].question.startswith("Indica la referencia de credencial")
+    assert "engineer_question_rephrased" in second["routing_signals"]
+
+
+def test_engineer_default_continue_uses_schema_default_for_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.httpRequest": {
+                "required_params": ["method", "responseFormat"],
+                "param_defaults": {"method": "GET", "responseFormat": "json"},
+            }
+        },
+    )
+
+    initial = _state(["n8n-nodes-base.httpRequest"])
+    first = engineer_agent_node(initial)
+
+    assert first["implementation_status"] == ImplementationStatus.blocked_waiting_user
+
+    resumed = dict(initial)
+    resumed.update(first)
+    resumed["user_query"] = "usa default"
+    resumed["resume_requested"] = True
+    second = engineer_agent_node(resumed)
+
+    assert second["implementation_status"] == ImplementationStatus.completed
+    assert second["workflow_draft"].nodes[0].parameters_inferred["method"] == "GET"
+    assert second["workflow_draft"].nodes[0].parameters_inferred["responseFormat"] == "json"
+    assert second["missing_user_input_details"] == []
+    assert "parameter:an_1:method" in second["workflow_draft"].metadata["defaulted_input_keys"]
+
+
+def test_engineer_default_continue_leaves_missing_credential_empty_and_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.googleSheets": {
+                "required_params": ["sheetName"],
+                "param_defaults": {"sheetName": "Sheet1"},
+                "credential_types": ["googleSheetsOAuth2Api", "googleDriveOAuth2Api"],
+            }
+        },
+    )
+
+    initial = _state(["n8n-nodes-base.googleSheets"])
+    first = engineer_agent_node(initial)
+
+    assert first["implementation_status"] == ImplementationStatus.blocked_waiting_user
+
+    resumed = dict(initial)
+    resumed.update(first)
+    resumed["user_query"] = "lo que veas"
+    resumed["resume_requested"] = True
+    second = engineer_agent_node(resumed)
+
+    node = second["workflow_draft"].nodes[0]
+    warnings = second["workflow_draft"].metadata["developer_warnings"]
+
+    assert second["implementation_status"] == ImplementationStatus.completed
+    assert node.credential_refs == {}
+    assert "credential_unresolved_after_user_declined:googleSheetsOAuth2Api" in node.notes
+    assert any("googleSheetsOAuth2Api" in item for item in warnings)
+    assert second["missing_user_input_details"] == []
+
+
+def test_engineer_strips_invented_credential_refs_from_structured_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.mistralAi": {
+                "credential_types": ["mistralCloudApi"],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        engineer_mod,
+        "_decide_node_implementation_with_structured_output",
+        lambda **_kwargs: NodeImplementationDecision(
+            parameters_known={},
+            parameters_inferred={},
+            parameters_unresolved=[],
+            credential_refs={
+                "mistralCloudApi": "MISSING",
+                "can_apply": "true",
+            },
+            missing_inputs=[],
+            variable_outputs=[],
+            notes=["bogus_credential_ref"],
+            can_apply=False,
+        ),
+    )
+
+    updates = engineer_agent_node(_state(["n8n-nodes-base.mistralAi"]))
+    node = updates["workflow_draft"].nodes[0]
+
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert node.credential_refs == {}
+    assert all(item.category == "credential" for item in updates["missing_user_input_details"])
+    assert updates["missing_user_input_details"][0].missing_item == "mistralCloudApi"
+
+
+def test_engineer_default_continue_preserves_unresolved_behavior_param_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {"n8n-nodes-base.cron": {"credential_types": ["dummyCredential"]}},
+    )
+    monkeypatch.setattr(
+        engineer_mod,
+        "_decide_node_implementation_with_structured_output",
+        lambda **_kwargs: NodeImplementationDecision(
+            parameters_known={},
+            parameters_inferred={"triggerTimes.item.mode": "everyHour"},
+            parameters_unresolved=[],
+            credential_refs={},
+            missing_inputs=[],
+            variable_outputs=[],
+            notes=["test_behavior_inference"],
+            can_apply=True,
+        ),
+    )
+
+    initial = _state(["n8n-nodes-base.cron"])
+    first = engineer_agent_node(initial)
+
+    assert first["implementation_status"] == ImplementationStatus.blocked_waiting_user
+
+    resumed = dict(initial)
+    resumed.update(first)
+    resumed["user_query"] = "hazlo tú"
+    resumed["resume_requested"] = True
+    second = engineer_agent_node(resumed)
+
+    node = second["workflow_draft"].nodes[0]
+
+    assert second["implementation_status"] == ImplementationStatus.completed
+    assert "triggerTimes.item.mode" in node.parameters_unresolved
+    assert "left_unresolved_after_user_declined:triggerTimes.item.mode" in node.notes
+    assert second["missing_user_input_details"] == []
 
 
 @pytest.mark.parametrize(
@@ -602,3 +827,273 @@ def test_engineer_relies_on_definition_lookup_not_hardcoded_heuristics(
 
     assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
     assert updates["missing_user_input_details"][0].missing_item == "customUrl"
+
+
+def test_engineer_blocks_when_architect_handoff_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.webhook": {},
+            "n8n-nodes-base.set": {},
+        },
+    )
+
+    state = _state(["n8n-nodes-base.webhook", "n8n-nodes-base.set"])
+    state["proposed_nodes"] = state["proposed_nodes"][:1]
+    state["workflow_draft"].nodes = state["workflow_draft"].nodes[:1]
+    state["workflow_draft"].connections = []
+
+    updates = engineer_agent_node(state)
+
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert "engineer_incomplete_architect_handoff" in updates["routing_signals"]
+    assert updates["missing_user_input_details"][0].category == "handoff"
+
+
+def test_engineer_blocks_when_source_update_handoff_lacks_concrete_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.gmailTrigger": {},
+            "n8n-nodes-base.gmail": {"required_params": ["resource", "operation"]},
+        },
+    )
+
+    state = _state(["n8n-nodes-base.gmailTrigger", "n8n-nodes-base.gmail"])
+    state["architecture_plan"].stages[1].stage_kind = StageKind.apply_update_source
+    state["architecture_plan"].stages[1].purpose = "Apply the urgency result back onto Gmail."
+    state["architecture_plan"].stages[1].target_entity = "gmail"
+
+    updates = engineer_agent_node(state)
+
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert "engineer_incomplete_architect_handoff" in updates["routing_signals"]
+    assert updates["missing_user_input_details"][0].category == "handoff"
+
+
+def test_engineer_blocks_multipurpose_action_nodes_without_material_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.gmailTrigger": {},
+            "n8n-nodes-base.gmail": {"required_params": ["resource", "operation"]},
+        },
+    )
+
+    state = _state(["n8n-nodes-base.gmailTrigger", "n8n-nodes-base.gmail"])
+    stage = state["architecture_plan"].stages[1]
+    stage.stage_kind = StageKind.apply_update_source
+    stage.purpose = "Apply an urgency label to the Gmail message."
+    stage.target_entity = "gmail"
+    hints = {
+        "semantic_action": "apply_label",
+        "require_action_selection": True,
+        "required_parameter_keys": ["resource", "operation"],
+        "allow_inferred_parameter_keys": ["resource", "operation"],
+        "selector_guidance": "Configure this node to apply a label to the source Gmail message.",
+    }
+    state["proposed_nodes"][1].implementation_hints = dict(hints)
+    state["workflow_draft"].nodes[1].implementation_hints = dict(hints)
+
+    def _decide(**kwargs):
+        queue_item = kwargs["queue_item"]
+        if queue_item.node_type == "n8n-nodes-base.gmailTrigger":
+            return NodeImplementationDecision(
+                parameters_known={},
+                parameters_inferred={},
+                parameters_unresolved=[],
+                credential_refs={},
+                missing_inputs=[],
+                variable_outputs=[],
+                notes=["trigger_ok"],
+                can_apply=True,
+            )
+        return NodeImplementationDecision(
+            parameters_known={},
+            parameters_inferred={},
+            parameters_unresolved=[],
+            credential_refs={},
+            missing_inputs=[],
+            variable_outputs=[],
+            notes=["gmail_missing_operation"],
+            can_apply=True,
+        )
+
+    monkeypatch.setattr(engineer_mod, "_decide_node_implementation_with_structured_output", _decide)
+
+    updates = engineer_agent_node(state)
+
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert {item.missing_item for item in updates["missing_user_input_details"]} >= {"resource", "operation"}
+
+
+def test_engineer_allows_inferred_action_selectors_when_architect_resolved_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.gmailTrigger": {},
+            "n8n-nodes-base.gmail": {"required_params": ["resource", "operation"]},
+        },
+    )
+
+    state = _state(["n8n-nodes-base.gmailTrigger", "n8n-nodes-base.gmail"])
+    stage = state["architecture_plan"].stages[1]
+    stage.stage_kind = StageKind.apply_update_source
+    stage.purpose = "Apply an urgency label to the Gmail message."
+    stage.target_entity = "gmail"
+    hints = {
+        "semantic_action": "apply_label",
+        "require_action_selection": True,
+        "required_parameter_keys": ["resource", "operation"],
+        "allow_inferred_parameter_keys": ["resource", "operation"],
+        "selector_guidance": "Configure this node to apply a label to the source Gmail message.",
+    }
+    state["proposed_nodes"][1].implementation_hints = dict(hints)
+    state["workflow_draft"].nodes[1].implementation_hints = dict(hints)
+
+    def _decide(**kwargs):
+        queue_item = kwargs["queue_item"]
+        if queue_item.node_type == "n8n-nodes-base.gmailTrigger":
+            return NodeImplementationDecision(
+                parameters_known={},
+                parameters_inferred={},
+                parameters_unresolved=[],
+                credential_refs={},
+                missing_inputs=[],
+                variable_outputs=[],
+                notes=["trigger_ok"],
+                can_apply=True,
+            )
+        return NodeImplementationDecision(
+            parameters_known={},
+            parameters_inferred={"resource": "message", "operation": "addLabel"},
+            parameters_unresolved=[],
+            credential_refs={},
+            missing_inputs=[],
+            variable_outputs=[],
+            notes=["gmail_apply_label"],
+            can_apply=True,
+        )
+
+    monkeypatch.setattr(engineer_mod, "_decide_node_implementation_with_structured_output", _decide)
+
+    updates = engineer_agent_node(state)
+
+    assert updates["implementation_status"] == ImplementationStatus.completed
+    gmail_node = updates["workflow_draft"].nodes[1]
+    assert gmail_node.parameters_inferred["resource"] == "message"
+    assert gmail_node.parameters_inferred["operation"] == "addLabel"
+
+
+def test_engineer_default_continue_infers_gmail_apply_label_action_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {
+            "n8n-nodes-base.gmailTrigger": {},
+            "n8n-nodes-base.gmail": {"required_params": ["resource", "operation"]},
+        },
+    )
+
+    state = _state(["n8n-nodes-base.gmailTrigger", "n8n-nodes-base.gmail"])
+    stage = state["architecture_plan"].stages[1]
+    stage.stage_kind = StageKind.apply_update_source
+    stage.purpose = "Apply an urgency label to the Gmail message."
+    stage.target_entity = "gmail"
+    hints = {
+        "semantic_action": "apply_label",
+        "require_action_selection": True,
+        "required_parameter_keys": ["resource", "operation"],
+        "allow_inferred_parameter_keys": ["resource", "operation"],
+        "preferred_resource": "message",
+        "selector_guidance": "Configure this node to apply a label to the source Gmail message.",
+    }
+    state["proposed_nodes"][1].implementation_hints = dict(hints)
+    state["workflow_draft"].nodes[1].implementation_hints = dict(hints)
+    state["workflow_draft"].metadata["developer_default_continue_requested"] = True
+    state["blocked_nodes"] = [
+        BlockedNode(
+            queue_id="stage_apply_gmail",
+            node_type="n8n-nodes-base.gmail",
+            reason="Need action selectors.",
+            missing_input_ids=[
+                "parameter:stage_apply_gmail:resource",
+                "parameter:stage_apply_gmail:operation",
+            ],
+        )
+    ]
+
+    def _decide(**kwargs):
+        queue_item = kwargs["queue_item"]
+        if queue_item.node_type == "n8n-nodes-base.gmailTrigger":
+            return NodeImplementationDecision(
+                parameters_known={},
+                parameters_inferred={},
+                parameters_unresolved=[],
+                credential_refs={},
+                missing_inputs=[],
+                variable_outputs=[],
+                notes=["trigger_ok"],
+                can_apply=True,
+            )
+        return NodeImplementationDecision(
+            parameters_known={},
+            parameters_inferred={},
+            parameters_unresolved=[],
+            credential_refs={},
+            missing_inputs=[],
+            variable_outputs=[],
+            notes=["gmail_missing_operation"],
+            can_apply=True,
+        )
+
+    monkeypatch.setattr(engineer_mod, "_decide_node_implementation_with_structured_output", _decide)
+
+    updates = engineer_agent_node(state)
+
+    assert updates["implementation_status"] == ImplementationStatus.completed
+    gmail_node = updates["workflow_draft"].nodes[1]
+    assert gmail_node.parameters_inferred["resource"] == "message"
+    assert gmail_node.parameters_inferred["operation"] == "addLabel"
+    assert "resource" not in gmail_node.parameters_unresolved
+    assert "operation" not in gmail_node.parameters_unresolved
+    assert "defaulted_after_user_declined:resource" in gmail_node.notes
+    assert "defaulted_after_user_declined:operation" in gmail_node.notes
+
+
+def test_engineer_blocks_behavior_defining_inferred_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_definition_lookups(
+        monkeypatch,
+        {"n8n-nodes-base.cron": {}},
+    )
+    monkeypatch.setattr(
+        engineer_mod,
+        "_decide_node_implementation_with_structured_output",
+        lambda **_kwargs: NodeImplementationDecision(
+            parameters_known={},
+            parameters_inferred={"triggerTimes.item.mode": "everyHour"},
+            parameters_unresolved=[],
+            credential_refs={},
+            missing_inputs=[],
+            variable_outputs=[],
+            notes=["test_behavior_inference"],
+            can_apply=True,
+        ),
+    )
+
+    updates = engineer_agent_node(_state(["n8n-nodes-base.cron"]))
+
+    assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
+    assert updates["missing_user_input_details"]
+    assert updates["missing_user_input_details"][0].missing_item == "triggerTimes.item.mode"

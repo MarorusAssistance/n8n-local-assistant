@@ -15,6 +15,7 @@ from ...features.reasoning.multi_agent_contracts import (
     ArchitecturePlan,
     ArchitectureStage,
     BlockedNode,
+    DecisionSlot,
     EntryIntent,
     ImplementationQueueItem,
     ImplementationStatus,
@@ -23,6 +24,7 @@ from ...features.reasoning.multi_agent_contracts import (
     NodeRequirement,
     ProposedNode,
     RequiredCredential,
+    StageKind,
     VariableDefinition,
     WorkflowDraft,
     WorkflowDraftConnection,
@@ -34,6 +36,11 @@ from ...llm import get_langchain_chat_model
 from ...observability import emit_llm_output_event, emit_llm_prompt_event, emit_trace_event
 from ...workflow.n8n_client import N8NClient, N8NClientError
 from ..multi_agent_state import MultiAgentGraphState
+from .question_utils import (
+    is_question_rephrase_request,
+    localize_question_list,
+    localize_question_text,
+)
 
 logger = logging.getLogger("n8n-assistant")
 trace_logger = logging.getLogger("n8n-assistant.trace")
@@ -47,6 +54,70 @@ _N8N_WORKFLOW_READ_ONLY_FIELDS = {
 }
 _NODE_DEFINITION_SOURCE = settings.LINKED_DEFS_NODES_SOURCE or "n8n-nodes"
 _CREDENTIAL_DEFINITION_SOURCE = settings.LINKED_DEFS_CREDENTIALS_SOURCE or "n8n-credentials"
+_BEHAVIOR_DEFINING_PARAM_HINTS = (
+    "schedule",
+    "trigger",
+    "cron",
+    "poll",
+    "interval",
+    "frequency",
+    "cadence",
+    "event",
+    "destination",
+    "target",
+    "route",
+    "routing",
+    "condition",
+    "model",
+    "provider",
+    "sheet",
+    "table",
+    "database",
+    "collection",
+    "bucket",
+    "folder",
+    "channel",
+    "queue",
+    "topic",
+    "path",
+    "filter",
+    "mailbox",
+    "resource",
+    "operation",
+    "action",
+)
+_DEFAULT_CONTINUE_HINTS = (
+    "use default",
+    "usa default",
+    "usa por defecto",
+    "por defecto",
+    "hazlo tu",
+    "hazlo tú",
+    "lo que veas",
+    "como veas",
+    "como quieras",
+    "haz lo que veas",
+    "decide tu",
+    "decide tú",
+    "whatever",
+    "up to you",
+    "you decide",
+)
+_UNAVAILABLE_RESPONSE_HINTS = (
+    "no se",
+    "no sé",
+    "ni idea",
+    "i don't know",
+    "dont know",
+    "do not know",
+    "no tengo",
+    "no puedo",
+    "prefiero no",
+    "no quiero responder",
+)
+_DEFAULT_CONTINUE_METADATA_KEY = "developer_default_continue_requested"
+_DEVELOPER_WARNINGS_METADATA_KEY = "developer_warnings"
+_DEFAULTED_INPUT_KEYS_METADATA_KEY = "defaulted_input_keys"
 
 
 class DeveloperParameterDefinition(BaseModel):
@@ -145,6 +216,28 @@ def _normalize_model(value: Any, cls: Any) -> Optional[Any]:
     return None
 
 
+def _request_context_query(
+    *,
+    state: MultiAgentGraphState,
+    architecture_plan: Optional[ArchitecturePlan],
+    current_user_query: str,
+) -> str:
+    explicit = str(state.get("request_context_query") or "").strip()
+    if explicit:
+        return _safe_text(explicit, max_chars=420)
+    if architecture_plan is not None:
+        for value in (
+            architecture_plan.business_objective,
+            architecture_plan.desired_outcome,
+            architecture_plan.title,
+            architecture_plan.workflow_summary,
+        ):
+            normalized = str(value or "").strip()
+            if normalized:
+                return _safe_text(normalized, max_chars=420)
+    return _safe_text(current_user_query, max_chars=420)
+
+
 def _normalize_list(values: Any, cls: Any) -> List[Any]:
     if not isinstance(values, list):
         return []
@@ -221,6 +314,7 @@ def _queue_item_trace_summary(queue_item: ImplementationQueueItem) -> Dict[str, 
         "expected_inputs": list(queue_item.expected_inputs),
         "expected_outputs": list(queue_item.expected_outputs),
         "purpose": _safe_text(queue_item.purpose, max_chars=220),
+        "implementation_hints": dict(queue_item.implementation_hints or {}),
     }
 
 
@@ -235,6 +329,34 @@ def _node_definition_trace_summary(node_definition: Optional[DeveloperNodeDefini
         "parameter_names": [item.name for item in node_definition.parameter_schema],
         "credential_types_required": list(node_definition.credential_types_required),
         "source_refs": list(node_definition.source_refs[:3]),
+    }
+
+
+def _node_definition_prompt_payload(node_definition: DeveloperNodeDefinition) -> Dict[str, Any]:
+    return {
+        "node_type": node_definition.node_type,
+        "display_name": node_definition.display_name,
+        "type_version": node_definition.type_version,
+        "summary": node_definition.summary,
+        "credential_types_required": list(node_definition.credential_types_required),
+        "source_refs": list(node_definition.source_refs[:3]),
+    }
+
+
+def _merged_implementation_hints(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: Optional[WorkflowDraftNode] = None,
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    if current_node is not None and isinstance(current_node.implementation_hints, dict):
+        merged.update(current_node.implementation_hints)
+    if isinstance(queue_item.implementation_hints, dict):
+        merged.update(queue_item.implementation_hints)
+    return {
+        str(key): value
+        for key, value in merged.items()
+        if str(key).strip()
     }
 
 
@@ -300,6 +422,7 @@ def _derive_proposed_nodes(
                 depends_on=list(node.dependencies),
                 expected_inputs=list(node.expected_inputs),
                 expected_outputs=list(node.expected_outputs),
+                implementation_hints=dict(node.implementation_hints or {}),
             )
             for node in workflow_draft.nodes
         ]
@@ -320,6 +443,7 @@ def _derive_proposed_nodes(
                 usable_as_tool=requirement.usable_as_tool,
                 has_main_input=requirement.has_main_input,
                 input_connection_types=list(requirement.input_connection_types),
+                implementation_hints={},
             )
         )
 
@@ -333,6 +457,7 @@ def _derive_proposed_nodes(
                 node_id=f"pn_{idx}",
                 node_type=node_type,
                 purpose=f"Derived from workflow context required node type '{node_type}'.",
+                implementation_hints={},
             )
         )
     return proposed
@@ -374,6 +499,7 @@ def _build_queue(
                 expected_inputs=list(node.expected_inputs),
                 expected_outputs=list(node.expected_outputs),
                 status="pending",
+                implementation_hints=dict(node.implementation_hints or {}),
             )
         )
     return queue
@@ -845,8 +971,18 @@ def _decision_prompt_payload(
     credential_requirements: List[DeveloperCredentialDefinition],
     upstream_variables: List[VariableDefinition],
     resolved_inputs: Dict[str, str],
+    resolved_decision_slots: List[DecisionSlot],
     downstream_queue_ids: List[str],
+    stage_bundle_map: Dict[str, List[str]],
 ) -> str:
+    stage_context = next(
+        (stage for stage in architecture_plan.stages if stage.id == queue_item.stage_id),
+        None,
+    )
+    implementation_hints = _merged_implementation_hints(
+        queue_item=queue_item,
+        current_node=current_node,
+    )
     return json.dumps(
         {
             "user_query": user_query,
@@ -854,17 +990,31 @@ def _decision_prompt_payload(
             "workflow_summary": architecture_plan.workflow_summary,
             "queue_item": queue_item.model_dump(mode="json"),
             "current_node": current_node.model_dump(mode="json"),
-            "node_definition": node_definition.model_dump(mode="json"),
+            "node_definition": _node_definition_prompt_payload(node_definition),
             "parameter_schema": [item.model_dump(mode="json") for item in parameter_schema],
             "credential_requirements": [item.model_dump(mode="json") for item in credential_requirements],
             "upstream_variables": [item.model_dump(mode="json") for item in upstream_variables],
             "resolved_inputs": resolved_inputs,
+            "resolved_decision_slots": [
+                {
+                    "slot_key": item.slot_key,
+                    "stage_id": item.stage_id,
+                    "answer": item.answer,
+                }
+                for item in resolved_decision_slots
+                if item.answer
+            ],
+            "stage_context": (stage_context.model_dump(mode="json") if stage_context is not None else None),
+            "stage_bundle_map": stage_bundle_map,
+            "implementation_hints": implementation_hints,
             "downstream_queue_ids": downstream_queue_ids,
             "rules": {
                 "do_not_invent_secrets": True,
                 "do_not_invent_ids_or_urls": True,
                 "preserve_existing_configuration": True,
                 "prefer_blocking_over_guessing": True,
+                "do_not_reopen_semantic_decisions": True,
+                "materialize_multipurpose_actions": True,
             },
         },
         ensure_ascii=True,
@@ -882,7 +1032,9 @@ def _decide_node_implementation_with_structured_output(
     credential_requirements: List[DeveloperCredentialDefinition],
     upstream_variables: List[VariableDefinition],
     resolved_inputs: Dict[str, str],
+    resolved_decision_slots: List[DecisionSlot],
     downstream_queue_ids: List[str],
+    stage_bundle_map: Dict[str, List[str]],
     model: Optional[str],
     request_id: Optional[str],
 ) -> NodeImplementationDecision:
@@ -890,6 +1042,7 @@ def _decide_node_implementation_with_structured_output(
         "You are the developer agent for an n8n workflow. Configure one node at a time using only the provided structured context. "
         "Do not redesign the workflow. Preserve ids, names, positions, and connections. "
         "Keep real user-confirmed values in parameters_known. Use parameters_inferred only for safe, non-sensitive values supported by the schema and workflow context. "
+        "When implementation_hints describe the node's semantic action, materialize that action through the node's real schema selectors instead of leaving the node generic. "
         "Never invent secrets, credential ids, endpoint URLs, resource identifiers, or business rules. "
         "If critical information is missing, set can_apply=false and return explicit missing_inputs."
     )
@@ -905,7 +1058,9 @@ def _decide_node_implementation_with_structured_output(
             credential_requirements=credential_requirements,
             upstream_variables=upstream_variables,
             resolved_inputs=resolved_inputs,
+            resolved_decision_slots=resolved_decision_slots,
             downstream_queue_ids=downstream_queue_ids,
+            stage_bundle_map=stage_bundle_map,
         ),
         output_model=NodeImplementationDecision,
         model=model,
@@ -1071,6 +1226,7 @@ def _missing_input(
     key_name: str,
     reason: str,
     question: Optional[str] = None,
+    slot_key: Optional[str] = None,
 ) -> MissingUserInput:
     input_key = f"{category}:{queue_id}:{key_name}"
     if not question and category == "credential":
@@ -1091,6 +1247,7 @@ def _missing_input(
         missing_item=key_name,
         reason=reason,
         blocking_node_id=queue_id,
+        slot_key=slot_key,
         category=category,
         question=_safe_text(question, max_chars=240),
     )
@@ -1104,6 +1261,34 @@ def _merge_missing_details(
     for item in additions:
         by_id[item.input_id] = item
     return list(by_id.values())
+
+
+def _localize_missing_details(
+    missing_details: List[MissingUserInput],
+    *,
+    user_query: str,
+    architecture_plan: Optional[ArchitecturePlan],
+) -> List[MissingUserInput]:
+    context_texts = []
+    if architecture_plan is not None:
+        context_texts.extend(
+            [
+                architecture_plan.title,
+                architecture_plan.business_objective,
+                architecture_plan.desired_outcome,
+                architecture_plan.workflow_summary,
+            ]
+        )
+    localized_questions = localize_question_list(
+        [item.question for item in missing_details],
+        user_query=user_query,
+        context_texts=context_texts,
+    )
+    localized: List[MissingUserInput] = []
+    for idx, item in enumerate(missing_details):
+        question = localized_questions[idx] if idx < len(localized_questions) else item.question
+        localized.append(item.model_copy(update={"question": question, "reason": question if item.category == "handoff" else item.reason}))
+    return localized
 
 
 def _queue_dependencies_met(
@@ -1216,6 +1401,539 @@ def _set_resolved_inputs(draft: WorkflowDraft, values: Dict[str, str]) -> None:
     draft.metadata["resolved_inputs"] = {str(key): str(value) for key, value in values.items()}
 
 
+def _draft_metadata_string_list(draft: WorkflowDraft, key: str) -> List[str]:
+    value = draft.metadata.get(key)
+    if isinstance(value, list):
+        return _safe_string_list(value)
+    return []
+
+
+def _append_draft_metadata_strings(draft: WorkflowDraft, key: str, values: Iterable[Any]) -> None:
+    existing = _draft_metadata_string_list(draft, key)
+    draft.metadata[key] = _safe_string_list(existing + list(values))
+
+
+def _default_continue_requested(draft: WorkflowDraft) -> bool:
+    value = draft.metadata.get(_DEFAULT_CONTINUE_METADATA_KEY)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _set_default_continue_requested(draft: WorkflowDraft, enabled: bool) -> None:
+    draft.metadata[_DEFAULT_CONTINUE_METADATA_KEY] = bool(enabled)
+
+
+def _text_indicates_default_continue(text: str) -> bool:
+    normalized = _safe_text(text, max_chars=320).lower()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _DEFAULT_CONTINUE_HINTS)
+
+
+def _text_indicates_unavailable_answer(text: str) -> bool:
+    normalized = _safe_text(text, max_chars=320).lower()
+    if not normalized:
+        return False
+    return any(hint in normalized for hint in _UNAVAILABLE_RESPONSE_HINTS)
+
+
+def _should_enable_default_continue(
+    *,
+    resume_requested: bool,
+    user_query: str,
+    missing_details: List[MissingUserInput],
+    resolved_from_input: Dict[str, str],
+) -> bool:
+    if not resume_requested or not missing_details or resolved_from_input:
+        return False
+    return _text_indicates_default_continue(user_query) or _text_indicates_unavailable_answer(user_query)
+
+
+def _should_keep_prompting_under_default_continue(item: MissingUserInput) -> bool:
+    return item.category not in {"parameter", "credential"}
+
+
+def _can_apply_freeform_answer(item: MissingUserInput) -> bool:
+    return item.category not in {"credential", "parameter"}
+
+
+def _credential_lookup_value(
+    *,
+    queue_id: str,
+    credential: DeveloperCredentialDefinition,
+    provided_values: Dict[str, str],
+) -> Optional[str]:
+    keys = [
+        f"credential:{queue_id}:{credential.credential_type}",
+        credential.credential_type,
+    ]
+    if credential.display_name:
+        keys.extend(
+            [
+                f"credential:{queue_id}:{credential.display_name}",
+                credential.display_name,
+            ]
+        )
+    for key in keys:
+        value = _lookup_user_value(key, provided_values)
+        if value:
+            return value
+    return None
+
+
+def _parameter_default_value(
+    *,
+    parameter_schema: List[DeveloperParameterDefinition],
+    key_name: str,
+) -> Any:
+    for item in parameter_schema:
+        if item.name != key_name:
+            continue
+        if item.default_value is None:
+            return None
+        return item.default_value
+    return None
+
+
+def _semantic_parameter_default_value(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    key_name: str,
+) -> Any:
+    hints = _merged_implementation_hints(queue_item=queue_item, current_node=current_node)
+    semantic_action = str(hints.get("semantic_action") or "").strip().lower()
+    preferred_resource = str(hints.get("preferred_resource") or "").strip()
+    node_signature = " ".join(
+        part.lower()
+        for part in (
+            queue_item.node_type,
+            current_node.node_type,
+            current_node.name,
+            str(hints.get("candidate_display_name") or ""),
+            str(hints.get("target_entity") or ""),
+        )
+        if part
+    )
+    if key_name == "resource" and preferred_resource:
+        return preferred_resource
+    if semantic_action == "apply_label" and "gmail" in node_signature:
+        if key_name == "resource":
+            return preferred_resource or "message"
+        if key_name in {"operation", "action"}:
+            return "addLabel"
+    return None
+
+
+def _allowed_inferred_parameter_keys(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+) -> set[str]:
+    hints = _merged_implementation_hints(queue_item=queue_item, current_node=current_node)
+    values = hints.get("allow_inferred_parameter_keys")
+    if not isinstance(values, list):
+        return set()
+    return {
+        str(item).strip()
+        for item in values
+        if str(item).strip()
+    }
+
+
+def _required_material_action_keys(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    parameter_schema: List[DeveloperParameterDefinition],
+) -> List[str]:
+    hints = _merged_implementation_hints(queue_item=queue_item, current_node=current_node)
+    configured = hints.get("required_parameter_keys")
+    if isinstance(configured, list):
+        explicit = [str(item).strip() for item in configured if str(item).strip()]
+        if explicit:
+            return explicit
+    schema_names = {item.name for item in parameter_schema}
+    return [
+        key
+        for key in ("resource", "operation", "action")
+        if key in schema_names
+    ]
+
+
+def _enforce_material_action_policy(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    parameter_schema: List[DeveloperParameterDefinition],
+    decision: NodeImplementationDecision,
+) -> NodeImplementationDecision:
+    hints = _merged_implementation_hints(queue_item=queue_item, current_node=current_node)
+    if not hints.get("require_action_selection"):
+        return decision
+
+    required_keys = _required_material_action_keys(
+        queue_item=queue_item,
+        current_node=current_node,
+        parameter_schema=parameter_schema,
+    )
+    if not required_keys:
+        return decision
+
+    merged_parameters: Dict[str, Any] = {}
+    merged_parameters.update(current_node.parameters_inferred)
+    merged_parameters.update(current_node.parameters_known)
+    merged_parameters.update(decision.parameters_inferred)
+    merged_parameters.update(decision.parameters_known)
+
+    missing_keys = [
+        key
+        for key in required_keys
+        if not str(merged_parameters.get(key, "") or "").strip()
+    ]
+    if not missing_keys:
+        return decision
+
+    semantic_action = str(hints.get("semantic_action") or "").strip()
+    selector_guidance = str(hints.get("selector_guidance") or "").strip()
+    parameters_unresolved = list(decision.parameters_unresolved)
+    missing_inputs = list(decision.missing_inputs)
+    notes = list(decision.notes)
+    for key in missing_keys:
+        if key not in parameters_unresolved:
+            parameters_unresolved.append(key)
+        missing_inputs.append(
+            DeveloperMissingInputDecision(
+                key_name=key,
+                category="parameter",
+                reason=(
+                    f"Node '{queue_item.queue_id}' still lacks the concrete action selector '{key}'"
+                    + (
+                        f" required to implement semantic action '{semantic_action}'."
+                        if semantic_action
+                        else "."
+                    )
+                ),
+                question=(
+                    selector_guidance
+                    or f"Confirm the concrete action that node '{queue_item.queue_id}' must execute."
+                ),
+            )
+        )
+    notes.append("blocked_missing_material_action")
+    return NodeImplementationDecision(
+        parameters_known=dict(decision.parameters_known),
+        parameters_inferred=dict(decision.parameters_inferred),
+        parameters_unresolved=_safe_string_list(parameters_unresolved),
+        credential_refs=dict(decision.credential_refs),
+        missing_inputs=_dedupe_missing_input_decisions(missing_inputs),
+        variable_outputs=list(decision.variable_outputs),
+        notes=_safe_string_list(notes),
+        can_apply=False,
+    )
+
+
+def _validate_architect_handoff(
+    *,
+    plan: ArchitecturePlan,
+    proposed_nodes: List[ProposedNode],
+    workflow_draft: WorkflowDraft,
+) -> List[str]:
+    materialized_stage_ids = {
+        str(item.stage_id).strip()
+        for item in proposed_nodes
+        if str(item.stage_id or "").strip()
+    }
+    materialized_stage_ids.update(
+        {
+            str(node.stage_id).strip()
+            for node in workflow_draft.nodes
+            if str(node.stage_id or "").strip()
+        }
+    )
+    issues: List[str] = []
+    for stage in plan.stages:
+        if stage.id not in materialized_stage_ids:
+            issues.append(
+                f"Architect handoff is incomplete: stage '{stage.id}' ({stage.name}) has no materialized node bundle."
+            )
+            continue
+        if stage.stage_kind != StageKind.apply_update_source:
+            continue
+        stage_nodes = [item for item in proposed_nodes if item.stage_id == stage.id]
+        if not stage_nodes:
+            continue
+        if any(
+            isinstance(item.implementation_hints, dict)
+            and item.implementation_hints.get("semantic_action")
+            for item in stage_nodes
+        ):
+            continue
+        issues.append(
+            f"Architect handoff is incomplete: stage '{stage.id}' ({stage.name}) selects a source-update node but does not define the concrete action that node must execute."
+        )
+    return _safe_string_list(issues)
+
+
+def _is_behavior_defining_parameter(param_name: str) -> bool:
+    lowered = str(param_name or "").strip().lower()
+    if not lowered:
+        return False
+    return any(hint in lowered for hint in _BEHAVIOR_DEFINING_PARAM_HINTS)
+
+
+def _dedupe_missing_input_decisions(
+    items: Iterable[DeveloperMissingInputDecision],
+) -> List[DeveloperMissingInputDecision]:
+    by_key: Dict[Tuple[str, str], DeveloperMissingInputDecision] = {}
+    for item in items:
+        key = (item.category, item.key_name)
+        by_key[key] = item
+    return list(by_key.values())
+
+
+def _enforce_safe_parameter_policy(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    decision: NodeImplementationDecision,
+    resolved_inputs: Dict[str, str],
+) -> NodeImplementationDecision:
+    parameters_known = dict(decision.parameters_known)
+    parameters_inferred = dict(decision.parameters_inferred)
+    parameters_unresolved = list(decision.parameters_unresolved)
+    missing_inputs = list(decision.missing_inputs)
+    notes = list(decision.notes)
+    blocked_keys: List[str] = []
+    allowed_inferred_keys = _allowed_inferred_parameter_keys(
+        queue_item=queue_item,
+        current_node=current_node,
+    )
+
+    for container in (parameters_known, parameters_inferred):
+        for param_name in list(container.keys()):
+            if not _is_behavior_defining_parameter(param_name):
+                continue
+            if param_name in allowed_inferred_keys:
+                continue
+            if param_name in current_node.parameters_known:
+                continue
+            supplied = (
+                _lookup_user_value(f"parameter:{queue_item.queue_id}:{param_name}", resolved_inputs)
+                or _lookup_user_value(param_name, resolved_inputs)
+            )
+            if supplied is not None:
+                continue
+            blocked_keys.append(param_name)
+            container.pop(param_name, None)
+            if param_name not in parameters_unresolved:
+                parameters_unresolved.append(param_name)
+            missing_inputs.append(
+                DeveloperMissingInputDecision(
+                    key_name=param_name,
+                    category="parameter",
+                    reason=(
+                        f"Parameter '{param_name}' defines the workflow's operational behavior and cannot be inferred safely."
+                    ),
+                    question=(
+                        f"Confirm the value for '{param_name}' required by node '{queue_item.queue_id}'."
+                    ),
+                )
+            )
+
+    if blocked_keys:
+        notes.append("blocked_behavior_defining_inference")
+
+    return NodeImplementationDecision(
+        parameters_known=parameters_known,
+        parameters_inferred=parameters_inferred,
+        parameters_unresolved=_safe_string_list(parameters_unresolved),
+        credential_refs=dict(decision.credential_refs),
+        missing_inputs=_dedupe_missing_input_decisions(missing_inputs),
+        variable_outputs=list(decision.variable_outputs),
+        notes=_safe_string_list(notes),
+        can_apply=bool(decision.can_apply) and not missing_inputs,
+    )
+
+
+def _enforce_credential_reference_policy(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    decision: NodeImplementationDecision,
+    credential_requirements: List[DeveloperCredentialDefinition],
+    resolved_inputs: Dict[str, str],
+    default_continue_enabled: bool,
+) -> NodeImplementationDecision:
+    credential_refs = dict(decision.credential_refs)
+    missing_inputs = list(decision.missing_inputs)
+    notes = list(decision.notes)
+    allowed_keys = set(current_node.credential_refs.keys())
+
+    for credential in credential_requirements:
+        canonical_key = credential.credential_type
+        allowed_keys.add(canonical_key)
+        if credential.display_name:
+            allowed_keys.add(credential.display_name)
+        existing_ref = (
+            current_node.credential_refs.get(canonical_key)
+            or (
+                current_node.credential_refs.get(credential.display_name or "")
+                if credential.display_name
+                else None
+            )
+        )
+        supplied_ref = _credential_lookup_value(
+            queue_id=queue_item.queue_id,
+            credential=credential,
+            provided_values=resolved_inputs,
+        )
+        if supplied_ref:
+            credential_refs[canonical_key] = supplied_ref
+            continue
+        if existing_ref:
+            credential_refs[canonical_key] = existing_ref
+            continue
+
+        credential_refs.pop(canonical_key, None)
+        if credential.display_name:
+            credential_refs.pop(credential.display_name, None)
+
+        already_missing = any(
+            item.category == "credential"
+            and item.key_name in {canonical_key, credential.display_name or canonical_key}
+            for item in missing_inputs
+        )
+        if default_continue_enabled:
+            if not already_missing:
+                missing_inputs.append(
+                    DeveloperMissingInputDecision(
+                        key_name=canonical_key,
+                        category="credential",
+                        reason=(
+                            f"Credential reference for '{credential.display_name or canonical_key}' is still missing after the user declined to provide it."
+                        ),
+                        question=(
+                            f"Provide the credential reference to use for '{credential.display_name or canonical_key}' in node '{queue_item.queue_id}'."
+                        ),
+                    )
+                )
+            continue
+        if not already_missing:
+            missing_inputs.append(
+                DeveloperMissingInputDecision(
+                    key_name=canonical_key,
+                    category="credential",
+                    reason=(
+                        f"Credential reference for '{credential.display_name or canonical_key}' is required by the indexed node definition."
+                    ),
+                    question=(
+                        f"Provide the credential reference to use for '{credential.display_name or canonical_key}' in node '{queue_item.queue_id}'."
+                    ),
+                )
+            )
+
+    credential_refs = {
+        key: value
+        for key, value in credential_refs.items()
+        if key in allowed_keys and str(value or "").strip()
+    }
+
+    return NodeImplementationDecision(
+        parameters_known=dict(decision.parameters_known),
+        parameters_inferred=dict(decision.parameters_inferred),
+        parameters_unresolved=_safe_string_list(decision.parameters_unresolved),
+        credential_refs=credential_refs,
+        missing_inputs=_dedupe_missing_input_decisions(missing_inputs),
+        variable_outputs=list(decision.variable_outputs),
+        notes=_safe_string_list(notes),
+        can_apply=bool(decision.can_apply) and not missing_inputs,
+    )
+
+
+def _apply_default_continue_policy(
+    *,
+    queue_item: ImplementationQueueItem,
+    current_node: WorkflowDraftNode,
+    decision: NodeImplementationDecision,
+    parameter_schema: List[DeveloperParameterDefinition],
+    workflow_draft: WorkflowDraft,
+    enabled: bool,
+) -> NodeImplementationDecision:
+    if not enabled:
+        return decision
+
+    parameters_known = dict(decision.parameters_known)
+    parameters_inferred = dict(decision.parameters_inferred)
+    parameters_unresolved = list(decision.parameters_unresolved)
+    credential_refs = dict(decision.credential_refs)
+    remaining_missing: List[DeveloperMissingInputDecision] = []
+    notes = list(decision.notes)
+    warnings: List[str] = []
+    defaulted_input_keys: List[str] = []
+
+    for item in decision.missing_inputs:
+        if item.category == "parameter":
+            input_key = f"parameter:{queue_item.queue_id}:{item.key_name}"
+            default_value = _parameter_default_value(
+                parameter_schema=parameter_schema,
+                key_name=item.key_name,
+            )
+            if default_value is None:
+                default_value = _semantic_parameter_default_value(
+                    queue_item=queue_item,
+                    current_node=current_node,
+                    key_name=item.key_name,
+                )
+            if default_value is not None and item.key_name not in parameters_known:
+                parameters_inferred[item.key_name] = default_value
+                parameters_unresolved = [
+                    key for key in parameters_unresolved if key != item.key_name
+                ]
+                notes.append(f"defaulted_after_user_declined:{item.key_name}")
+                warnings.append(
+                    f"Node '{queue_item.queue_id}' used a safe default for parameter '{item.key_name}' after the user declined to specify it."
+                )
+            else:
+                if item.key_name not in parameters_unresolved:
+                    parameters_unresolved.append(item.key_name)
+                notes.append(f"left_unresolved_after_user_declined:{item.key_name}")
+                warnings.append(
+                    f"Node '{queue_item.queue_id}' is still missing parameter '{item.key_name}' because no explicit schema default exists."
+                )
+            defaulted_input_keys.append(input_key)
+            continue
+        if item.category == "credential":
+            input_key = f"credential:{queue_item.queue_id}:{item.key_name}"
+            credential_refs.pop(item.key_name, None)
+            notes.append(f"credential_unresolved_after_user_declined:{item.key_name}")
+            warnings.append(
+                f"Node '{queue_item.queue_id}' remains without credential '{item.key_name}' after the user declined to provide it."
+            )
+            defaulted_input_keys.append(input_key)
+            continue
+        remaining_missing.append(item)
+
+    if defaulted_input_keys:
+        _append_draft_metadata_strings(workflow_draft, _DEFAULTED_INPUT_KEYS_METADATA_KEY, defaulted_input_keys)
+    if warnings:
+        _append_draft_metadata_strings(workflow_draft, _DEVELOPER_WARNINGS_METADATA_KEY, warnings)
+
+    return NodeImplementationDecision(
+        parameters_known=parameters_known,
+        parameters_inferred=parameters_inferred,
+        parameters_unresolved=_safe_string_list(parameters_unresolved),
+        credential_refs=credential_refs,
+        missing_inputs=_dedupe_missing_input_decisions(remaining_missing),
+        variable_outputs=list(decision.variable_outputs),
+        notes=_safe_string_list(notes),
+        can_apply=not remaining_missing,
+    )
+
+
 def _missing_details_from_decision(
     *,
     queue_item: ImplementationQueueItem,
@@ -1255,6 +1973,8 @@ def _node_context_for_queue_item(
             updated.expected_outputs = list(queue_item.expected_outputs)
         if not updated.dependencies:
             updated.dependencies = list(queue_item.dependencies)
+        if not updated.implementation_hints:
+            updated.implementation_hints = dict(queue_item.implementation_hints or {})
         if getattr(updated, "type_version", 1) < 1:
             updated.type_version = node_definition.type_version
         return updated
@@ -1277,6 +1997,7 @@ def _node_context_for_queue_item(
         dependencies=list(queue_item.dependencies),
         position=[240 * max(0, len(draft.nodes)), 300],
         notes=["created_by_engineer_agent"],
+        implementation_hints=dict(queue_item.implementation_hints or {}),
     )
 
 
@@ -1636,6 +2357,8 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
 
     architecture_plan = _normalize_model(state.get("architecture_plan"), ArchitecturePlan)
     workflow_context = _normalize_model(state.get("workflow_context"), WorkflowContext)
+    pending_decision_slots = _normalize_list(state.get("pending_decision_slots"), DecisionSlot)
+    resolved_decision_slots = _normalize_list(state.get("resolved_decision_slots"), DecisionSlot)
     provided_nodes = _normalize_list(state.get("proposed_nodes"), ProposedNode)
     provided_credentials = _normalize_list(state.get("required_credentials"), RequiredCredential)
     queue = _normalize_list(state.get("node_implementation_queue"), ImplementationQueueItem)
@@ -1837,10 +2560,108 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             **persist_payload,
         }
 
+    if workflow_context is None:
+        workflow_context = WorkflowContext(use_case_id=architecture_plan.use_case_id)
+    if not pending_decision_slots:
+        pending_decision_slots = list(workflow_context.pending_decision_slots)
+    if not resolved_decision_slots:
+        resolved_decision_slots = list(workflow_context.resolved_decision_slots)
+    request_context_query = _request_context_query(
+        state=state,
+        architecture_plan=architecture_plan,
+        current_user_query=user_query,
+    )
+
+    if pending_decision_slots:
+        missing_details = _merge_missing_details(
+            missing_details,
+            [
+                _missing_input(
+                    category="decision",
+                    queue_id=slot.stage_id or "workflow_decision",
+                    key_name=slot.slot_key,
+                    reason=slot.question_text or f"Pending semantic decision for slot '{slot.slot_key}'.",
+                    question=slot.question_text,
+                    slot_key=slot.slot_key,
+                )
+                for slot in pending_decision_slots
+            ],
+        )
+        missing_user_inputs = [item.question for item in missing_details]
+        implementation_status = ImplementationStatus.blocked_waiting_user
+        workflow_context.handoff_target = None
+        workflow_context.unresolved_inputs = list(missing_user_inputs)
+        workflow_context.pending_decision_slots = list(pending_decision_slots)
+        workflow_context.resolved_decision_slots = list(resolved_decision_slots)
+        workflow_context.clarification_owner = workflow_context.clarification_owner or AgentStage.architect_agent
+        workflow_context.clarification_reason = workflow_context.clarification_reason or "planning_gap"
+        workflow_context.last_block_cause = workflow_context.last_block_cause or "planning_gap"
+        routing_signals.append("engineer_blocked_waiting_user")
+        routing_signals.append("engineer_semantic_decision_pending")
+        engineer_notes.append("Engineer blocked: semantic planning decisions are still unresolved upstream.")
+        emit_trace_event(
+            trace_logger,
+            event="engineer_preflight_blocked",
+            request_id=request_id,
+            stage="multi_agent.engineer",
+            payload={
+                "status": implementation_status.value,
+                "reason": "pending_decision_slots",
+                "pending_decision_slots": [
+                    {
+                        "slot_key": slot.slot_key,
+                        "stage_id": slot.stage_id,
+                        "owner_agent": slot.owner_agent.value,
+                    }
+                    for slot in pending_decision_slots
+                ],
+            },
+        )
+        return {
+            "current_stage": "engineer_agent",
+            "target_stage": None,
+            "implementation_status": implementation_status,
+            "missing_user_inputs": missing_user_inputs,
+            "missing_user_input_details": missing_details,
+            "routing_signals": routing_signals,
+            "engineer_notes": engineer_notes,
+            "final_workflow_json": {},
+            "workflow_draft": workflow_draft,
+            "workflow_versions": workflow_versions,
+            "node_implementation_queue": queue,
+            "implemented_nodes": implemented_nodes,
+            "blocked_nodes": blocked_nodes,
+            "variable_registry": variable_registry,
+            "proposed_nodes": provided_nodes,
+            "required_credentials": provided_credentials,
+            "workflow_context": workflow_context,
+            "pending_decision_slots": list(pending_decision_slots),
+            "resolved_decision_slots": list(resolved_decision_slots),
+            "clarification_owner": workflow_context.clarification_owner,
+            "clarification_reason": workflow_context.clarification_reason,
+            "last_block_cause": workflow_context.last_block_cause,
+            "resume_requested": False,
+            **persist_payload,
+        }
+
     workflow_draft = _normalize_workflow_draft(
         workflow_draft,
         plan=architecture_plan,
     )
+    stage_bundle_map = {}
+    metadata_bundle_map = workflow_draft.metadata.get("stage_bundle_map")
+    if isinstance(metadata_bundle_map, dict):
+        stage_bundle_map = {
+            str(key): [str(item) for item in value]
+            for key, value in metadata_bundle_map.items()
+            if isinstance(value, list)
+        }
+    if not stage_bundle_map:
+        stage_bundle_map = {
+            stage.id: [node.node_id for node in workflow_draft.nodes if node.stage_id == stage.id]
+            for stage in architecture_plan.stages
+        }
+    workflow_context.stage_bundle_map = dict(stage_bundle_map)
     proposed_nodes = _derive_proposed_nodes(
         plan=architecture_plan,
         workflow_context=workflow_context,
@@ -1850,6 +2671,104 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     required_credentials = provided_credentials or _required_credentials_from_definitions(
         proposed_nodes
     )
+    handoff_issues = _validate_architect_handoff(
+        plan=architecture_plan,
+        proposed_nodes=proposed_nodes,
+        workflow_draft=workflow_draft,
+    )
+
+    if handoff_issues:
+        missing_details = _merge_missing_details(
+            missing_details,
+            [
+                _missing_input(
+                    category="handoff",
+                    queue_id="engineer_handoff",
+                    key_name="architect_handoff",
+                    reason=handoff_issues[0],
+                    question=handoff_issues[0],
+                )
+            ],
+        )
+        missing_details = _localize_missing_details(
+            missing_details,
+            user_query=user_query,
+            architecture_plan=architecture_plan,
+        )
+        missing_user_inputs = [item.question for item in missing_details]
+        implementation_status = ImplementationStatus.blocked_waiting_user
+        if workflow_context is None:
+            workflow_context = WorkflowContext(
+                use_case_id=architecture_plan.use_case_id,
+                planning_ready=True,
+                handoff_target=None,
+                required_node_types=[node.node_type for node in proposed_nodes],
+                unresolved_inputs=[],
+                notes=[],
+            )
+        workflow_context.handoff_target = None
+        workflow_context.unresolved_inputs = list(missing_user_inputs)
+        workflow_context.pending_decision_slots = list(pending_decision_slots)
+        workflow_context.resolved_decision_slots = list(resolved_decision_slots)
+        workflow_context.clarification_owner = AgentStage.engineer_agent
+        workflow_context.clarification_reason = "planning_gap"
+        workflow_context.last_block_cause = "planning_gap"
+        workflow_context.notes = _safe_string_list(
+            list(workflow_context.notes) + ["engineer_preflight=incomplete_architect_handoff"]
+        )
+        routing_signals.append("engineer_blocked_waiting_user")
+        routing_signals.append("engineer_incomplete_architect_handoff")
+        engineer_notes.append("Engineer blocked: architect handoff does not materialize the full abstract plan.")
+        emit_trace_event(
+            trace_logger,
+            event="engineer_preflight_blocked",
+            request_id=request_id,
+            stage="multi_agent.engineer",
+            payload={
+                "status": implementation_status.value,
+                "handoff_issues": list(handoff_issues),
+                "proposed_stage_ids": sorted(
+                    {
+                        str(item.stage_id)
+                        for item in proposed_nodes
+                        if str(item.stage_id or "").strip()
+                    }
+                ),
+                "draft_stage_ids": sorted(
+                    {
+                        str(node.stage_id)
+                        for node in workflow_draft.nodes
+                        if str(node.stage_id or "").strip()
+                    }
+                ),
+            },
+        )
+        return {
+            "current_stage": "engineer_agent",
+            "target_stage": None,
+            "implementation_status": implementation_status,
+            "missing_user_inputs": missing_user_inputs,
+            "missing_user_input_details": missing_details,
+            "routing_signals": routing_signals,
+            "engineer_notes": engineer_notes,
+            "final_workflow_json": {},
+            "workflow_draft": workflow_draft,
+            "workflow_versions": workflow_versions,
+            "node_implementation_queue": queue,
+            "implemented_nodes": implemented_nodes,
+            "blocked_nodes": blocked_nodes,
+            "variable_registry": variable_registry,
+            "proposed_nodes": proposed_nodes,
+            "required_credentials": required_credentials,
+            "workflow_context": workflow_context,
+            "pending_decision_slots": list(pending_decision_slots),
+            "resolved_decision_slots": list(resolved_decision_slots),
+            "clarification_owner": AgentStage.engineer_agent,
+            "clarification_reason": "planning_gap",
+            "last_block_cause": "planning_gap",
+            "resume_requested": False,
+            **persist_payload,
+        }
 
     if not proposed_nodes:
         missing_details = _merge_missing_details(
@@ -1945,6 +2864,44 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     if not workflow_versions:
         _append_version(workflow_versions, workflow_draft, reason="initialized engineer workflow draft")
 
+    if resume_requested and missing_details and is_question_rephrase_request(user_query):
+        missing_details = _localize_missing_details(
+            missing_details,
+            user_query=user_query,
+            architecture_plan=architecture_plan,
+        )
+        missing_user_inputs = [item.question for item in missing_details]
+        implementation_status = ImplementationStatus.blocked_waiting_user
+        if workflow_context is not None:
+            workflow_context.unresolved_inputs = list(missing_user_inputs)
+            workflow_context.handoff_target = None
+            workflow_context.notes = _safe_string_list(
+                list(workflow_context.notes) + ["engineer_question_rephrased"]
+            )
+        routing_signals.append("engineer_question_rephrased")
+        engineer_notes.append("Rephrased pending developer questions for the user.")
+        return {
+            "current_stage": "engineer_agent",
+            "target_stage": None,
+            "implementation_status": implementation_status,
+            "workflow_draft": workflow_draft,
+            "workflow_versions": workflow_versions,
+            "node_implementation_queue": queue,
+            "implemented_nodes": implemented_nodes,
+            "blocked_nodes": blocked_nodes,
+            "variable_registry": variable_registry,
+            "missing_user_inputs": missing_user_inputs,
+            "missing_user_input_details": missing_details,
+            "routing_signals": routing_signals,
+            "engineer_notes": engineer_notes,
+            "final_workflow_json": final_workflow_json,
+            "proposed_nodes": proposed_nodes,
+            "required_credentials": required_credentials,
+            "workflow_context": workflow_context,
+            "resume_requested": False,
+            **persist_payload,
+        }
+
     provided_values = _extract_user_supplied_values(user_query)
     remaining_missing, resolved_from_input = _merge_engineer_missing_inputs(
         missing_details,
@@ -1956,12 +2913,47 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     resolved_inputs.update(resolved_from_input)
     if resume_requested and not resolved_from_input and len(missing_details) == 1:
         freeform = _single_freeform_answer(user_query)
-        if freeform:
+        if freeform and _can_apply_freeform_answer(missing_details[0]):
             fallback_key = missing_details[0].input_key
             resolved_inputs[fallback_key] = freeform
             missing_details = []
             engineer_notes.append(
                 f"Applied freeform user response to '{fallback_key}' during resume."
+            )
+    default_continue_enabled = _default_continue_requested(workflow_draft)
+    if _should_enable_default_continue(
+        resume_requested=resume_requested,
+        user_query=user_query,
+        missing_details=missing_details,
+        resolved_from_input=resolved_from_input,
+    ):
+        default_continue_enabled = True
+        _set_default_continue_requested(workflow_draft, True)
+        retained_missing = [
+            item for item in missing_details if _should_keep_prompting_under_default_continue(item)
+        ]
+        defaulted_now = [item for item in missing_details if item not in retained_missing]
+        missing_details = retained_missing
+        if defaulted_now:
+            _append_draft_metadata_strings(
+                workflow_draft,
+                _DEFAULTED_INPUT_KEYS_METADATA_KEY,
+                [item.input_key for item in defaulted_now],
+            )
+            _append_draft_metadata_strings(
+                workflow_draft,
+                _DEVELOPER_WARNINGS_METADATA_KEY,
+                [
+                    f"Developer switched to default-and-continue after the user declined to answer '{item.input_key}'."
+                    for item in defaulted_now
+                ],
+            )
+        engineer_notes.append(
+            "Developer switched to default-and-continue after the user declined or could not provide the requested inputs."
+        )
+        if workflow_context is not None:
+            workflow_context.notes = _safe_string_list(
+                list(workflow_context.notes) + ["engineer_default_continue=true"]
             )
     _set_resolved_inputs(workflow_draft, resolved_inputs)
 
@@ -2029,6 +3021,11 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                         ),
                     )
                 ]
+                unresolved_inputs = _localize_missing_details(
+                    unresolved_inputs,
+                    user_query=user_query,
+                    architecture_plan=architecture_plan,
+                )
                 queue_item.status = "blocked"
                 blocked_nodes = [item for item in blocked_nodes if item.queue_id != queue_item.queue_id]
                 blocked_nodes.append(
@@ -2100,7 +3097,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
 
             try:
                 decision = _decide_node_implementation_with_structured_output(
-                    user_query=user_query,
+                    user_query=request_context_query,
                     architecture_plan=architecture_plan,
                     queue_item=queue_item,
                     current_node=current_node,
@@ -2109,7 +3106,9 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                     credential_requirements=credential_requirements,
                     upstream_variables=upstream_variables,
                     resolved_inputs=resolved_inputs,
+                    resolved_decision_slots=resolved_decision_slots,
                     downstream_queue_ids=downstream_queue_ids,
+                    stage_bundle_map=stage_bundle_map,
                     model=model,
                     request_id=request_id,
                 )
@@ -2128,6 +3127,34 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                     resolved_inputs=resolved_inputs,
                     downstream_queue_ids=downstream_queue_ids,
                 )
+            decision = _enforce_safe_parameter_policy(
+                queue_item=queue_item,
+                current_node=current_node,
+                decision=decision,
+                resolved_inputs=resolved_inputs,
+            )
+            decision = _enforce_credential_reference_policy(
+                queue_item=queue_item,
+                current_node=current_node,
+                decision=decision,
+                credential_requirements=credential_requirements,
+                resolved_inputs=resolved_inputs,
+                default_continue_enabled=default_continue_enabled,
+            )
+            decision = _enforce_material_action_policy(
+                queue_item=queue_item,
+                current_node=current_node,
+                decision=decision,
+                parameter_schema=parameter_schema,
+            )
+            decision = _apply_default_continue_policy(
+                queue_item=queue_item,
+                current_node=current_node,
+                decision=decision,
+                parameter_schema=parameter_schema,
+                workflow_draft=workflow_draft,
+                enabled=default_continue_enabled,
+            )
             emit_trace_event(
                 trace_logger,
                 event="engineer_node_decision",
@@ -2155,6 +3182,11 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             unresolved_inputs = _missing_details_from_decision(
                 queue_item=queue_item,
                 decision=decision,
+            )
+            unresolved_inputs = _localize_missing_details(
+                unresolved_inputs,
+                user_query=user_query,
+                architecture_plan=architecture_plan,
             )
             if unresolved_inputs or not decision.can_apply:
                 current_node.parameters_known = dict(decision.parameters_known)
@@ -2240,7 +3272,7 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
                 }
             current_node.parameters_known = dict(decision.parameters_known)
             current_node.parameters_inferred = dict(decision.parameters_inferred)
-            current_node.parameters_unresolved = []
+            current_node.parameters_unresolved = _safe_string_list(decision.parameters_unresolved)
             current_node.credential_refs = dict(decision.credential_refs)
             current_node.expected_inputs = list(queue_item.expected_inputs or current_node.expected_inputs)
             current_node.expected_outputs = (
@@ -2434,6 +3466,21 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
     workflow_context.unresolved_inputs = []
     workflow_context.handoff_target = AgentStage.qa_agent
     workflow_context.required_node_types = [node.node_type for node in proposed_nodes]
+    workflow_context.pending_decision_slots = []
+    workflow_context.resolved_decision_slots = list(resolved_decision_slots)
+    workflow_context.clarification_owner = None
+    workflow_context.clarification_reason = None
+    workflow_context.last_block_cause = None
+    developer_warnings = _draft_metadata_string_list(workflow_draft, _DEVELOPER_WARNINGS_METADATA_KEY)
+    defaulted_input_keys = _draft_metadata_string_list(workflow_draft, _DEFAULTED_INPUT_KEYS_METADATA_KEY)
+    if developer_warnings:
+        workflow_context.notes = _safe_string_list(
+            list(workflow_context.notes)
+            + [f"engineer_warnings={len(developer_warnings)}", "engineer_defaulted_nodes=true"]
+        )
+        engineer_notes.append(
+            f"Developer completed with warnings: {len(defaulted_input_keys)} inputs were defaulted or left unresolved."
+        )
     if "handoff_ready_qa" not in routing_signals:
         routing_signals.append("handoff_ready_qa")
     engineer_notes.append("Engineer completed iterative workflow construction. QA handoff is ready.")
@@ -2468,6 +3515,8 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             "active_workflow_id": persist_payload.get("active_workflow_id"),
             "persist_action": persist_payload.get("workflow_persist_action"),
             "target_stage": AgentStage.qa_agent.value,
+            "developer_warning_count": len(developer_warnings),
+            "defaulted_input_keys": list(defaulted_input_keys),
         },
     )
 
@@ -2489,6 +3538,11 @@ def engineer_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         "proposed_nodes": proposed_nodes,
         "required_credentials": required_credentials,
         "workflow_context": workflow_context,
+        "pending_decision_slots": [],
+        "resolved_decision_slots": list(resolved_decision_slots),
+        "clarification_owner": None,
+        "clarification_reason": None,
+        "last_block_cause": None,
         "resume_requested": False,
         **persist_payload,
     }

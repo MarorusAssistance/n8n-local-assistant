@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from uuid import uuid4
 
@@ -55,6 +56,115 @@ class ChatService:
         self._workflow = WorkflowService(self._n8n_client, self._logger)
         self._graph_runtime = MasterGraphRuntime(self._workflow)
         self._chat_use_case = HandleChatUseCase(ChatModePolicy())
+        self._temporal_result_path = Path(__file__).resolve().parents[2] / "temporal_result.json"
+
+    @staticmethod
+    def _format_question_block(questions: List[str]) -> str:
+        cleaned = [str(item).strip() for item in questions if str(item or "").strip()]
+        if not cleaned:
+            return ""
+        if len(cleaned) == 1:
+            return cleaned[0]
+        return "\n".join(f"{idx}. {question}" for idx, question in enumerate(cleaned, start=1))
+
+    @staticmethod
+    def _reasoning_missing_nodes_message(payload: Dict[str, Any]) -> Optional[str]:
+        current_stage = str(payload.get("current_stage") or "")
+        architect_status = str(payload.get("architect_status") or "")
+        if current_stage != "architect_agent":
+            return None
+        if payload.get("workflow_persisted"):
+            return None
+        notes: List[str] = []
+        architect_notes = payload.get("architect_notes")
+        if isinstance(architect_notes, list):
+            notes.extend(str(item) for item in architect_notes)
+        workflow_context = payload.get("workflow_context")
+        if isinstance(workflow_context, dict):
+            notes.extend(str(item) for item in workflow_context.get("notes") or [])
+            notes.extend(str(item) for item in workflow_context.get("unresolved_inputs") or [])
+        combined = " ".join(notes).lower()
+        if architect_status == "architect_failed_no_solution":
+            return (
+                "No se pudo crear el workflow porque no se encontraron nodos necesarios "
+                "para una o mas etapas del flujo planeado."
+            )
+        if any(
+            token in combined
+            for token in (
+                "no valid node",
+                "no candidate",
+                "missing_valid_nodes",
+                "failed_no_solution",
+                "could not ground",
+                "could not materialize",
+            )
+        ):
+            return (
+                "No se pudo crear el workflow porque no se encontraron nodos necesarios "
+                "para una o mas etapas del flujo planeado."
+            )
+        return None
+
+    @staticmethod
+    def _reasoning_public_text(payload: Dict[str, Any], consultant_text: Optional[str]) -> str:
+        if consultant_text is not None:
+            return consultant_text
+
+        questions = list(payload.get("missing_user_inputs") or [])
+        if questions:
+            return ChatService._format_question_block(questions)
+
+        workflow_reference = payload.get("workflow_reference")
+        workflow_url = None
+        workflow_persisted = bool(payload.get("workflow_persisted"))
+        if isinstance(workflow_reference, dict):
+            workflow_url = str(workflow_reference.get("url") or "").strip() or None
+            workflow_persisted = bool(workflow_reference.get("persisted", workflow_persisted))
+        if workflow_persisted and workflow_url:
+            return f"Aqui lo tienes: {workflow_url}"
+
+        missing_nodes_message = ChatService._reasoning_missing_nodes_message(payload)
+        if missing_nodes_message:
+            return missing_nodes_message
+
+        current_stage = str(payload.get("current_stage") or "")
+        pm_status = str(payload.get("pm_status") or "")
+        architect_status = str(payload.get("architect_status") or "")
+        implementation_status = str(payload.get("implementation_status") or "")
+
+        if current_stage == "product_manager_agent":
+            return "He dejado el plan listo para la siguiente fase."
+        if current_stage == "architect_agent" and architect_status == "architect_completed":
+            return "He dejado la arquitectura del workflow lista para la siguiente fase."
+        if current_stage == "engineer_agent":
+            if implementation_status == "completed":
+                return "He dejado el workflow listo."
+            if implementation_status:
+                return "He actualizado el workflow y he dejado la siguiente accion preparada."
+        if payload.get("selected_use_case"):
+            return "He dejado el caso de uso listo para la siguiente fase."
+        return "He procesado la solicitud."
+
+    def _persist_envelope_snapshot(
+        self,
+        *,
+        request_id: str,
+        payload: Dict[str, Any],
+        source: str,
+    ) -> Dict[str, Any]:
+        sanitized = sanitize_for_json(payload)
+        serialized, sanitized = safe_json_dumps(sanitized)
+        self._trace_logger.info("%s envelope: id=%s payload=%s", source, request_id, serialized)
+        try:
+            self._temporal_result_path.write_text(serialized, encoding="utf-8")
+        except Exception:
+            self._trace_logger.exception(
+                "failed writing temporal result snapshot: id=%s path=%s",
+                request_id,
+                str(self._temporal_result_path),
+            )
+        return sanitized
 
     def health(self) -> Dict[str, Any]:
         """Return DB and LM Studio health status."""
@@ -643,6 +753,14 @@ class ChatService:
             consultant_retrieval_results = list(getattr(result, "consultant_retrieval_results", []) or [])
             consultant_response = getattr(result, "consultant_response", None)
             consultant_notes = list(getattr(result, "consultant_notes", []) or [])
+            request_context_query = getattr(result, "request_context_query", None)
+            pending_decision_slots = list(getattr(result, "pending_decision_slots", []) or [])
+            resolved_decision_slots = list(getattr(result, "resolved_decision_slots", []) or [])
+            clarification_owner = getattr(result, "clarification_owner", None)
+            clarification_reason = getattr(result, "clarification_reason", None)
+            last_block_cause = getattr(result, "last_block_cause", None)
+            stage_bundle_map = dict(getattr(result, "stage_bundle_map", {}) or {})
+            evidence_fingerprints = dict(getattr(result, "evidence_fingerprints", {}) or {})
             current_stage = getattr(result, "current_stage", None)
             if current_stage == "consultant_agent":
                 candidate = (
@@ -704,6 +822,7 @@ class ChatService:
                     for item in alternative_use_cases
                 ],
                 "selection_reason": getattr(result, "selection_reason", None),
+                "request_context_query": request_context_query,
                 "architecture_plan": (
                     architecture_plan.model_dump(exclude_none=True)
                     if hasattr(architecture_plan, "model_dump")
@@ -714,6 +833,23 @@ class ChatService:
                     if hasattr(workflow_context, "model_dump")
                     else workflow_context
                 ),
+                "pending_decision_slots": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in pending_decision_slots
+                ],
+                "resolved_decision_slots": [
+                    item.model_dump(exclude_none=True) if hasattr(item, "model_dump") else item
+                    for item in resolved_decision_slots
+                ],
+                "clarification_owner": (
+                    clarification_owner.value
+                    if hasattr(clarification_owner, "value")
+                    else clarification_owner
+                ),
+                "clarification_reason": clarification_reason,
+                "last_block_cause": last_block_cause,
+                "stage_bundle_map": stage_bundle_map,
+                "evidence_fingerprints": evidence_fingerprints,
                 "planning_summary": getattr(result, "planning_summary", None),
                 "pm_status": (pm_status.value if hasattr(pm_status, "value") else pm_status),
                 "pm_stage_plan": [
@@ -855,17 +991,18 @@ class ChatService:
                     "checker": result.checker.model_dump(exclude_none=True),
                 }
 
-        payload = sanitize_for_json(payload)
+        payload = self._persist_envelope_snapshot(
+            request_id=request_id,
+            payload=payload,
+            source="reasoning graph",
+        )
         if consultant_text is None and payload.get("current_stage") == "consultant_agent":
             consultant_payload = payload.get("consultant_response")
             if isinstance(consultant_payload, dict):
                 candidate = consultant_payload.get("text")
                 if isinstance(candidate, str) and candidate.strip():
                     consultant_text = candidate.strip()
-        if consultant_text is not None:
-            assistant_text_raw = consultant_text
-        else:
-            assistant_text_raw, payload = safe_json_dumps(payload)
+        assistant_text_raw = self._reasoning_public_text(payload, consultant_text)
         model = resolve_model(request.model)
 
         self._memory.append_memory(conversation_id, raw_user_message, assistant_text_raw)

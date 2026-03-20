@@ -15,10 +15,13 @@ from app.features.reasoning.multi_agent_contracts import (
     ArchitecturePlan,
     ArchitectureStage,
     EntryIntent,
+    StageKind,
     WorkflowContext,
 )
+from app.graphs.nodes import architect_agent as architect_mod
 from app.graphs.nodes.architect_agent import (
     _StageSelectionOutput,
+    _augment_candidates_with_definition_fallbacks,
     _build_workflow_blueprint_with_structured_output,
     _WorkflowConnectionBlueprint,
     _WorkflowBlueprintOutput,
@@ -27,6 +30,9 @@ from app.graphs.nodes.architect_agent import (
     _is_trigger_candidate,
     _build_candidates,
     _normalize_confidence,
+    _plan_terminal_outcome_gap_question,
+    _refine_terminal_outcome_plan_from_slots,
+    _select_linking_page_keys,
     _select_stage_nodes_with_structured_output,
     architect_agent_node,
 )
@@ -230,6 +236,241 @@ def test_architect_stage_selection_returns_structured_output(monkeypatch: pytest
 
     assert output is not None
     assert output.selected_node_types == ["n8n-nodes-base.webhook"]
+
+
+def test_architect_rejects_trigger_nodes_for_classification_stage() -> None:
+    plan = _plan()
+    stage = plan.stages[1]
+    candidate = _candidate(
+        "n8n-nodes-base.postmarkTrigger",
+        stage_id=stage.id,
+        has_main_input=False,
+        capability_summary="Trigger the workflow when a new Postmark email event is received.",
+    )
+
+    reasons = _candidate_rejection_reasons(
+        candidate=candidate,
+        stage=stage,
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+
+    assert "trigger_invalid_for_classification" in reasons
+    assert "not_a_classification_node" in reasons
+
+
+def test_architect_rejects_trigger_nodes_for_apply_label_stage() -> None:
+    plan = ArchitecturePlan(
+        use_case_id="uc_apply_label",
+        title="Apply Gmail labels",
+        business_objective="Apply urgency labels back to Gmail.",
+        desired_outcome="Label the original Gmail message.",
+        workflow_summary="Receive, classify, and apply a visible label in Gmail.",
+        stages=[
+            ArchitectureStage(
+                id="stage_apply",
+                name="Apply Urgency Label in Gmail",
+                purpose="Apply the resulting urgency level back onto the same Gmail message as a visible label.",
+                stage_kind=StageKind.apply_update_source,
+                business_effect="The source email is updated with the workflow result.",
+                target_entity="gmail_message",
+                user_visible_goal="The urgency label is visible in Gmail.",
+                required_capabilities=["Add a visible label to the Gmail message"],
+                expected_inputs=["message id", "urgency label"],
+                expected_outputs=["labeled message"],
+                dependencies=[],
+                success_criteria=["The Gmail message is updated with the correct label."],
+            )
+        ],
+        data_flow=[],
+        assumptions=[],
+        missing_information=[],
+        implementation_notes_for_engineer=[],
+        required_nodes=[],
+    )
+    stage = plan.stages[0]
+    candidate = _candidate(
+        "n8n-nodes-base.emailReadImap",
+        stage_id=stage.id,
+        has_main_input=False,
+        capability_summary="Triggers the workflow when a new email is received. Can mark messages as read.",
+    )
+
+    reasons = _candidate_rejection_reasons(
+        candidate=candidate,
+        stage=stage,
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+
+    assert "trigger_invalid_for_apply_update" in reasons
+
+
+def test_source_update_stage_rejects_generic_wait_even_with_contaminated_summary() -> None:
+    plan = ArchitecturePlan(
+        use_case_id="uc_apply_label",
+        title="Apply Gmail labels",
+        business_objective="Apply urgency labels back to Gmail.",
+        desired_outcome="Label Gmail messages by urgency.",
+        workflow_summary="Receive, classify, and apply a visible label in Gmail.",
+        stages=[
+            ArchitectureStage(
+                id="stage_apply",
+                name="Apply Urgency Label in Gmail",
+                purpose="Apply the resulting urgency level back onto the same Gmail message as a visible label.",
+                stage_kind=StageKind.apply_update_source,
+                business_effect="Update the Gmail message with the urgency result.",
+                target_entity="gmail_message",
+                user_visible_goal="The urgency label is visible in Gmail.",
+                required_capabilities=["Add a visible label to the Gmail message"],
+                expected_inputs=["message id", "urgency label"],
+                expected_outputs=["labeled message"],
+                dependencies=[],
+                success_criteria=["The Gmail message is updated with the correct label."],
+            )
+        ],
+    )
+    candidate = _candidate(
+        "n8n-nodes-base.wait",
+        stage_id="stage_apply",
+        capability_summary=(
+            "Wait before continue with execution. Gmail node Message Operations / Add Label to a message."
+        ),
+    )
+
+    reasons = _candidate_rejection_reasons(
+        candidate=candidate,
+        stage=plan.stages[0],
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+
+    assert "not_a_source_update_node" in reasons
+
+
+def test_definition_fallback_replaces_invalid_same_type_candidate_for_gmail_apply_stage() -> None:
+    plan = ArchitecturePlan(
+        use_case_id="uc_apply_label",
+        title="Apply Gmail labels",
+        business_objective="Apply urgency labels back to Gmail.",
+        desired_outcome="Label Gmail messages by urgency.",
+        workflow_summary="Receive, classify, and apply a visible label in Gmail.",
+        stages=[
+            ArchitectureStage(
+                id="stage_apply",
+                name="Apply Urgency Label in Gmail",
+                purpose="Apply the resulting urgency level back onto the same Gmail message as a visible label.",
+                stage_kind=StageKind.apply_update_source,
+                business_effect="Update the Gmail message with the urgency result.",
+                target_entity="gmail_message",
+                user_visible_goal="The urgency label is visible in Gmail.",
+                required_capabilities=["Add a visible label to the Gmail message"],
+                expected_inputs=["message id", "urgency label"],
+                expected_outputs=["labeled message"],
+                dependencies=[],
+                success_criteria=["The Gmail message is updated with the correct label."],
+            )
+        ],
+    )
+    invalid_gmail = _candidate(
+        "n8n-nodes-base.gmail",
+        stage_id="stage_apply",
+        capability_summary="Generic Gmail node summary without a concrete update action.",
+        output_connection_types=[],
+    )
+
+    augmented = _augment_candidates_with_definition_fallbacks(
+        stage=plan.stages[0],
+        plan=plan,
+        stage_requires_trigger=False,
+        candidates=[invalid_gmail],
+    )
+
+    gmail_candidates = [item for item in augmented if item.node_type == "n8n-nodes-base.gmail"]
+    assert len(gmail_candidates) == 1
+    reasons = _candidate_rejection_reasons(
+        candidate=gmail_candidates[0],
+        stage=plan.stages[0],
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+    assert reasons == []
+
+
+def test_architect_refines_terminal_outcome_plan_from_resolved_slot() -> None:
+    plan = ArchitecturePlan(
+        use_case_id="uc_architect_refine",
+        title="Email urgency classification",
+        business_objective="Classify incoming emails by urgency.",
+        desired_outcome="Classify incoming emails by urgency.",
+        workflow_summary="Receive each email, classify it, and then handle the result.",
+        stages=[
+            ArchitectureStage(
+                id="stage_1",
+                name="Email Intake",
+                purpose="Receive new incoming emails.",
+                stage_kind=StageKind.trigger_intake,
+                required_capabilities=["Receive inbound email"],
+                expected_inputs=["incoming email"],
+                expected_outputs=["normalized email payload"],
+                dependencies=[],
+                success_criteria=["Each email starts the workflow."],
+            ),
+            ArchitectureStage(
+                id="stage_2",
+                name="Urgency Classification",
+                purpose="Classify the email by urgency.",
+                stage_kind=StageKind.classify_decision,
+                required_capabilities=["Assign urgency"],
+                expected_inputs=["normalized email payload"],
+                expected_outputs=["urgency label"],
+                dependencies=["stage_1"],
+                success_criteria=["A single urgency label is produced."],
+            ),
+            ArchitectureStage(
+                id="stage_3",
+                name="Outcome Handling",
+                purpose="Persist, notify, or otherwise record the final outcome of the workflow.",
+                stage_kind=StageKind.transform_process,
+                required_capabilities=["Execute the final outcome step"],
+                expected_inputs=["urgency label"],
+                expected_outputs=["stored outcome or outbound action result"],
+                dependencies=["stage_2"],
+                success_criteria=["The final outcome is executed and traceable."],
+            ),
+        ],
+        data_flow=[
+            ArchitectureDataFlowItem(source_stage_id="stage_1", target_stage_id="stage_2", data_items=["normalized email payload"]),
+            ArchitectureDataFlowItem(source_stage_id="stage_2", target_stage_id="stage_3", data_items=["urgency label"]),
+        ],
+        assumptions=[],
+        missing_information=[],
+        implementation_notes_for_engineer=[],
+        required_nodes=[],
+    )
+    clarification_state = ArchitectClarificationState(
+        resolved_slots=[
+            {
+                "slot_key": "result_application_mode",
+                "owner_agent": "architect_agent",
+                "stage_id": "plan_terminal_outcome",
+                "question_text": "What should happen with that result next?",
+                "question_intent": "result_application_mode",
+                "answer_status": "resolved",
+                "answer": "Aplicalo al mismo correo de Gmail como una etiqueta visible para poder filtrarlo despues.",
+            }
+        ]
+    )
+
+    refined = _refine_terminal_outcome_plan_from_slots(
+        plan=plan,
+        clarification_state=clarification_state,
+    )
+
+    assert refined.stages[-1].stage_kind == StageKind.apply_update_source
+    assert refined.stages[-1].target_entity == "gmail_message"
+    assert "label" in (refined.stages[-1].purpose or "").lower()
+    assert _plan_terminal_outcome_gap_question(refined) is None
 
 
 def test_architect_stage_selection_prompt_includes_recent_upstream_nodes(
@@ -486,6 +727,300 @@ def test_architect_rejects_non_main_ai_connectors_for_v1_rule_based_stage() -> N
     assert "rule_based_stage_rejects_ai_candidate" in reasons
 
 
+def test_architect_linking_page_selection_preserves_specific_node_docs() -> None:
+    stage = _plan().stages[0]
+    docs_chunks = [
+        {
+            "doc_id": "doc-imap",
+            "title": "Email Trigger (IMAP)",
+            "url": "https://docs.n8n.io/integrations/builtin/core-nodes/n8n-nodes-base.emailreadimap/",
+            "metadata": {},
+            "rerank_score": 0.98,
+            "text": "Email Trigger (IMAP) receives incoming emails from IMAP inboxes.",
+        },
+        {
+            "doc_id": "doc-privacy",
+            "title": "Privacy",
+            "url": "https://docs.n8n.io/privacy/",
+            "metadata": {},
+            "rerank_score": 0.97,
+            "text": "Privacy policy and generic documentation.",
+        },
+        {
+            "doc_id": "doc-tutorial",
+            "title": "AI Workflow Builder",
+            "url": "https://docs.n8n.io/advanced-ai/ai-workflow-builder/",
+            "metadata": {},
+            "rerank_score": 0.96,
+            "text": "Generic AI tutorial page unrelated to inbound email triggers.",
+        },
+    ]
+
+    selected_page_keys, selected_pages, _discarded = _select_linking_page_keys(
+        docs_chunks=docs_chunks,
+        user_query="Consume incoming Gmail emails as they arrive.",
+        plan=_plan(),
+        stage=stage,
+        previous_selections=[],
+        stage_requires_trigger=True,
+    )
+
+    assert selected_page_keys
+    assert "emailreadimap" in selected_pages[0]["page_key"]
+
+
+def test_architect_rejects_generic_scheduler_for_source_specific_trigger_stage() -> None:
+    plan = _plan()
+    stage = plan.stages[0]
+    candidate = _candidate(
+        "n8n-nodes-base.cron",
+        stage_id=stage.id,
+        has_main_input=False,
+        capability_summary="Schedule workflow execution on time-based intervals.",
+    )
+
+    reasons = _candidate_rejection_reasons(
+        candidate=candidate,
+        stage=stage,
+        plan=plan,
+        stage_requires_trigger=True,
+    )
+
+    assert "generic_scheduler_rejected_for_source_specific_trigger" in reasons
+
+
+def test_architect_blocks_when_plan_leaves_terminal_business_outcome_undefined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan().model_copy(
+        update={
+            "business_objective": "Classify incoming emails by urgency.",
+            "desired_outcome": "Classify incoming emails by urgency.",
+            "workflow_summary": "Two-stage workflow that receives emails and classifies urgency.",
+            "stages": _plan().stages[:2],
+            "data_flow": _plan().data_flow[:1],
+        }
+    )
+
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent.retrieve_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not retrieve")),
+    )
+
+    updates = architect_agent_node(
+        _state(
+            extra={
+                "architecture_plan": plan,
+                "user_query": "Crea un workflow que reciba emails y los clasifique por urgencia",
+            }
+        )
+    )
+
+    assert updates["architect_status"] == ArchitectStatus.architect_blocked_waiting_user
+    assert updates["missing_user_inputs"]
+    assert "what should happen with that result" in updates["missing_user_inputs"][0].lower()
+    assert updates["missing_user_input_details"][0].missing_item == "plan_terminal_outcome"
+
+
+def test_architect_blocks_when_apply_update_stage_still_lacks_concrete_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = _plan().model_copy(
+        update={
+            "stages": [
+                _plan().stages[0],
+                ArchitectureStage(
+                    id="stage_2",
+                    name="Filter Urgent Emails in Gmail",
+                    purpose="Make urgent emails easy to filter in Gmail later.",
+                    stage_kind=StageKind.apply_update_source,
+                    business_effect="Keep urgent emails visible for later filtering in Gmail.",
+                    target_entity="gmail",
+                    user_visible_goal="See urgent emails in Gmail filters.",
+                    required_capabilities=["Apply the result back into Gmail"],
+                    expected_inputs=["normalized email payload", "urgency label"],
+                    expected_outputs=["updated Gmail message"],
+                    dependencies=["stage_1"],
+                    success_criteria=["Urgent emails are easy to find in Gmail."],
+                ),
+            ],
+            "data_flow": [
+                ArchitectureDataFlowItem(
+                    source_stage_id="stage_1",
+                    target_stage_id="stage_2",
+                    data_items=["normalized email payload", "urgency label"],
+                )
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent.retrieve_context",
+        lambda *_args, **_kwargs: [{"doc_id": "doc-1", "text": "docs", "url": "https://docs.n8n.io/gmail"}],
+    )
+    monkeypatch.setattr("app.graphs.nodes.architect_agent.query_related_definition_chunks", lambda *_args, **_kwargs: [])
+
+    def _build_candidates(*, stage_id: str, **_kwargs):
+        if stage_id == "stage_1":
+            return [_candidate("n8n-nodes-base.gmailTrigger", stage_id=stage_id, has_main_input=False)]
+        return [
+            _candidate(
+                "n8n-nodes-base.gmail",
+                stage_id=stage_id,
+                capability_summary="Update Gmail messages by adding labels or changing message status.",
+            )
+        ]
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", _build_candidates)
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._select_stage_nodes_with_structured_output",
+        lambda *, candidates, **_kwargs: _StageSelectionOutput(
+            selected_node_types=[candidates[0].node_type],
+            rationale="selected",
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._build_workflow_blueprint_with_structured_output",
+        lambda **_kwargs: _WorkflowBlueprintOutput(
+            workflow_name="Ambiguous Gmail Update",
+            summary="Architect draft",
+            nodes=[
+                _WorkflowNodeBlueprint(
+                    node_id="an_1",
+                    name="gmail_trigger_1",
+                    node_type="n8n-nodes-base.gmailTrigger",
+                    type_version=1,
+                    stage_id="stage_1",
+                    purpose="Receive emails",
+                    depends_on=[],
+                ),
+                _WorkflowNodeBlueprint(
+                    node_id="an_2",
+                    name="gmail_2",
+                    node_type="n8n-nodes-base.gmail",
+                    type_version=1,
+                    stage_id="stage_2",
+                    purpose="Apply result in Gmail",
+                    depends_on=["an_1"],
+                ),
+            ],
+            connections=[_WorkflowConnectionBlueprint(source_node_id="an_1", target_node_id="an_2")],
+        ),
+    )
+
+    updates = architect_agent_node(
+        _state(
+            extra={
+                "architecture_plan": plan,
+                "runtime_context": {"model": None, "request_id": "req-architect", "persist_to_n8n": False},
+            }
+        )
+    )
+
+    assert updates["architect_status"] == ArchitectStatus.architect_blocked_waiting_user
+    assert updates["missing_user_inputs"]
+    assert "etiquetar" in updates["missing_user_inputs"][0].lower() or "archivar" in updates["missing_user_inputs"][0].lower()
+
+
+def test_architect_attaches_operation_hints_for_generic_source_update_nodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    plan = _plan().model_copy(
+        update={
+            "stages": [
+                _plan().stages[0],
+                ArchitectureStage(
+                    id="stage_2",
+                    name="Apply Urgency Label",
+                    purpose="Apply an urgency label to the Gmail message so users can filter it later.",
+                    stage_kind=StageKind.apply_update_source,
+                    business_effect="Add the urgency label to the Gmail message.",
+                    target_entity="gmail",
+                    user_visible_goal="Users can filter Gmail by urgency label.",
+                    required_capabilities=["Update the source Gmail message"],
+                    expected_inputs=["normalized email payload", "urgency label"],
+                    expected_outputs=["Gmail message updated with urgency label"],
+                    dependencies=["stage_1"],
+                    success_criteria=["The Gmail message receives the urgency label."],
+                ),
+            ],
+            "data_flow": [
+                ArchitectureDataFlowItem(
+                    source_stage_id="stage_1",
+                    target_stage_id="stage_2",
+                    data_items=["normalized email payload", "urgency label"],
+                )
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent.retrieve_context",
+        lambda *_args, **_kwargs: [{"doc_id": "doc-1", "text": "docs", "url": "https://docs.n8n.io/gmail"}],
+    )
+    monkeypatch.setattr("app.graphs.nodes.architect_agent.query_related_definition_chunks", lambda *_args, **_kwargs: [])
+
+    def _build_candidates(*, stage_id: str, **_kwargs):
+        if stage_id == "stage_1":
+            return [_candidate("n8n-nodes-base.gmailTrigger", stage_id=stage_id, has_main_input=False)]
+        return [
+            _candidate(
+                "n8n-nodes-base.gmail",
+                stage_id=stage_id,
+                capability_summary="Update Gmail messages by adding labels or changing message status.",
+            )
+        ]
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", _build_candidates)
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._select_stage_nodes_with_structured_output",
+        lambda *, candidates, **_kwargs: _StageSelectionOutput(
+            selected_node_types=[candidates[0].node_type],
+            rationale="selected",
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._build_workflow_blueprint_with_structured_output",
+        lambda **_kwargs: _WorkflowBlueprintOutput(
+            workflow_name="Gmail Label Flow",
+            summary="Architect draft",
+            nodes=[
+                _WorkflowNodeBlueprint(
+                    node_id="an_1",
+                    name="gmail_trigger_1",
+                    node_type="n8n-nodes-base.gmailTrigger",
+                    type_version=1,
+                    stage_id="stage_1",
+                    purpose="Receive emails",
+                    depends_on=[],
+                ),
+                _WorkflowNodeBlueprint(
+                    node_id="an_2",
+                    name="gmail_2",
+                    node_type="n8n-nodes-base.gmail",
+                    type_version=1,
+                    stage_id="stage_2",
+                    purpose="Apply urgency label",
+                    depends_on=["an_1"],
+                ),
+            ],
+            connections=[_WorkflowConnectionBlueprint(source_node_id="an_1", target_node_id="an_2")],
+        ),
+    )
+
+    updates = architect_agent_node(
+        _state(
+            extra={
+                "architecture_plan": plan,
+                "runtime_context": {"model": None, "request_id": "req-architect", "persist_to_n8n": False},
+            }
+        )
+    )
+
+    assert updates["architect_status"] == ArchitectStatus.architect_completed
+    assert updates["proposed_nodes"][1].implementation_hints["semantic_action"] == "apply_label"
+    assert updates["proposed_nodes"][1].implementation_hints["require_action_selection"] is True
+    assert updates["workflow_draft"].nodes[1].implementation_hints["preferred_resource"] == "message"
+
+
 def test_architect_builds_and_persists_new_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
     def _retrieve(*_args, **_kwargs):
         return [{"doc_id": "doc-1", "text": "docs", "url": "https://docs.n8n.io/gmail"}]
@@ -497,8 +1032,21 @@ def test_architect_builds_and_persists_new_workflow(monkeypatch: pytest.MonkeyPa
         if stage_id == "stage_1":
             return [_candidate("n8n-nodes-base.gmailTrigger", stage_id=stage_id, has_main_input=False)]
         if stage_id == "stage_2":
-            return [_candidate("n8n-nodes-base.code", stage_id=stage_id, type_version=2)]
-        return [_candidate("n8n-nodes-base.googleSheets", stage_id=stage_id)]
+            return [
+                _candidate(
+                    "n8n-nodes-base.code",
+                    stage_id=stage_id,
+                    type_version=2,
+                    capability_summary="Use AI or code-based logic to classify urgency.",
+                )
+            ]
+        return [
+            _candidate(
+                "n8n-nodes-base.googleSheets",
+                stage_id=stage_id,
+                capability_summary="Store workflow results in a spreadsheet table.",
+            )
+        ]
 
     monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", _build_candidates)
     monkeypatch.setattr(
@@ -599,7 +1147,7 @@ def test_architect_blocks_when_only_tool_candidates_exist(monkeypatch: pytest.Mo
     assert updates["architect_status"] == ArchitectStatus.architect_blocked_waiting_user
     assert updates["target_stage"] is None
     assert updates["missing_user_inputs"]
-    assert "trigger" in updates["missing_user_inputs"][0].lower()
+    assert "iniciar" in updates["missing_user_inputs"][0].lower() or "evento" in updates["missing_user_inputs"][0].lower()
 
 
 def test_architect_resume_after_user_clarification(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -617,8 +1165,21 @@ def test_architect_resume_after_user_clarification(monkeypatch: pytest.MonkeyPat
                 return []
             return [_candidate("n8n-nodes-base.webhook", stage_id=stage_id, has_main_input=False)]
         if stage_id == "stage_2":
-            return [_candidate("n8n-nodes-base.code", stage_id=stage_id, type_version=2)]
-        return [_candidate("n8n-nodes-base.googleSheets", stage_id=stage_id)]
+            return [
+                _candidate(
+                    "n8n-nodes-base.code",
+                    stage_id=stage_id,
+                    type_version=2,
+                    capability_summary="Use AI or code-based logic to classify urgency.",
+                )
+            ]
+        return [
+            _candidate(
+                "n8n-nodes-base.googleSheets",
+                stage_id=stage_id,
+                capability_summary="Store workflow results in a spreadsheet table.",
+            )
+        ]
 
     monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", _build_candidates)
     monkeypatch.setattr(
@@ -694,6 +1255,201 @@ def test_architect_resume_after_user_clarification(monkeypatch: pytest.MonkeyPat
     assert second["architect_clarification_state"].turns[0].answer is not None
 
 
+def test_architect_uses_request_context_query_for_stage_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_queries: List[str] = []
+
+    def _retrieve_context(query: str, *args, **kwargs):
+        seen_queries.append(query)
+        return [{"doc_id": "doc-1", "text": "docs", "url": "https://docs.n8n.io/webhook"}]
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent.retrieve_context", _retrieve_context)
+    monkeypatch.setattr("app.graphs.nodes.architect_agent.query_related_definition_chunks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", lambda **_kwargs: [])
+
+    updates = architect_mod.architect_agent_node(
+        _state(
+            extra={
+                "user_query": "nothing else",
+                "request_context_query": "crea un workflow para coger emails y clasificarlos por urgencia",
+            }
+        )
+    )
+
+    assert updates["architect_status"] == ArchitectStatus.architect_blocked_waiting_user
+    assert seen_queries
+    assert any("coger emails" in query.lower() for query in seen_queries)
+    assert all("nothing else" not in query.lower() for query in seen_queries)
+
+
+def test_architect_rephrases_pending_question_in_spanish_without_consuming_answer() -> None:
+    state = _state(
+        extra={
+            "architect_status": ArchitectStatus.architect_blocked_waiting_user,
+            "architect_clarification_state": ArchitectClarificationState(
+                attempts_used=1,
+                max_attempts=3,
+                pending_questions=["How should the result of stage 'Urgency Classification' be applied or stored?"],
+                pending_slots=[
+                    {
+                        "slot_key": "result_application_mode",
+                        "owner_agent": "architect_agent",
+                        "stage_id": "stage_2",
+                        "question_text": "How should the result of stage 'Urgency Classification' be applied or stored?",
+                        "question_intent": "result_application_mode",
+                        "answer_status": "pending",
+                    }
+                ],
+                turns=[
+                    {
+                        "stage_id": "stage_2",
+                        "slot_key": "result_application_mode",
+                        "question": "How should the result of stage 'Urgency Classification' be applied or stored?",
+                        "answer": None,
+                    }
+                ],
+            ),
+            "user_query": "Me lo puedes preguntar en espanol?",
+            "resume_requested": True,
+        }
+    )
+
+    updates = architect_agent_node(state)
+
+    assert updates["architect_status"] == ArchitectStatus.architect_blocked_waiting_user
+    assert "urgency classification" in updates["missing_user_inputs"][0].lower()
+    assert updates["architect_clarification_state"].turns[0].answer is None
+    assert "architect_question_rephrased" in updates["routing_signals"]
+
+
+def test_architect_single_answer_can_clear_multiple_pending_questions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent.retrieve_context",
+        lambda *_args, **_kwargs: [{"doc_id": "doc-1", "text": "docs", "url": "https://docs.n8n.io/webhook"}],
+    )
+    monkeypatch.setattr("app.graphs.nodes.architect_agent.query_related_definition_chunks", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._build_candidates",
+        lambda *, stage_id, **_kwargs: (
+            [_candidate("n8n-nodes-base.webhook", stage_id=stage_id, has_main_input=False)]
+            if stage_id == "stage_1"
+            else [
+                _candidate(
+                    "n8n-nodes-base.code",
+                    stage_id=stage_id,
+                    type_version=2,
+                    capability_summary="Use AI or code-based logic to classify urgency.",
+                )
+            ]
+            if stage_id == "stage_2"
+            else [
+                _candidate(
+                    "n8n-nodes-base.googleSheets",
+                    stage_id=stage_id,
+                    capability_summary="Store workflow results in a spreadsheet table.",
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._select_stage_nodes_with_structured_output",
+        lambda *, candidates, **_kwargs: _StageSelectionOutput(
+            selected_node_types=[candidates[0].node_type],
+            rationale="selected",
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._build_workflow_blueprint_with_structured_output",
+        lambda **_kwargs: _WorkflowBlueprintOutput(
+            workflow_name="Clarified architect workflow",
+            summary="Workflow",
+            nodes=[
+                _WorkflowNodeBlueprint(
+                    node_id="an_1",
+                    name="webhook_1",
+                    node_type="n8n-nodes-base.webhook",
+                    type_version=1,
+                    stage_id="stage_1",
+                    purpose="Receive",
+                    depends_on=[],
+                ),
+                _WorkflowNodeBlueprint(
+                    node_id="an_2",
+                    name="code_2",
+                    node_type="n8n-nodes-base.code",
+                    type_version=2,
+                    stage_id="stage_2",
+                    purpose="Classify",
+                    depends_on=["an_1"],
+                ),
+                _WorkflowNodeBlueprint(
+                    node_id="an_3",
+                    name="google_sheets_3",
+                    node_type="n8n-nodes-base.googleSheets",
+                    type_version=1,
+                    stage_id="stage_3",
+                    purpose="Store",
+                    depends_on=["an_2"],
+                ),
+            ],
+            connections=[
+                _WorkflowConnectionBlueprint(source_node_id="an_1", target_node_id="an_2"),
+                _WorkflowConnectionBlueprint(source_node_id="an_2", target_node_id="an_3"),
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.engineer_agent.N8NClient.create_workflow",
+        lambda self, payload: {"id": "wf_multi_answer", "name": payload["name"], "url": "http://localhost:5678/workflow/wf_multi_answer"},
+    )
+
+    state = _state(
+        extra={
+            "architect_status": ArchitectStatus.architect_blocked_waiting_user,
+            "architect_clarification_state": ArchitectClarificationState(
+                attempts_used=1,
+                max_attempts=3,
+                pending_questions=[
+                    "How should the result of stage 'Urgency Classification' be applied or stored?",
+                    "Where should the result of stage 'Store Result' be stored?",
+                ],
+                pending_slots=[
+                    {
+                        "slot_key": "result_application_mode",
+                        "owner_agent": "architect_agent",
+                        "stage_id": "stage_2",
+                        "question_text": "How should the result of stage 'Urgency Classification' be applied or stored?",
+                        "question_intent": "result_application_mode",
+                        "answer_status": "pending",
+                    },
+                    {
+                        "slot_key": "storage_destination",
+                        "owner_agent": "architect_agent",
+                        "stage_id": "stage_3",
+                        "question_text": "Where should the result of stage 'Store Result' be stored?",
+                        "question_intent": "storage_destination",
+                        "answer_status": "pending",
+                    },
+                ],
+                turns=[
+                    {"stage_id": "stage_2", "slot_key": "result_application_mode", "question": "How should the result of stage 'Urgency Classification' be applied or stored?", "answer": None},
+                    {"stage_id": "stage_3", "slot_key": "storage_destination", "question": "Where should the result of stage 'Store Result' be stored?", "answer": None},
+                ],
+            ),
+            "user_query": "Usa un LLM para clasificar y luego guarda el resultado en Google Sheets.",
+            "resume_requested": True,
+            "runtime_context": {"model": None, "request_id": "req-architect-multi", "persist_to_n8n": True},
+        }
+    )
+
+    updates = architect_agent_node(state)
+
+    assert updates["architect_status"] == ArchitectStatus.architect_completed
+    assert updates["architect_clarification_state"].pending_questions == []
+    assert all(turn.answer is not None for turn in updates["architect_clarification_state"].turns)
+
+
 def test_architect_fails_after_max_clarifications(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "app.graphs.nodes.architect_agent.retrieve_context",
@@ -734,8 +1490,21 @@ def test_architect_updates_existing_workflow(monkeypatch: pytest.MonkeyPatch) ->
         if stage_id == "stage_1":
             return [_candidate("n8n-nodes-base.gmailTrigger", stage_id=stage_id, has_main_input=False)]
         if stage_id == "stage_2":
-            return [_candidate("n8n-nodes-base.code", stage_id=stage_id, type_version=2)]
-        return [_candidate("n8n-nodes-base.googleSheets", stage_id=stage_id)]
+            return [
+                _candidate(
+                    "n8n-nodes-base.code",
+                    stage_id=stage_id,
+                    type_version=2,
+                    capability_summary="Use AI or code-based logic to classify urgency.",
+                )
+            ]
+        return [
+            _candidate(
+                "n8n-nodes-base.googleSheets",
+                stage_id=stage_id,
+                capability_summary="Store workflow results in a spreadsheet table.",
+            )
+        ]
 
     monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", _build_candidates)
     monkeypatch.setattr(
@@ -805,3 +1574,66 @@ def test_architect_updates_existing_workflow(monkeypatch: pytest.MonkeyPatch) ->
     assert updates["architect_status"] == ArchitectStatus.architect_completed
     assert updates["workflow_persist_action"] == "updated"
     assert updates["active_workflow_id"] == "wf_existing"
+
+
+def test_architect_blocks_when_blueprint_does_not_cover_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent.retrieve_context",
+        lambda *_args, **_kwargs: [{"doc_id": "doc-1", "text": "docs", "url": "https://docs.n8n.io/gmail"}],
+    )
+    monkeypatch.setattr("app.graphs.nodes.architect_agent.query_related_definition_chunks", lambda *_args, **_kwargs: [])
+
+    def _build_candidates(*, stage_id: str, **_kwargs):
+        if stage_id == "stage_1":
+            return [_candidate("n8n-nodes-base.gmailTrigger", stage_id=stage_id, has_main_input=False)]
+        if stage_id == "stage_2":
+            return [
+                _candidate(
+                    "n8n-nodes-base.code",
+                    stage_id=stage_id,
+                    type_version=2,
+                    capability_summary="Use AI or code-based logic to classify urgency.",
+                )
+            ]
+        return [
+            _candidate(
+                "n8n-nodes-base.googleSheets",
+                stage_id=stage_id,
+                capability_summary="Store workflow results in a spreadsheet table.",
+            )
+        ]
+
+    monkeypatch.setattr("app.graphs.nodes.architect_agent._build_candidates", _build_candidates)
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._select_stage_nodes_with_structured_output",
+        lambda *, candidates, **_kwargs: _StageSelectionOutput(
+            selected_node_types=[candidates[0].node_type],
+            rationale="selected",
+            needs_clarification=False,
+            clarification_questions=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "app.graphs.nodes.architect_agent._build_workflow_blueprint_with_structured_output",
+        lambda **_kwargs: _WorkflowBlueprintOutput(
+            workflow_name="Broken blueprint",
+            summary="Missing downstream stages",
+            nodes=[
+                _WorkflowNodeBlueprint(
+                    node_id="an_1",
+                    name="gmail_trigger_1",
+                    node_type="n8n-nodes-base.gmailTrigger",
+                    type_version=1,
+                    stage_id="stage_1",
+                    purpose="Receive emails",
+                    depends_on=[],
+                )
+            ],
+            connections=[],
+        ),
+    )
+
+    updates = architect_agent_node(_state())
+
+    assert updates["architect_status"] == ArchitectStatus.architect_blocked_waiting_user
+    assert updates["missing_user_inputs"]

@@ -78,4 +78,4 @@ class N8NClient:
         return self._request("POST", self._workflows_endpoint(), payload=workflow_payload)
 
     def update_workflow(self, workflow_id: str, workflow_payload: Dict[str, Any]) -> Dict[str, Any]:
-        return self._request("PATCH", self._endpoint(workflow_id), payload=workflow_payload)
+        return self._request("PUT", self._endpoint(workflow_id), payload=workflow_payload)

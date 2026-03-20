@@ -34,6 +34,11 @@ def _client_with_store() -> tuple[TestClient, InMemoryStore]:
     return TestClient(app), store
 
 
+def _read_temporal_result() -> Any:
+    path = routes.chat_service._temporal_result_path  # noqa: SLF001
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _fake_reasoning_result() -> MultiAgentGraphResult:
     return MultiAgentGraphResult(
         user_query="Crea un flujo",
@@ -174,7 +179,8 @@ def test_chat_completion_contract_non_stream(monkeypatch) -> None:
     assert payload["object"] == "chat.completion"
     assert isinstance(payload["choices"], list) and payload["choices"]
     content = payload["choices"][0]["message"]["content"]
-    parsed = json.loads(content)
+    assert content == "He dejado el plan listo para la siguiente fase."
+    parsed = _read_temporal_result()
     assert parsed["entry_intent"] == "business_discovery_conversation"
     assert parsed["target_stage"] is None
     assert parsed["selected_use_case"]["id"] == "uc_1"
@@ -270,7 +276,8 @@ def test_chat_completion_contract_accepts_additive_engineer_fields(monkeypatch) 
     )
     assert response.status_code == 200
     payload = response.json()
-    parsed = json.loads(payload["choices"][0]["message"]["content"])
+    assert payload["choices"][0]["message"]["content"] == "Aqui lo tienes: http://localhost:5678/workflow/wf_contract_1"
+    parsed = _read_temporal_result()
     assert parsed["entry_intent"] == "business_discovery_conversation"
     assert parsed["current_stage"] == "engineer_agent"
     assert parsed["implementation_status"] == "blocked_waiting_user"

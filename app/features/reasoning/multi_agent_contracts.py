@@ -24,6 +24,33 @@ class AgentStage(str, Enum):
     qa_agent = "qa_agent"
 
 
+class StageKind(str, Enum):
+    trigger_intake = "trigger_intake"
+    fetch_read = "fetch_read"
+    transform_process = "transform_process"
+    classify_decision = "classify_decision"
+    route_branch = "route_branch"
+    apply_update_source = "apply_update_source"
+    persist_store = "persist_store"
+    notify_output = "notify_output"
+
+
+class DecisionSlotAnswerStatus(str, Enum):
+    pending = "pending"
+    resolved = "resolved"
+    deferred = "deferred"
+
+
+class DecisionSlot(BaseModel):
+    slot_key: str
+    owner_agent: AgentStage
+    stage_id: Optional[str] = None
+    question_text: str = ""
+    question_intent: Optional[str] = None
+    answer_status: DecisionSlotAnswerStatus = DecisionSlotAnswerStatus.pending
+    answer: Optional[str] = None
+
+
 class ConsultantSource(str, Enum):
     conversation_history = "conversation_history"
     nodes_index = "nodes_index"
@@ -148,6 +175,11 @@ class ArchitectureStage(BaseModel):
     id: str
     name: str
     purpose: str
+    stage_kind: Optional[StageKind] = None
+    business_effect: Optional[str] = None
+    target_entity: Optional[str] = None
+    user_visible_goal: Optional[str] = None
+    unresolved_decisions: List[str] = Field(default_factory=list)
     required_capabilities: List[str] = Field(default_factory=list)
     expected_inputs: List[str] = Field(default_factory=list)
     expected_outputs: List[str] = Field(default_factory=list)
@@ -183,6 +215,13 @@ class WorkflowContext(BaseModel):
     handoff_target: Optional[AgentStage] = None
     required_node_types: List[str] = Field(default_factory=list)
     unresolved_inputs: List[str] = Field(default_factory=list)
+    pending_decision_slots: List[DecisionSlot] = Field(default_factory=list)
+    resolved_decision_slots: List[DecisionSlot] = Field(default_factory=list)
+    clarification_owner: Optional[AgentStage] = None
+    clarification_reason: Optional[str] = None
+    last_block_cause: Optional[str] = None
+    stage_bundle_map: Dict[str, List[str]] = Field(default_factory=dict)
+    evidence_fingerprints: Dict[str, str] = Field(default_factory=dict)
     notes: List[str] = Field(default_factory=list)
 
 
@@ -250,6 +289,7 @@ class PMProgressState(BaseModel):
 
 class PMClarificationTurn(BaseModel):
     stage_id: Optional[str] = None
+    slot_key: Optional[str] = None
     question: str
     answer: Optional[str] = None
 
@@ -258,6 +298,8 @@ class PMClarificationState(BaseModel):
     attempts_used: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=2, ge=1)
     pending_questions: List[str] = Field(default_factory=list)
+    pending_slots: List[DecisionSlot] = Field(default_factory=list)
+    resolved_slots: List[DecisionSlot] = Field(default_factory=list)
     turns: List[PMClarificationTurn] = Field(default_factory=list)
 
 
@@ -290,11 +332,13 @@ class ArchitectNodeCandidate(BaseModel):
 class ArchitectStageSearchState(BaseModel):
     stage_id: str
     pass_index: int = Field(default=1, ge=1)
+    query_variant: int = Field(default=1, ge=1)
     query: str
     doc_chunk_ids: List[str] = Field(default_factory=list)
     candidate_node_types: List[str] = Field(default_factory=list)
     result_count: int = Field(default=0, ge=0)
     top_rerank_confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    evidence_fingerprint: Optional[str] = None
     notes: List[str] = Field(default_factory=list)
 
 
@@ -310,6 +354,7 @@ class ArchitectStageSelection(BaseModel):
 
 class ArchitectClarificationTurn(BaseModel):
     stage_id: Optional[str] = None
+    slot_key: Optional[str] = None
     question: str
     answer: Optional[str] = None
 
@@ -318,6 +363,8 @@ class ArchitectClarificationState(BaseModel):
     attempts_used: int = Field(default=0, ge=0)
     max_attempts: int = Field(default=3, ge=1)
     pending_questions: List[str] = Field(default_factory=list)
+    pending_slots: List[DecisionSlot] = Field(default_factory=list)
+    resolved_slots: List[DecisionSlot] = Field(default_factory=list)
     turns: List[ArchitectClarificationTurn] = Field(default_factory=list)
 
 
@@ -342,6 +389,7 @@ class ProposedNode(BaseModel):
     has_main_input: Optional[bool] = None
     input_connection_types: List[str] = Field(default_factory=list)
     output_connection_types: List[str] = Field(default_factory=list)
+    implementation_hints: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RequiredCredential(BaseModel):
@@ -368,6 +416,7 @@ class WorkflowDraftNode(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     position: List[int] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
+    implementation_hints: Dict[str, Any] = Field(default_factory=dict)
 
 
 class WorkflowDraftConnection(BaseModel):
@@ -402,6 +451,7 @@ class ImplementationQueueItem(BaseModel):
     expected_inputs: List[str] = Field(default_factory=list)
     expected_outputs: List[str] = Field(default_factory=list)
     status: Literal["pending", "implemented", "blocked"] = "pending"
+    implementation_hints: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ImplementedNode(BaseModel):
@@ -434,6 +484,7 @@ class MissingUserInput(BaseModel):
     missing_item: str
     reason: str
     blocking_node_id: Optional[str] = None
+    slot_key: Optional[str] = None
     category: Literal[
         "credential",
         "parameter",
@@ -441,12 +492,14 @@ class MissingUserInput(BaseModel):
         "business_rule",
         "handoff",
         "dependency",
+        "decision",
     ] = "parameter"
     question: str
 
 
 class MultiAgentGraphResult(BaseModel):
     user_query: str
+    request_context_query: Optional[str] = None
     entry_intent: EntryIntent
     target_stage: Optional[AgentStage] = None
     confidence: float = Field(ge=0.0, le=1.0)
@@ -467,6 +520,13 @@ class MultiAgentGraphResult(BaseModel):
     selection_reason: Optional[str] = None
     architecture_plan: Optional[ArchitecturePlan] = None
     workflow_context: Optional[WorkflowContext] = None
+    pending_decision_slots: List[DecisionSlot] = Field(default_factory=list)
+    resolved_decision_slots: List[DecisionSlot] = Field(default_factory=list)
+    clarification_owner: Optional[AgentStage] = None
+    clarification_reason: Optional[str] = None
+    last_block_cause: Optional[str] = None
+    stage_bundle_map: Dict[str, List[str]] = Field(default_factory=dict)
+    evidence_fingerprints: Dict[str, str] = Field(default_factory=dict)
     planning_summary: Optional[str] = None
     pm_status: Optional[PMStatus] = None
     pm_stage_plan: List[PMStagePlan] = Field(default_factory=list)

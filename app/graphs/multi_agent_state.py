@@ -28,6 +28,7 @@ from ..features.reasoning.multi_agent_contracts import (
     PMStageSearchState,
     PMStageSelection,
     PMStatus,
+    DecisionSlot,
     MissingUserInput,
     ProposedNode,
     RequiredCredential,
@@ -41,6 +42,7 @@ from ..features.reasoning.multi_agent_contracts import (
 
 class MultiAgentGraphState(TypedDict, total=False):
     user_query: str
+    request_context_query: str
     entry_intent: EntryIntent
     target_stage: Optional[AgentStage]
     confidence: float
@@ -59,6 +61,13 @@ class MultiAgentGraphState(TypedDict, total=False):
     alternative_use_cases: List[UseCase]
     selection_reason: Optional[str]
     workflow_context: Optional[WorkflowContext | Dict[str, Any]]
+    pending_decision_slots: List[DecisionSlot | Dict[str, Any]]
+    resolved_decision_slots: List[DecisionSlot | Dict[str, Any]]
+    clarification_owner: Optional[AgentStage | str]
+    clarification_reason: Optional[str]
+    last_block_cause: Optional[str]
+    stage_bundle_map: Dict[str, List[str]]
+    evidence_fingerprints: Dict[str, str]
     architecture_plan: Optional[ArchitecturePlan | Dict[str, Any]]
     planning_summary: Optional[str]
     pm_status: Optional[PMStatus | str]

@@ -6,6 +6,7 @@ import re
 import time
 from typing import Dict, List, Optional, Tuple
 
+from ...config import settings
 from ...features.reasoning.multi_agent_contracts import (
     AgentStage,
     EntryIntent,
@@ -31,6 +32,12 @@ _FIX_PATTERNS = (
     r"\bnot working\b",
     r"\bbroken\b",
     r"\btimeout\b",
+    r"\barregl[ao]\b",
+    r"\brepar[ao]\b",
+    r"\bdepur[ao]\b",
+    r"\berror(?:es)?\b",
+    r"\bfall[ao]s?\b",
+    r"\brot[ao]\b",
 )
 _EDIT_PATTERNS = (
     r"\bmodify\b",
@@ -42,6 +49,15 @@ _EDIT_PATTERNS = (
     r"\badd\b",
     r"\bremove\b",
     r"\brefactor\b",
+    r"\bmodific[ao]\b",
+    r"\bcambi[ao]\b",
+    r"\bactualiz[ao]\b",
+    r"\bedit[ao]\b",
+    r"\bextiend[eo]\b",
+    r"\bajust[ae]\b",
+    r"\banad[ei]\b",
+    r"\bañad[ei]\b",
+    r"\belimin[ao]\b",
 )
 _EXISTING_WORKFLOW_PATTERNS = (
     r"\bexisting workflow\b",
@@ -58,6 +74,13 @@ _BUILD_PATTERNS = (
     r"\bnew automation\b",
     r"\bdesign a workflow\b",
     r"\bset up a workflow\b",
+    r"\bcrea(?:r)?\b",
+    r"\bconstruy(?:e|elo|eme|amos|an)\b",
+    r"\bgenera(?:r)?\b",
+    r"\bnuevo workflow\b",
+    r"\bnueva automatizaci[oó]n\b",
+    r"\bdise[ñn]a(?:r)? un workflow\b",
+    r"\bmonta(?:r)? un workflow\b",
 )
 _DISCOVERY_PATTERNS = (
     r"\bbusiness process\b",
@@ -69,6 +92,11 @@ _DISCOVERY_PATTERNS = (
     r"\boperation(s)? team\b",
     r"\bwhere should we automate\b",
     r"\bwhich processes\b",
+    r"\bproceso(?:s)? de negocio\b",
+    r"\boportunidades de automatizaci[oó]n\b",
+    r"\bqu[ée] procesos\b",
+    r"\bdonde automatizar\b",
+    r"\bsesi[oó]n de discovery\b",
 )
 _INFORMATION_PATTERNS = (
     r"\bwhat is\b",
@@ -79,6 +107,13 @@ _INFORMATION_PATTERNS = (
     r"\bbest practice\b",
     r"\bpros and cons\b",
     r"\bguidance\b",
+    r"\bqu[ée] es\b",
+    r"\bc[oó]mo funciona\b",
+    r"\bexplica\b",
+    r"\bcompara\b",
+    r"\brecomienda\b",
+    r"\bbuenas pr[aá]cticas\b",
+    r"\bgu[ií]a\b",
 )
 _MULTITURN_MARKERS = (r"\buser:\b", r"\bassistant:\b", r"\bclient:\b", r"\bconsultant:\b")
 
@@ -355,6 +390,9 @@ def route_entry_intent(
     model: Optional[str] = None,
     request_id: Optional[str] = None,
 ) -> EntryRouterDecision:
+    if not getattr(settings, "ROUTER_USE_LLM", False):
+        return _apply_guardrails(user_query, _heuristic_decision(user_query))
+
     try:
         decision = _classify_with_structured_output(
             user_query=user_query,
