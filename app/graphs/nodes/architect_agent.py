@@ -33,7 +33,7 @@ from ...features.reasoning.multi_agent_contracts import (
     WorkflowDraftNode,
     WorkflowVersion,
 )
-from ...llm import get_langchain_chat_model
+from ...llm import get_langchain_chat_model, invoke_openai_structured_output
 from ...observability import emit_llm_output_event, emit_llm_prompt_event, emit_trace_event
 from ...rag import retrieve_context
 from ..multi_agent_state import MultiAgentGraphState
@@ -651,7 +651,40 @@ def _invoke_structured_output(
 
     llm = get_langchain_chat_model(model=model, temperature=temperature)
     if llm is None:
-        raise RuntimeError("LangChain chat model is unavailable")
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        emit_llm_prompt_event(
+            trace_logger,
+            request_id=request_id,
+            stage=stage,
+            model=model,
+            messages=messages,
+            estimated_tokens=0,
+            params={"temperature": temperature, "structured": True, "provider": "openai_json_schema"},
+        )
+        response = invoke_openai_structured_output(
+            messages=messages,
+            model=model,
+            output_model=output_model,
+            temperature=temperature,
+        )
+        emit_llm_output_event(
+            trace_logger,
+            request_id=request_id,
+            stage=stage,
+            model=model,
+            latency_ms=None,
+            content=(
+                response.model_dump_json(exclude_none=True)
+                if hasattr(response, "model_dump_json")
+                else str(response)
+            ),
+            usage=None,
+            extra={"structured": True, "provider": "openai_json_schema"},
+        )
+        return response
 
     try:
         structured = llm.with_structured_output(output_model)
@@ -1113,6 +1146,56 @@ def _candidate_matches_source_update_stage(
         token in f"{identity} {summary}"
         for token in ("update", "status", "mark", "folder", "move", "archive", "label", "tag")
     )
+
+
+def _candidate_is_explicit_model_node(candidate: ArchitectNodeCandidate) -> bool:
+    if _candidate_is_generic_utility_node(candidate) or not _candidate_looks_ai_capable(candidate):
+        return False
+    identity = _candidate_identity_text(candidate)
+    return any(
+        token in identity
+        for token in (
+            "openai",
+            "mistral",
+            "ollama",
+            "anthropic",
+            "claude",
+            "gemini",
+            "groq",
+            "azureopenai",
+            "azure_openai",
+            "bedrock",
+            "huggingface",
+        )
+    )
+
+
+def _extract_priority_labels(*texts: Any) -> List[str]:
+    variants = {
+        "low": {"low", "bajo"},
+        "medium": {"medium", "medio"},
+        "high": {"high", "alto"},
+        "critical": {"critical", "critico", "crítico"},
+    }
+    output: List[str] = []
+    seen = set()
+    for text in texts:
+        tokens = re.findall(r"[a-záéíóúñü]+", _sanitize_text(text).lower())
+        for token in tokens:
+            for canonical, allowed in variants.items():
+                if token not in allowed or canonical in seen:
+                    continue
+                seen.add(canonical)
+                output.append(token)
+                break
+    return output
+
+
+def _extract_fallback_label(*texts: Any) -> Optional[str]:
+    combined = " ".join(_sanitize_text(text) for text in texts if _sanitize_text(text))
+    if re.search(r"\breview\b", combined, flags=re.IGNORECASE):
+        return "Review"
+    return None
 
 
 def _page_selection_terms(
@@ -2069,6 +2152,27 @@ def _derive_operation_hints(
         "target_entity": stage.target_entity or "",
         "user_visible_goal": _compact(stage.user_visible_goal or stage.name, max_chars=220),
     }
+    priority_labels = _extract_priority_labels(
+        stage.name,
+        stage.purpose,
+        stage.business_effect or "",
+        stage.user_visible_goal or "",
+        " ".join(stage.required_capabilities),
+        " ".join(stage.expected_inputs),
+        " ".join(stage.expected_outputs),
+        " ".join(stage.success_criteria),
+        stage.notes or "",
+        plan.workflow_summary,
+        plan.business_objective,
+        plan.desired_outcome,
+        " ".join(plan.implementation_notes_for_engineer),
+    )
+    fallback_label = _extract_fallback_label(
+        stage.notes or "",
+        plan.workflow_summary,
+        " ".join(plan.implementation_notes_for_engineer),
+        plan.desired_outcome,
+    )
     if candidate is not None:
         hints["candidate_display_name"] = candidate.display_name or ""
 
@@ -2096,6 +2200,8 @@ def _derive_operation_hints(
             )
             if any(token in combined for token in ("gmail", "email", "correo", "message", "mensaje")):
                 hints["preferred_resource"] = "message"
+                hints["source_identifier_hint"] = "Use the upstream Gmail message identifier when binding this update."
+                hints["parameter_focus"] = ["resource", "operation", "messageId", "labelId", "labelIds", "name", "threadId"]
             label_name = _extract_stage_named_token(
                 stage.name,
                 stage.purpose,
@@ -2106,6 +2212,18 @@ def _derive_operation_hints(
             )
             if label_name:
                 hints["target_label_name"] = label_name
+            if priority_labels:
+                hints["allowed_label_values"] = priority_labels
+            if fallback_label:
+                hints["fallback_label_name"] = fallback_label
+            hints["label_mapping_strategy"] = (
+                "Use the classification result as the visible label on the source email. If the classifier returns no confident label, use the fallback label."
+            )
+            hints["required_runtime_bindings"] = ["messageId", "urgency_level"]
+            hints["label_resolution_strategy"] = (
+                "Do not invent label IDs. If the node bundle does not already create or resolve Gmail labels, "
+                "assume the visible labels already exist and leave only the label-binding field unresolved when IDs are still unknown."
+            )
         elif any(token in action_text for token in ("move", "folder", "carpeta", "mover")):
             hints["semantic_action"] = "move_item"
             hints["selector_guidance"] = "Configure this node to move the source item to the appropriate folder or location."
@@ -2121,6 +2239,13 @@ def _derive_operation_hints(
             )
     elif stage.stage_kind == StageKind.classify_decision:
         hints["semantic_action"] = "classify_payload"
+        hints["classification_output_key"] = "urgency_level"
+        hints["classification_output_mode"] = "single_label"
+        hints["classification_input_hints"] = ["subject", "body"]
+        if priority_labels:
+            hints["allowed_label_values"] = priority_labels
+        if fallback_label:
+            hints["fallback_label_name"] = fallback_label
         if _user_explicitly_requested_ai(
             plan.business_objective,
             plan.desired_outcome,
@@ -2141,8 +2266,59 @@ def _derive_operation_hints(
             plan.desired_outcome,
         ):
             hints["classification_method"] = "rule_based"
+        if candidate is not None and candidate.node_type == "n8n-nodes-base.aiTransform":
+            hints["require_action_selection"] = True
+            hints["allow_inferred_parameter_keys"] = ["instructions"]
+            hints["required_parameter_keys"] = ["instructions"]
+            hints["parameter_focus"] = ["instructions", "jsCode"]
+            hints["selector_guidance"] = (
+                "Configure this node with explicit instructions that read the email subject and body semantically and return exactly one urgency label."
+            )
+        if candidate is not None and candidate.node_type == "n8n-nodes-base.openAi":
+            hints["allow_inferred_parameter_keys"] = [
+                "model",
+                "chatModel",
+                "resource",
+                "operation",
+                "prompt",
+                "input",
+                "instruction",
+                "jsonOutput",
+                "simplifyOutput",
+            ]
+            hints["parameter_focus"] = [
+                "model",
+                "chatModel",
+                "prompt",
+                "input",
+                "instruction",
+                "jsonOutput",
+                "simplifyOutput",
+            ]
+            hints["selector_guidance"] = (
+                "Configure the explicit model call so it reads subject and body and returns exactly one urgency label from the allowed values."
+            )
     elif stage.stage_kind == StageKind.trigger_intake:
         hints["semantic_action"] = "receive_incoming_item"
+        if candidate is not None and candidate.node_type == "n8n-nodes-base.gmailTrigger":
+            hints["native_trigger_mechanism"] = "polling"
+            hints["preferred_poll_mode"] = "everyMinute"
+            hints["allow_inferred_parameter_keys"] = [
+                "pollTimes.item.mode",
+                "authentication",
+                "event",
+                "simple",
+            ]
+            hints["parameter_focus"] = [
+                "pollTimes.item.mode",
+                "event",
+                "simple",
+                "authentication",
+            ]
+            hints["selector_guidance"] = (
+                "This trigger uses Gmail's native polling settings. Do not invent push or webhook semantics. "
+                "Use the shortest safe native cadence when the workflow requires near-real-time intake."
+            )
     elif stage.stage_kind == StageKind.persist_store:
         hints["semantic_action"] = "persist_result"
     elif stage.stage_kind == StageKind.notify_output:
@@ -2209,6 +2385,10 @@ def _fallback_candidate_score(
             ),
         ):
             score += 5.0
+            if _candidate_is_explicit_model_node(candidate):
+                score += 2.5
+            elif candidate.node_type == "n8n-nodes-base.aiTransform":
+                score += 0.8
         if _is_trigger_candidate(candidate):
             score -= 8.0
     if stage.stage_kind == StageKind.apply_update_source:
@@ -2335,6 +2515,7 @@ def _select_stage_nodes_with_structured_output(
         f"Workflow summary: {plan.workflow_summary}\n"
         f"Current stage id: {stage.id}\n"
         f"Current stage name: {stage.name}\n"
+        f"Current stage kind: {stage.stage_kind.value if stage.stage_kind is not None else 'unknown'}\n"
         f"Current stage purpose: {stage.purpose}\n"
         f"Current stage required capabilities: {', '.join(stage.required_capabilities) or '-'}\n"
         f"Current stage expected inputs: {', '.join(stage.expected_inputs) or '-'}\n"
@@ -2352,6 +2533,8 @@ def _select_stage_nodes_with_structured_output(
         "- Avoid selecting a node that would make the previous 2 to 3 stages impossible to connect coherently.\n"
         "- Decide by functional role, not just semantic similarity. Distinguish trigger, poller, classifier, model provider, transformer, router, and sink roles.\n"
         "- Reject provider-only or infrastructure-only nodes when the stage needs a complete business operation node.\n"
+        "- If the stage is classify_decision and the user explicitly asked for AI or an LLM, prefer an explicit model/app node that performs the model call on the main path over a generic AI wrapper or generic transform node when both are valid.\n"
+        "- Use a generic AI Transform node only when no explicit LLM/model node can satisfy the stage on the main path.\n"
         "- Prefer nodes whose main inputs and outputs naturally match the stage I/O and the nearest upstream node outputs.\n"
         "- If a candidate would require an extra hidden node, hidden model attachment, or hidden auxiliary connection to work, reject it in this selection step.\n"
         "- For the first stage, only explicit inbound trigger/listener/polling nodes are valid.\n"

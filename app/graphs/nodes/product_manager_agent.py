@@ -24,7 +24,7 @@ from ...features.reasoning.multi_agent_contracts import (
     UseCase,
     WorkflowContext,
 )
-from ...llm import get_langchain_chat_model
+from ...llm import get_langchain_chat_model, invoke_openai_structured_output
 from ...observability import emit_llm_output_event, emit_llm_prompt_event, emit_trace_event
 from ...token_budget import estimate_messages_tokens
 from ..multi_agent_state import MultiAgentGraphState
@@ -265,6 +265,61 @@ _OPERABLE_APPLY_HINTS: Tuple[str, ...] = (
     "actualiz",
     "marcar",
 )
+_NON_QUESTION_MISSING_INFO_PREFIXES: Tuple[str, ...] = (
+    "none",
+    "none.",
+    "ninguna",
+    "ninguna.",
+    "ninguno",
+    "ninguno.",
+    "n/a",
+    "na",
+)
+_QUESTION_LEAD_HINTS: Tuple[str, ...] = (
+    "what ",
+    "which ",
+    "how ",
+    "where ",
+    "when ",
+    "should ",
+    "do you ",
+    "can you ",
+    "please ",
+    "provide ",
+    "confirm ",
+    "que ",
+    "qué ",
+    "como ",
+    "cómo ",
+    "donde ",
+    "dónde ",
+    "cuando ",
+    "cuándo ",
+    "cual ",
+    "cuál ",
+    "indica ",
+    "confirma ",
+)
+_QUESTION_SIGNAL_HINTS: Tuple[str, ...] = (
+    "what should happen",
+    "which concrete",
+    "what concrete",
+    "how should",
+    "where should",
+    "provide the",
+    "confirm the",
+    "please restate",
+    "restate the workflow goal",
+    "restate the full workflow",
+    "que quieres hacer",
+    "que debe pasar",
+    "que sistema",
+    "que origen",
+    "que metodo",
+    "que método",
+    "indica el valor",
+    "confirma el valor",
+)
 
 
 def _pm_int(name: str, default: int) -> int:
@@ -305,6 +360,32 @@ def _safe_list(values: Sequence[Any]) -> List[str]:
     for value in values:
         item = _sanitize_text(value)
         if not item or item in seen:
+            continue
+        seen.add(item)
+        output.append(item)
+    return output
+
+
+def _looks_like_user_question(text: Any) -> bool:
+    normalized = _sanitize_text(text)
+    lowered = normalized.lower()
+    if not normalized or lowered in _NON_QUESTION_MISSING_INFO_PREFIXES:
+        return False
+    if lowered.startswith("none.") or lowered.startswith("none ") or lowered.startswith("ninguna "):
+        return False
+    if "?" in normalized:
+        return True
+    if any(lowered.startswith(prefix) for prefix in _QUESTION_LEAD_HINTS):
+        return True
+    return any(signal in lowered for signal in _QUESTION_SIGNAL_HINTS)
+
+
+def _sanitize_missing_information_items(values: Sequence[Any]) -> List[str]:
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        item = _sanitize_text(value)
+        if not item or not _looks_like_user_question(item) or item in seen:
             continue
         seen.add(item)
         output.append(item)
@@ -851,8 +932,11 @@ def _repair_abstract_plan_with_structured_output(
         "- data_flow and stage dependencies may reference only existing stage ids.\n"
         "- If the request contains more than one explicit operation, return at least 2 stages.\n"
         "- Preserve source system, trigger style, processing mode, and final outcome.\n"
+        "- If no clarification is needed, missing_information must be an empty array.\n"
+        "- Never put confirmations, summaries, or values like 'None' inside missing_information.\n"
         "- If the workflow would end only in a classification, decision, routing outcome, or transformation result, either add the missing final business outcome stage when it is explicit in the request, or set planning_ready=false and ask what should happen with that result.\n"
         "- Do not invent review or approval stages unless the user explicitly asked for them.\n"
+        "- If the user explicitly asked for a silent workflow with no notifications, do not ask again about notifications.\n"
         "- Write user-facing clarification questions in the same language as the user's request.\n"
         "- Set planning_ready=true only if the repaired plan is coherent enough to hand off to architect_agent.\n"
     )
@@ -925,6 +1009,175 @@ def _request_context_query(
         if derived:
             return _compact(derived, max_chars=500)
     return _compact(current_user_query, max_chars=500)
+
+
+def _clarification_answer_texts(
+    clarification_state: Optional[PMClarificationState],
+) -> List[str]:
+    if clarification_state is None:
+        return []
+    values: List[str] = []
+    for slot in clarification_state.resolved_slots:
+        if slot.answer:
+            values.append(slot.answer)
+    for turn in clarification_state.turns:
+        if turn.answer:
+            values.append(turn.answer)
+    return _safe_list(values)
+
+
+def _extract_priority_labels(*texts: Any) -> List[str]:
+    variants = {
+        "low": {"low", "bajo"},
+        "medium": {"medium", "medio"},
+        "high": {"high", "alto"},
+        "critical": {"critical", "critico", "crítico"},
+    }
+    output: List[str] = []
+    seen = set()
+    for text in texts:
+        tokens = re.findall(r"[a-záéíóúñü]+", _sanitize_text(text).lower())
+        for token in tokens:
+            for canonical, allowed in variants.items():
+                if token not in allowed or canonical in seen:
+                    continue
+                seen.add(canonical)
+                output.append(token)
+                break
+    return output
+
+
+def _extract_fallback_label(*texts: Any) -> Optional[str]:
+    for text in texts:
+        sanitized = _sanitize_text(text)
+        if not sanitized:
+            continue
+        match = re.search(r"[\"'“”]?([A-Za-z][A-Za-z0-9 _-]{1,40})[\"'“”]?", sanitized)
+        if not match:
+            continue
+        candidate = _sanitize_text(match.group(1))
+        if candidate.lower() == "review" or "review" in candidate.lower():
+            return "Review"
+    combined = " ".join(_sanitize_text(text).lower() for text in texts if _sanitize_text(text))
+    if "review" in combined:
+        return "Review"
+    return None
+
+
+def _enrich_architecture_plan_with_constraints(
+    *,
+    plan: ArchitecturePlan,
+    request_context_query: str,
+    clarification_state: Optional[PMClarificationState],
+) -> ArchitecturePlan:
+    answer_texts = _clarification_answer_texts(clarification_state)
+    combined_texts = [request_context_query, *answer_texts]
+    combined = " ".join(_sanitize_text(text).lower() for text in combined_texts if _sanitize_text(text))
+    priority_labels = _extract_priority_labels(*combined_texts)
+    fallback_label = _extract_fallback_label(*combined_texts)
+    source_is_gmail = "gmail" in combined
+    semantic_classification = any(
+        hint in combined
+        for hint in ("semantic", "semantica", "semántica", "context", "contexto", "subject", "asunto", "body", "cuerpo")
+    )
+    per_item_trigger = any(
+        hint in combined
+        for hint in ("cada correo", "cada email", "every email", "cada mensaje", "new email", "nuevo correo", "en cuanto llegue", "siempre que se reciba")
+    )
+    visible_in_gmail = source_is_gmail and any(
+        hint in combined
+        for hint in ("visible", "gmail ui", "filtrar", "filter", "label", "tag", "etiquet")
+    )
+    apply_back_to_source = any(
+        hint in combined
+        for hint in (
+            "same email",
+            "same gmail",
+            "same message",
+            "same source",
+            "apply it to the source",
+            "apply it back",
+            "mismo correo",
+            "mismo email",
+            "mismo mensaje",
+            "mismo gmail",
+            "mismo origen",
+            "aplica el resultado al mismo",
+            "anade la etiqueta al correo",
+            "anade un tag al correo",
+            "añade la etiqueta al correo",
+            "añade un tag al correo",
+        )
+    )
+    sink_stage_ids = {stage.id for stage in _sink_stages(plan.stages, plan.data_flow)}
+
+    shared_notes: List[str] = []
+    if priority_labels:
+        shared_notes.append(
+            "Urgency levels must remain exactly: " + ", ".join(priority_labels) + "."
+        )
+    if fallback_label:
+        shared_notes.append(
+            f"If the workflow cannot determine a confident urgency level, use fallback label '{fallback_label}'."
+        )
+    if semantic_classification:
+        shared_notes.append(
+            "Urgency must be inferred semantically from the email subject and body, not only from static metadata."
+        )
+    if visible_in_gmail:
+        shared_notes.append(
+            "Any source-side update must remain visible in Gmail UI so the user can filter emails later."
+        )
+    if per_item_trigger:
+        shared_notes.append(
+            "The workflow should run for each newly received email, not as a manual or batch-only process."
+        )
+
+    enriched_stages: List[ArchitectureStage] = []
+    for stage in plan.stages:
+        stage_kind = stage.stage_kind
+        if (
+            stage.id in sink_stage_ids
+            and stage_kind in {StageKind.persist_store, StageKind.notify_output, StageKind.transform_process}
+            and (apply_back_to_source or visible_in_gmail)
+        ):
+            stage_kind = StageKind.apply_update_source
+        notes = _safe_list([stage.notes or ""])
+        if stage_kind == StageKind.trigger_intake and per_item_trigger:
+            notes.append("Preserve one execution per newly received email.")
+        if stage_kind == StageKind.classify_decision:
+            if priority_labels:
+                notes.append("Return exactly one urgency level from: " + ", ".join(priority_labels) + ".")
+            if semantic_classification:
+                notes.append("Classify urgency from the semantic meaning of subject and body.")
+            if fallback_label:
+                notes.append(f"If classification is uncertain, use fallback label '{fallback_label}'.")
+        if stage_kind == StageKind.apply_update_source:
+            if source_is_gmail:
+                notes.append("Apply the result back onto the same Gmail message.")
+            if visible_in_gmail:
+                notes.append("The applied label must be visible in Gmail UI for later filtering.")
+            if priority_labels:
+                notes.append("Applied label values should mirror the classification levels: " + ", ".join(priority_labels) + ".")
+            if fallback_label:
+                notes.append(f"Use fallback label '{fallback_label}' when no confident urgency level is available.")
+        enriched_stages.append(
+            stage.model_copy(
+                update={
+                    "stage_kind": stage_kind,
+                    "notes": "\n".join(_safe_list(notes)) or None,
+                    "target_entity": stage.target_entity or ("gmail" if source_is_gmail else stage.target_entity),
+                }
+            )
+        )
+
+    implementation_notes = _safe_list(list(plan.implementation_notes_for_engineer) + shared_notes)
+    return plan.model_copy(
+        update={
+            "stages": enriched_stages,
+            "implementation_notes_for_engineer": implementation_notes,
+        }
+    )
 
 
 def _derive_use_case_from_direct_build_request(user_query: str) -> Optional[UseCase]:
@@ -1094,7 +1347,37 @@ def _invoke_structured_output(
 
     llm = get_langchain_chat_model(model=model, temperature=temperature)
     if llm is None:
-        raise RuntimeError("LangChain chat model is unavailable")
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_tokens = estimate_messages_tokens(messages)
+        emit_llm_prompt_event(
+            trace_logger,
+            request_id=request_id,
+            stage=stage,
+            model=model,
+            messages=messages,
+            estimated_tokens=prompt_tokens,
+            params={"temperature": temperature, "structured": True, "provider": "openai_json_schema"},
+        )
+        response = invoke_openai_structured_output(
+            messages=messages,
+            model=model,
+            output_model=output_model,
+            temperature=temperature,
+        )
+        emit_llm_output_event(
+            trace_logger,
+            request_id=request_id,
+            stage=stage,
+            model=model,
+            latency_ms=None,
+            content=response.model_dump_json(exclude_none=True) if hasattr(response, "model_dump_json") else str(response),
+            usage=None,
+            extra={"structured": True, "provider": "openai_json_schema"},
+        )
+        return response
 
     try:
         structured = llm.with_structured_output(output_model)
@@ -1500,6 +1783,11 @@ def _plan_abstract_workflow_with_structured_output(
         "- Do not invent validation, feedback, manual review, refinement, or approval stages unless the user explicitly asked for them.\n"
         "- Never output concrete node types or workflow JSON.\n"
         "- If the user explicitly named systems like Gmail, Slack, or Google Sheets, treat them as business/system context, not node choices.\n"
+        "- Preserve concrete business constraints mentioned by the user, including label values, fallback values, source-system visibility requirements, trigger cadence, and whether classification should be semantic/AI-driven.\n"
+        "- Carry those concrete constraints into the relevant stages and handoff_notes so architect_agent and engineer_agent can implement them later without re-asking the same thing.\n"
+        "- If no clarification is needed, missing_information must be an empty array. Never place statements like 'None' or summary text there.\n"
+        "- If the user already made the workflow silent or said there should be no notifications, do not ask again about notifications.\n"
+        "- If the user already defined that the result should be applied back to Gmail or made visible there for filtering, do not ask again for downstream action.\n"
         "- Set planning_ready=true only if the abstract workflow plan is coherent enough to hand off to architect_agent.\n"
         "- If essential planning information is missing, set planning_ready=false and list the missing_information as concise user-facing clarification questions.\n"
         "- Write missing_information questions in the same language as the user's request.\n"
@@ -1523,19 +1811,27 @@ def _build_architecture_plan(
     *,
     use_case: UseCase,
     plan_output: _AbstractPlanningOutput,
+    request_context_query: str,
+    clarification_state: Optional[PMClarificationState],
 ) -> ArchitecturePlan:
-    return ArchitecturePlan(
+    enriched_output = _enrich_stages(plan_output)
+    plan = ArchitecturePlan(
         use_case_id=use_case.id,
         title=use_case.title,
         business_objective=_compact(use_case.business_problem, max_chars=260),
         desired_outcome=_compact(use_case.desired_outcome, max_chars=260),
-        workflow_summary=_compact(plan_output.workflow_summary, max_chars=320),
-        stages=list(plan_output.stages),
-        data_flow=list(plan_output.data_flow),
-        assumptions=_safe_list(plan_output.assumptions),
-        missing_information=_safe_list(plan_output.missing_information),
-        implementation_notes_for_engineer=_safe_list(plan_output.handoff_notes),
+        workflow_summary=_compact(enriched_output.workflow_summary, max_chars=320),
+        stages=list(enriched_output.stages),
+        data_flow=list(enriched_output.data_flow),
+        assumptions=_safe_list(enriched_output.assumptions),
+        missing_information=_safe_list(enriched_output.missing_information),
+        implementation_notes_for_engineer=_safe_list(enriched_output.handoff_notes),
         required_nodes=[],
+    )
+    return _enrich_architecture_plan_with_constraints(
+        plan=plan,
+        request_context_query=request_context_query,
+        clarification_state=clarification_state,
     )
 
 
@@ -1816,12 +2112,15 @@ def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
         plan_output = plan_output.model_copy(
             update={
                 "planning_ready": False,
-                "missing_information": _safe_list(list(plan_output.missing_information) + [clarification_message]),
+                "missing_information": _sanitize_missing_information_items(
+                    list(plan_output.missing_information) + [clarification_message]
+                ),
             }
         )
 
+    sanitized_missing_information = _sanitize_missing_information_items(plan_output.missing_information)
     localized_missing_information = localize_question_list(
-        plan_output.missing_information,
+        sanitized_missing_information,
         user_query=request_context_query,
         context_texts=[
             selected_use_case.title,
@@ -1829,10 +2128,25 @@ def product_manager_agent_node(state: MultiAgentGraphState) -> Dict[str, Any]:
             selected_use_case.desired_outcome,
         ],
     )
-    if localized_missing_information != list(plan_output.missing_information):
-        plan_output = plan_output.model_copy(update={"missing_information": localized_missing_information})
+    localized_missing_information = _sanitize_missing_information_items(localized_missing_information)
+    effective_planning_ready = bool(plan_output.stages) and not planning_validation_issues and not localized_missing_information
+    if (
+        localized_missing_information != list(plan_output.missing_information)
+        or bool(plan_output.planning_ready) != effective_planning_ready
+    ):
+        plan_output = plan_output.model_copy(
+            update={
+                "missing_information": localized_missing_information,
+                "planning_ready": effective_planning_ready,
+            }
+        )
 
-    architecture_plan = _build_architecture_plan(use_case=selected_use_case, plan_output=plan_output)
+    architecture_plan = _build_architecture_plan(
+        use_case=selected_use_case,
+        plan_output=plan_output,
+        request_context_query=request_context_query,
+        clarification_state=clarification_state,
+    )
     stage_plan = _derive_pm_stage_plan(architecture_plan)
     clarification_questions = _safe_list(plan_output.missing_information)
     clarification_slots = _build_decision_slots_for_plan(

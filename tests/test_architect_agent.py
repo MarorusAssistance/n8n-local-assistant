@@ -1123,6 +1123,148 @@ def test_architect_builds_and_persists_new_workflow(monkeypatch: pytest.MonkeyPa
     assert updates["workflow_context"].handoff_target == AgentStage.engineer_agent
 
 
+def test_architect_prefers_explicit_model_node_for_ai_classification() -> None:
+    plan = _plan()
+    stage = plan.stages[1].model_copy(
+        update={
+            "stage_kind": StageKind.classify_decision,
+            "purpose": "Use an AI model to classify urgency semantically from subject and body.",
+        }
+    )
+    openai_candidate = _candidate(
+        "n8n-nodes-base.openAi",
+        stage_id=stage.id,
+        capability_summary="OpenAI model call for text analysis and classification.",
+    )
+    ai_transform_candidate = _candidate(
+        "n8n-nodes-base.aiTransform",
+        stage_id=stage.id,
+        capability_summary="Generic AI data transform node.",
+    )
+
+    openai_score = architect_mod._fallback_candidate_score(
+        candidate=openai_candidate,
+        stage=stage,
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+    ai_transform_score = architect_mod._fallback_candidate_score(
+        candidate=ai_transform_candidate,
+        stage=stage,
+        plan=plan,
+        stage_requires_trigger=False,
+    )
+
+    assert openai_score > ai_transform_score
+
+
+def test_architect_operation_hints_capture_label_contract() -> None:
+    plan = _plan().model_copy(
+        update={
+            "workflow_summary": "Incoming Gmail urgency classification with labels bajo, medio, alto, critico and fallback Review.",
+            "implementation_notes_for_engineer": [
+                "Applied labels must stay visible in Gmail UI.",
+                "Use Review when confidence is low.",
+            ],
+        }
+    )
+    stage = ArchitectureStage(
+        id="stage_apply",
+        name="Apply Urgency Label in Gmail",
+        purpose="Apply the urgency label back to the same Gmail message.",
+        stage_kind=StageKind.apply_update_source,
+        target_entity="gmail_message",
+        user_visible_goal="Visible in Gmail UI for filtering later.",
+        required_capabilities=["Apply label"],
+        expected_inputs=["Urgency classification result", "Source email identifiers"],
+        expected_outputs=["Updated Gmail message"],
+        dependencies=["stage_2"],
+        success_criteria=["The message shows the chosen urgency label in Gmail."],
+        notes="Use labels bajo, medio, alto, critico. If uncertain use Review.",
+    )
+    candidate = _candidate(
+        "n8n-nodes-base.gmail",
+        stage_id=stage.id,
+        capability_summary="Update Gmail messages and labels.",
+    )
+
+    hints = architect_mod._derive_operation_hints(stage=stage, candidate=candidate, plan=plan)
+
+    assert hints["semantic_action"] == "apply_label"
+    assert hints["preferred_resource"] == "message"
+    assert hints["allowed_label_values"] == ["bajo", "medio", "alto", "critico"]
+    assert hints["fallback_label_name"] == "Review"
+    assert "messageId" in hints["parameter_focus"]
+
+
+def test_architect_operation_hints_capture_gmail_trigger_polling_contract() -> None:
+    plan = _plan().model_copy(
+        update={
+            "workflow_summary": "Capture every new Gmail email and classify it by urgency.",
+            "implementation_notes_for_engineer": ["Use near-real-time intake for each new Gmail email."],
+        }
+    )
+    stage = ArchitectureStage(
+        id="stage_trigger",
+        name="Receive Gmail Emails",
+        purpose="Capture each new Gmail email as soon as the native trigger allows.",
+        stage_kind=StageKind.trigger_intake,
+        business_effect="Capture incoming Gmail messages for downstream processing.",
+        target_entity="gmail_message",
+        user_visible_goal="Run automatically for each new email.",
+        required_capabilities=["Trigger on each Gmail email received."],
+        expected_inputs=["Gmail inbox"],
+        expected_outputs=["Email subject and body"],
+        dependencies=[],
+        success_criteria=["Each new email starts the workflow promptly."],
+    )
+    candidate = _candidate("n8n-nodes-base.gmailTrigger", stage_id=stage.id, has_main_input=False)
+
+    hints = architect_mod._derive_operation_hints(stage=stage, candidate=candidate, plan=plan)
+
+    assert hints["semantic_action"] == "receive_incoming_item"
+    assert hints["native_trigger_mechanism"] == "polling"
+    assert hints["preferred_poll_mode"] == "everyMinute"
+    assert "pollTimes.item.mode" in hints["parameter_focus"]
+    assert "pollTimes.item.mode" in hints["allow_inferred_parameter_keys"]
+
+
+def test_architect_operation_hints_capture_openai_classifier_contract() -> None:
+    plan = _plan().model_copy(
+        update={
+            "workflow_summary": "Use AI to classify Gmail email urgency as low, medium, high, or critical.",
+            "implementation_notes_for_engineer": [
+                "Urgency levels must remain exactly: low, medium, high, critical.",
+                "If the workflow cannot determine a confident urgency level, use fallback label 'Review'.",
+            ],
+        }
+    )
+    stage = ArchitectureStage(
+        id="stage_classify",
+        name="Classify Email Urgency",
+        purpose="Use an AI model to classify email urgency from subject and body.",
+        stage_kind=StageKind.classify_decision,
+        business_effect="Produce one urgency level for each email.",
+        target_entity="email",
+        user_visible_goal="Every email has one urgency label.",
+        required_capabilities=["Use AI to classify email urgency semantically."],
+        expected_inputs=["Email subject and body"],
+        expected_outputs=["Urgency label"],
+        dependencies=["stage_trigger"],
+        success_criteria=["Exactly one urgency label is returned for each email."],
+    )
+    candidate = _candidate("n8n-nodes-base.openAi", stage_id=stage.id)
+
+    hints = architect_mod._derive_operation_hints(stage=stage, candidate=candidate, plan=plan)
+
+    assert hints["semantic_action"] == "classify_payload"
+    assert hints["classification_output_key"] == "urgency_level"
+    assert hints["fallback_label_name"] == "Review"
+    assert "model" in hints["parameter_focus"]
+    assert "prompt" in hints["parameter_focus"]
+    assert "model" in hints["allow_inferred_parameter_keys"]
+
+
 def test_architect_blocks_when_only_tool_candidates_exist(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "app.graphs.nodes.architect_agent.retrieve_context",

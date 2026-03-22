@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from ...config import settings
 from ...db import query_definition_chunks_by_entity
@@ -32,7 +32,7 @@ from ...features.reasoning.multi_agent_contracts import (
     WorkflowVersion,
     WorkflowContext,
 )
-from ...llm import get_langchain_chat_model
+from ...llm import get_langchain_chat_model, invoke_openai_structured_output
 from ...observability import emit_llm_output_event, emit_llm_prompt_event, emit_trace_event
 from ...workflow.n8n_client import N8NClient, N8NClientError
 from ..multi_agent_state import MultiAgentGraphState
@@ -156,6 +156,35 @@ class DeveloperMissingInputDecision(BaseModel):
     category: str = "parameter"
     reason: str
     question: str
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def _normalize_category(cls, value: Any) -> str:
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return "parameter"
+        if normalized in {
+            "credential",
+            "parameter",
+            "mapping",
+            "business_rule",
+            "decision",
+            "dependency",
+        }:
+            return normalized
+        if "credential" in normalized:
+            return "credential"
+        if "mapping" in normalized:
+            return "mapping"
+        if "business" in normalized or "rule" in normalized:
+            return "business_rule"
+        if "decision" in normalized or "clarification" in normalized:
+            return "decision"
+        if "dependency" in normalized:
+            return "dependency"
+        if "parameter" in normalized or "selector" in normalized or "field" in normalized:
+            return "parameter"
+        return "parameter"
 
 
 class DeveloperVariableOutput(BaseModel):
@@ -358,6 +387,28 @@ def _merged_implementation_hints(
         for key, value in merged.items()
         if str(key).strip()
     }
+
+
+def _focused_parameter_schema_prompt_payload(
+    *,
+    parameter_schema: List[DeveloperParameterDefinition],
+    implementation_hints: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    focus = implementation_hints.get("parameter_focus")
+    if not isinstance(focus, list):
+        return []
+    focus_names = {
+        str(item).strip()
+        for item in focus
+        if str(item).strip()
+    }
+    if not focus_names:
+        return []
+    return [
+        item.model_dump(mode="json")
+        for item in parameter_schema
+        if item.name in focus_names
+    ]
 
 
 def _decision_trace_summary(decision: NodeImplementationDecision) -> Dict[str, Any]:
@@ -927,7 +978,40 @@ def _invoke_structured_output(
         raise RuntimeError("No model configured for engineer structured output")
     llm = get_langchain_chat_model(model=model, temperature=temperature)
     if llm is None:
-        raise RuntimeError("LangChain chat model is unavailable")
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        emit_llm_prompt_event(
+            trace_logger,
+            request_id=request_id,
+            stage=stage,
+            model=model,
+            messages=messages,
+            estimated_tokens=0,
+            params={"temperature": temperature, "structured": True, "provider": "openai_json_schema"},
+        )
+        response = invoke_openai_structured_output(
+            messages=messages,
+            model=model,
+            output_model=output_model,
+            temperature=temperature,
+        )
+        emit_llm_output_event(
+            trace_logger,
+            request_id=request_id,
+            stage=stage,
+            model=model,
+            latency_ms=None,
+            content=(
+                response.model_dump_json(exclude_none=True)
+                if hasattr(response, "model_dump_json")
+                else str(response)
+            ),
+            usage=None,
+            extra={"structured": True, "provider": "openai_json_schema"},
+        )
+        return response
     structured = llm.with_structured_output(output_model)
     messages = [
         {"role": "system", "content": system_prompt},
@@ -983,6 +1067,10 @@ def _decision_prompt_payload(
         queue_item=queue_item,
         current_node=current_node,
     )
+    focused_parameter_schema = _focused_parameter_schema_prompt_payload(
+        parameter_schema=parameter_schema,
+        implementation_hints=implementation_hints,
+    )
     return json.dumps(
         {
             "user_query": user_query,
@@ -992,6 +1080,7 @@ def _decision_prompt_payload(
             "current_node": current_node.model_dump(mode="json"),
             "node_definition": _node_definition_prompt_payload(node_definition),
             "parameter_schema": [item.model_dump(mode="json") for item in parameter_schema],
+            "focused_parameter_schema": focused_parameter_schema,
             "credential_requirements": [item.model_dump(mode="json") for item in credential_requirements],
             "upstream_variables": [item.model_dump(mode="json") for item in upstream_variables],
             "resolved_inputs": resolved_inputs,
@@ -1043,6 +1132,15 @@ def _decide_node_implementation_with_structured_output(
         "Do not redesign the workflow. Preserve ids, names, positions, and connections. "
         "Keep real user-confirmed values in parameters_known. Use parameters_inferred only for safe, non-sensitive values supported by the schema and workflow context. "
         "When implementation_hints describe the node's semantic action, materialize that action through the node's real schema selectors instead of leaving the node generic. "
+        "Treat implementation_hints as the operational contract for this node: follow semantic_action, parameter_focus, allowed_label_values, fallback_label_name, source_identifier_hint, classification_input_hints, label_mapping_strategy, label_resolution_strategy, required_runtime_bindings, native_trigger_mechanism, and preferred_poll_mode whenever they are present. "
+        "For classify_decision nodes, configure the node so it actually performs the classification and emits one concrete result label, not just a generic AI step. "
+        "For explicit model/app classifier nodes, fully materialize the model call using the schema fields that control model choice and prompt or instruction payload. "
+        "For apply_update_source nodes, configure the full source update: choose the action selector and also bind the source item reference and update payload when the schema exposes them. Do not stop at resource/operation only. "
+        "If a trigger node only exposes polling controls, do not invent push or webhook semantics. Use the shortest safe native cadence described by implementation_hints or the schema. "
+        "If a source-update node needs internal resource IDs such as Gmail labelIds and those IDs are not known, never invent them. Leave only that binding unresolved unless the current stage bundle already includes a concrete way to create or resolve those IDs. "
+        "If node_definition.summary shows example scopes or example operations that conflict with implementation_hints, trust implementation_hints and stage_context over those examples. "
+        "Use focused_parameter_schema first when it is present, then consult the full parameter_schema only if you need additional fields. "
+        "When returning missing_inputs, use only these categories: credential, parameter, mapping, business_rule, decision, dependency. "
         "Never invent secrets, credential ids, endpoint URLs, resource identifiers, or business rules. "
         "If critical information is missing, set can_apply=false and return explicit missing_inputs."
     )
@@ -1507,6 +1605,7 @@ def _semantic_parameter_default_value(
     hints = _merged_implementation_hints(queue_item=queue_item, current_node=current_node)
     semantic_action = str(hints.get("semantic_action") or "").strip().lower()
     preferred_resource = str(hints.get("preferred_resource") or "").strip()
+    preferred_poll_mode = str(hints.get("preferred_poll_mode") or "").strip()
     node_signature = " ".join(
         part.lower()
         for part in (
@@ -1520,6 +1619,8 @@ def _semantic_parameter_default_value(
     )
     if key_name == "resource" and preferred_resource:
         return preferred_resource
+    if key_name == "pollTimes.item.mode" and preferred_poll_mode:
+        return preferred_poll_mode
     if semantic_action == "apply_label" and "gmail" in node_signature:
         if key_name == "resource":
             return preferred_resource or "message"

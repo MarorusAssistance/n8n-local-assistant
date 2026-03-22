@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import importlib
 import logging
+from pathlib import Path
 import threading
 
 from .config import settings
@@ -117,6 +118,21 @@ class Reranker:
 
     def _load_with_fallback(self) -> bool:
         model_name = settings.RERANK_MODEL
+        if not _reranker_model_available_locally(model_name):
+            self._logger.warning(
+                "reranker skipped: model=%s is not cached locally and network downloads are unavailable",
+                model_name,
+            )
+            fallback = settings.RERANK_FALLBACK_MODEL or ""
+            if not fallback or fallback == model_name:
+                return False
+            if not _reranker_model_available_locally(fallback):
+                self._logger.warning(
+                    "reranker fallback skipped: model=%s is not cached locally",
+                    fallback,
+                )
+                return False
+            model_name = fallback
         try:
             self._model = self._load_model(model_name)
             self._model_name = model_name
@@ -185,6 +201,27 @@ def _ensure_lightweight_compatible() -> None:
             "BAAI/bge-reranker-v2.5-gemma2-lightweight. "
             "Pin a compatible 4.x release or use fallback model."
         )
+
+
+def _reranker_model_available_locally(model_name: str) -> bool:
+    normalized = str(model_name or "").strip()
+    if not normalized:
+        return False
+    if Path(normalized).exists():
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except Exception:
+        return False
+
+    sentinel = object()
+    for filename in ("config.json", "tokenizer_config.json", "sentence_bert_config.json"):
+        cached_path = try_to_load_from_cache(normalized, filename)
+        if cached_path is not None and cached_path is not sentinel:
+            return True
+    return False
+
+
 def _resolve_devices(force_cpu: bool = False) -> Optional[List[str]]:
     if force_cpu:
         return ["cpu"]

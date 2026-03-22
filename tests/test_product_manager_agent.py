@@ -8,6 +8,8 @@ from app.features.reasoning.multi_agent_contracts import (
     AgentStage,
     ArchitectureDataFlowItem,
     ArchitectureStage,
+    DecisionSlot,
+    DecisionSlotAnswerStatus,
     EntryIntent,
     PMClarificationState,
     PMStatus,
@@ -256,6 +258,40 @@ def test_pm_completes_abstract_plan_for_architect_handoff(monkeypatch: pytest.Mo
     assert "handoff_ready_architect" in updates["routing_signals"]
 
 
+def test_build_architecture_plan_propagates_user_constraints() -> None:
+    selected = _use_case(use_case_id="uc_pm_constraints")
+    clarification_state = PMClarificationState(
+        resolved_slots=[
+            DecisionSlot(
+                slot_key="result_application_mode",
+                owner_agent=AgentStage.product_manager_agent,
+                stage_id="stage_persistence",
+                answer_status=DecisionSlotAnswerStatus.resolved,
+                answer=(
+                    "Los niveles de urgencia son bajo, medio, alto y critico. "
+                    "Aplica el resultado al mismo correo de Gmail para que quede visible en Gmail UI y pueda filtrarlo luego. "
+                    "Si no hay suficiente confianza, usa Review."
+                ),
+            )
+        ],
+        turns=[],
+    )
+    plan = pm._build_architecture_plan(
+        use_case=selected,
+        plan_output=_abstract_plan(),
+        request_context_query="Clasifica los correos con IA segun asunto y cuerpo.",
+        clarification_state=clarification_state,
+    )
+
+    classification_stage = next(stage for stage in plan.stages if stage.id == "stage_classification")
+    persistence_stage = next(stage for stage in plan.stages if stage.id == "stage_persistence")
+
+    assert "bajo, medio, alto, critico" in (classification_stage.notes or "")
+    assert "Review" in (classification_stage.notes or "")
+    assert "Gmail UI" in (persistence_stage.notes or "")
+    assert any("Gmail UI" in note for note in plan.implementation_notes_for_engineer)
+
+
 def test_pm_accepts_direct_build_request_without_selected_use_case(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -345,6 +381,39 @@ def test_terminal_outcome_question_maps_to_result_application_mode() -> None:
     )
 
     assert infer_decision_slot_key(question, stage_name="plan_terminal_outcome") == "result_application_mode"
+
+
+def test_downstream_actions_question_maps_to_result_application_mode() -> None:
+    question = (
+        "Are there additional downstream actions (e.g., routing to a different mailbox, forwarding) "
+        "that should occur after classification?"
+    )
+
+    assert infer_decision_slot_key(question, stage_name="stage_3") == "result_application_mode"
+
+
+def test_pm_ignores_none_style_missing_information_when_plan_is_otherwise_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = _use_case(use_case_id="uc_pm_none_missing_info")
+    noisy_plan = _abstract_plan(
+        planning_ready=False,
+        missing_information=[
+            "None. The workflow now covers all explicit operations and no clarification is required."
+        ],
+    )
+    monkeypatch.setattr(
+        pm,
+        "_plan_abstract_workflow_with_structured_output",
+        lambda **_: noisy_plan,
+    )
+
+    updates = pm.product_manager_agent_node(_state(selected_use_case=selected))
+
+    assert updates["pm_status"] == PMStatus.pm_completed
+    assert updates["workflow_context"].planning_ready is True
+    assert updates["pending_decision_slots"] == []
+    assert updates["missing_user_inputs"] == []
 
 
 def test_pm_heuristic_email_plan_blocks_until_outcome_is_defined() -> None:

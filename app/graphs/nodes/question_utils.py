@@ -398,6 +398,28 @@ def infer_decision_slot_key(
         return "result_application_mode"
     if any(
         token in combined
+        for token in (
+            "downstream action",
+            "downstream actions",
+            "after classification",
+            "after triage",
+            "after the classification",
+            "after the result",
+            "additional downstream actions",
+            "routing to a different mailbox",
+            "forwarding",
+            "different mailbox",
+            "what happens after",
+            "what should happen after",
+            "que debe pasar despues",
+            "que quieres hacer despues",
+            "accion posterior",
+            "acciones posteriores",
+        )
+    ):
+        return "result_application_mode"
+    if any(
+        token in combined
         for token in ("what should happen", "que quieres hacer", "result next", "apply", "tag", "label", "save", "guardar", "notify", "route")
     ):
         return "result_application_mode"

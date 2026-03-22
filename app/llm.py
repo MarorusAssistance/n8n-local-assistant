@@ -1,5 +1,8 @@
 ﻿from __future__ import annotations
 
+import logging
+import json
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -7,16 +10,58 @@ from openai import OpenAI
 
 from .config import settings
 
+_logger = logging.getLogger("n8n-assistant")
+_langchain_import_error: Optional[str] = None
+
 try:  # Optional at runtime until deps are installed.
     from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-except Exception:  # pragma: no cover - optional dependency fallback
+except Exception as exc:  # pragma: no cover - optional dependency fallback
     ChatOpenAI = None  # type: ignore[assignment]
     OpenAIEmbeddings = None  # type: ignore[assignment]
+    _langchain_import_error = f"{type(exc).__name__}: {exc}"
 
 _client: Optional[OpenAI] = None
 _http_client: Optional[httpx.Client] = None
 _lc_chat_models: Dict[Tuple[str, float], Any] = {}
 _lc_embeddings: Optional[Any] = None
+
+
+def _strip_code_fences(text: str) -> str:
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = value.strip("`").strip()
+        if value.lower().startswith("json"):
+            value = value[4:].strip()
+    if value.endswith("```"):
+        value = value[:-3].strip()
+    return value
+
+
+def invoke_openai_structured_output(
+    *,
+    messages: List[Dict[str, str]],
+    model: Optional[str],
+    output_model: Any,
+    temperature: float = 0.0,
+) -> Any:
+    resolved_model = resolve_model(model)
+    client = _get_openai_client()
+    schema = output_model.model_json_schema()
+    response = client.chat.completions.create(
+        model=resolved_model,
+        messages=messages,
+        temperature=temperature,
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": getattr(output_model, "__name__", "structured_output"),
+                "schema": schema,
+            },
+        },
+    )
+    content = _strip_code_fences(response.choices[0].message.content or "")
+    payload = json.loads(content)
+    return output_model.model_validate(payload)
 
 
 def _get_openai_client() -> OpenAI:
@@ -72,6 +117,11 @@ def resolve_model(requested: Optional[str]) -> str:
 def get_langchain_chat_model(model: Optional[str] = None, temperature: float = 0.0) -> Optional[Any]:
     """Return a cached ChatOpenAI model configured for LM Studio compatibility."""
     if ChatOpenAI is None:
+        _logger.warning(
+            "langchain_openai unavailable: interpreter=%s error=%s",
+            sys.executable,
+            _langchain_import_error or "unknown import error",
+        )
         return None
 
     resolved_model = resolve_model(model)

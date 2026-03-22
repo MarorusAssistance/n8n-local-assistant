@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 import pytest
@@ -11,6 +12,7 @@ from app.features.reasoning.multi_agent_contracts import (
     ArchitectureStage,
     BlockedNode,
     EntryIntent,
+    ImplementationQueueItem,
     ImplementationStatus,
     MissingUserInput,
     NodeRequirement,
@@ -24,6 +26,7 @@ from app.features.reasoning.multi_agent_contracts import (
 from app.graphs.nodes import engineer_agent as engineer_mod
 from app.graphs.nodes.engineer_agent import (
     DeveloperCredentialDefinition,
+    DeveloperMissingInputDecision,
     DeveloperNodeDefinition,
     DeveloperParameterDefinition,
     NodeImplementationDecision,
@@ -1097,3 +1100,148 @@ def test_engineer_blocks_behavior_defining_inferred_parameters(
     assert updates["implementation_status"] == ImplementationStatus.blocked_waiting_user
     assert updates["missing_user_input_details"]
     assert updates["missing_user_input_details"][0].missing_item == "triggerTimes.item.mode"
+
+
+def test_decision_prompt_payload_includes_focused_parameter_schema() -> None:
+    plan = ArchitecturePlan(
+        use_case_id="uc_prompt",
+        title="Apply Gmail label",
+        business_objective="Apply urgency labels to Gmail messages.",
+        desired_outcome="Each message is labeled in Gmail.",
+        workflow_summary="Classify then apply Gmail label.",
+        stages=[
+            ArchitectureStage(
+                id="stage_apply",
+                name="Apply Gmail Label",
+                purpose="Apply the label to the same Gmail message.",
+                stage_kind=StageKind.apply_update_source,
+                expected_inputs=["Urgency classification result", "Source email identifiers"],
+                expected_outputs=["Updated Gmail message"],
+                dependencies=[],
+                success_criteria=["The Gmail label is visible."],
+            )
+        ],
+        data_flow=[],
+        assumptions=[],
+        missing_information=[],
+        implementation_notes_for_engineer=[],
+        required_nodes=[],
+    )
+    queue_item = ImplementationQueueItem(
+        queue_id="an_1",
+        node_type="n8n-nodes-base.gmail",
+        stage_id="stage_apply",
+        purpose="Apply Gmail label",
+        dependencies=[],
+        expected_inputs=["Urgency classification result", "Source email identifiers"],
+        expected_outputs=["Updated Gmail message"],
+        status="pending",
+        implementation_hints={
+            "semantic_action": "apply_label",
+            "parameter_focus": ["resource", "operation", "messageId", "labelId"],
+            "fallback_label_name": "Review",
+            "allowed_label_values": ["bajo", "medio", "alto", "critico"],
+        },
+    )
+    current_node = WorkflowDraftNode(
+        node_id="an_1",
+        name="Gmail",
+        node_type="n8n-nodes-base.gmail",
+        type_version=1,
+        purpose="Apply Gmail label",
+        stage_id="stage_apply",
+        parameters_known={},
+        parameters_inferred={},
+        parameters_unresolved=[],
+        credential_refs={},
+        expected_inputs=["Urgency classification result", "Source email identifiers"],
+        expected_outputs=["Updated Gmail message"],
+        dependencies=[],
+        position=[260, 300],
+        implementation_hints=dict(queue_item.implementation_hints),
+    )
+    node_definition = _node_def("n8n-nodes-base.gmail")
+    parameter_schema = [
+        DeveloperParameterDefinition(name="resource"),
+        DeveloperParameterDefinition(name="operation"),
+        DeveloperParameterDefinition(name="messageId"),
+        DeveloperParameterDefinition(name="labelId"),
+        DeveloperParameterDefinition(name="htmlMessage"),
+    ]
+
+    payload = engineer_mod._decision_prompt_payload(
+        user_query="Aplica una etiqueta visible en Gmail.",
+        architecture_plan=plan,
+        queue_item=queue_item,
+        current_node=current_node,
+        node_definition=node_definition,
+        parameter_schema=parameter_schema,
+        credential_requirements=[],
+        upstream_variables=[],
+        resolved_inputs={},
+        resolved_decision_slots=[],
+        downstream_queue_ids=[],
+        stage_bundle_map={"stage_apply": ["an_1"]},
+    )
+    parsed = json.loads(payload)
+
+    assert parsed["implementation_hints"]["fallback_label_name"] == "Review"
+    assert parsed["implementation_hints"]["allowed_label_values"] == ["bajo", "medio", "alto", "critico"]
+    assert [item["name"] for item in parsed["focused_parameter_schema"]] == [
+        "resource",
+        "operation",
+        "messageId",
+        "labelId",
+    ]
+
+
+def test_engineer_missing_input_category_is_normalized() -> None:
+    item = DeveloperMissingInputDecision(
+        key_name="labelIds",
+        category="required_parameter_keys",
+        reason="Need label ids.",
+        question="Provide label ids.",
+    )
+
+    assert item.category == "parameter"
+
+
+def test_engineer_semantic_parameter_default_uses_architect_poll_hint() -> None:
+    queue_item = ImplementationQueueItem(
+        queue_id="gmail_trigger",
+        node_type="n8n-nodes-base.gmailTrigger",
+        stage_id="stage_trigger",
+        purpose="Receive emails",
+        dependencies=[],
+        expected_inputs=[],
+        expected_outputs=["email"],
+        implementation_hints={
+            "semantic_action": "receive_incoming_item",
+            "preferred_poll_mode": "everyMinute",
+        },
+    )
+    current_node = WorkflowDraftNode(
+        node_id="gmail_trigger",
+        name="Gmail Trigger",
+        node_type="n8n-nodes-base.gmailTrigger",
+        type_version=1,
+        purpose="Receive emails",
+        stage_id="stage_trigger",
+        parameters_known={},
+        parameters_inferred={},
+        parameters_unresolved=[],
+        credential_refs={},
+        expected_inputs=[],
+        expected_outputs=["email"],
+        dependencies=[],
+        position=[260, 300],
+        implementation_hints=dict(queue_item.implementation_hints),
+    )
+
+    value = engineer_mod._semantic_parameter_default_value(
+        queue_item=queue_item,
+        current_node=current_node,
+        key_name="pollTimes.item.mode",
+    )
+
+    assert value == "everyMinute"
